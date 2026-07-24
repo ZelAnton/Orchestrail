@@ -1,0 +1,32 @@
+[package]
+name = "orchestrail-tui"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Operator TUI for a running deterministic Orchestrail engine."
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# ratatui + crossterm: the operator TUI stack chosen by the intent doc (§6). `ratatui` re-exports
+# a matching `crossterm`, but `crossterm` is also declared directly (pinned to the same minor cargo
+# unifies) because `main.rs` drives raw-mode / alternate-screen / input directly. The exact
+# ratatui release enables its rendered-line-info API so wrapped approval cards can keep the
+# selected one visible; pinning prevents an unstable API change from silently altering that
+# navigation guarantee. The path dep on the engine crate reuses `events::TailReader` — the SAME
+# cursor reader the future engine uses — so there is zero duplication of the `.work/events.jsonl`
+# tail/dedup/torn-tail logic (T-101).
+# `serde_json` is pulled directly only to read opaque event `payload` fields (Map<String, Value>);
+# it is already in the lock via the engine dep, so no new transitive surface. Cargo.lock is
+# committed so that after the ONE initial online fetch the build/test smoke gate stays offline
+# (same pattern as engine/Cargo.lock — see engine/README.md).
+[dependencies]
+ratatui = { version = "=0.29.0", features = ["unstable-rendered-line-info"] }
+crossterm = "0.28"
+serde_json = "1"
+# Private sibling engine crate; retain its exact release-compatible version for cargo-deny.
+orchestrail-engine = { path = "../engine", version = "0.0.1" }
+
+[[bin]]
+name = "orchestrail-tui"
+path = "src/main.rs"

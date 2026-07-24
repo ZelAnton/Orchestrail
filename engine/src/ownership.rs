@@ -1,0 +1,1161 @@
+//! Native, interoperable owner lease for `.work/orchestrator.lock`.
+//!
+//! Orchestra's historical control plane stores an `orchestra/lease@1` JSON record in that
+//! directory. During catch-up development Orchestrail must coexist with a running Orchestra
+//! process, so this implementation preserves the record shape and the same `state-tx.lock`
+//! serialization directory. It does not invoke the PowerShell script and never recursively
+//! removes a lock directory: a foreign/corrupt lock remains an operator-visible refusal.
+
+use std::env;
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::supervise::CancellationProbe;
+use crate::time::{epoch_to_iso, iso_to_epoch};
+
+pub const ENGINE_ROLE: &str = "engine";
+const LEASE_SCHEMA: &str = "orchestra/lease@1";
+const LOCK_DIRECTORY: &str = "orchestrator.lock";
+const LEASE_FILE: &str = "lease.json";
+const STAGING_FILE: &str = "lease.json.tmp";
+const TRANSACTION_LOCK: &str = "state-tx.lock";
+const MAX_LEASE_BYTES: u64 = 64 * 1024;
+
+fn redirected(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn plain_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.is_dir() && !redirected(metadata) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("lease path is not a plain directory: {}", path.display()),
+        ))
+    }
+}
+
+fn plain_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.is_file() && !redirected(metadata) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("lease path is not a plain file: {}", path.display()),
+        ))
+    }
+}
+
+fn read_plain_lease(path: &Path) -> io::Result<String> {
+    let before = fs::symlink_metadata(path)?;
+    plain_file(path, &before)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400_000);
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x0100);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    plain_file(path, &metadata)?;
+    if metadata.len() > MAX_LEASE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lease is oversized",
+        ));
+    }
+    let mut raw = String::new();
+    (&mut file)
+        .take(MAX_LEASE_BYTES + 1)
+        .read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_LEASE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lease grew oversized",
+        ));
+    }
+    plain_file(path, &fs::symlink_metadata(path)?)?;
+    Ok(raw)
+}
+
+/// The interoperable lease document written by both control planes. Numeric time enters the
+/// native API explicitly and is rendered in the established UTC ISO form at the file boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRecord {
+    pub schema: String,
+    pub role: String,
+    pub owner_id: String,
+    pub session_id: String,
+    pub root: String,
+    pub host: String,
+    pub pid: u32,
+    pub pid_started: Option<String>,
+    pub acquired: String,
+    pub heartbeat: String,
+    pub ttl_seconds: u64,
+    pub generation: u64,
+    pub taken_over_from: Option<String>,
+}
+
+/// A safe liveness assessment. This native port deliberately uses the portable heartbeat proof;
+/// a future process-start proof may only make a stale result earlier, never turn a stale record
+/// into an automatic live takeover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseLiveness {
+    pub live: bool,
+    pub heartbeat_age_secs: u64,
+    pub basis: &'static str,
+}
+
+/// Read-only current lease state. Corrupt and legacy locks are distinct from a vacant lease so
+/// callers never silently overwrite an ownership record they cannot validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseStatus {
+    Vacant,
+    Live {
+        record: LeaseRecord,
+        liveness: LeaseLiveness,
+    },
+    Stale {
+        record: LeaseRecord,
+        liveness: LeaseLiveness,
+    },
+    LegacyLock {
+        detail: String,
+    },
+    Corrupt {
+        detail: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum LeaseError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    InvalidInput(String),
+    Busy,
+    HeldLive {
+        owner: String,
+        role: String,
+    },
+    Stale {
+        owner: String,
+    },
+    NotOwner {
+        owner: String,
+    },
+    AddressMismatch {
+        expected_role: String,
+        actual_role: String,
+        expected_root: String,
+        actual_root: String,
+    },
+    LegacyLock {
+        detail: String,
+    },
+    Corrupt {
+        detail: String,
+    },
+}
+
+impl fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "lease I/O error: {error}"),
+            Self::Json(error) => write!(f, "lease JSON error: {error}"),
+            Self::InvalidInput(message)
+            | Self::LegacyLock { detail: message }
+            | Self::Corrupt { detail: message } => f.write_str(message),
+            Self::Busy => f.write_str("lease transaction lock is held; retry after inspection"),
+            Self::HeldLive { owner, role } => {
+                write!(f, "lease is held live by owner={owner} role={role}")
+            }
+            Self::Stale { owner } => write!(
+                f,
+                "a stale lease is present for owner={owner}; explicit takeover is required"
+            ),
+            Self::NotOwner { owner } => write!(f, "lease belongs to owner={owner}"),
+            Self::AddressMismatch {
+                expected_role,
+                actual_role,
+                expected_root,
+                actual_root,
+            } => write!(
+                f,
+                "lease address mismatch: expected role={expected_role} root={expected_root}, found role={actual_role} root={actual_root}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LeaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::InvalidInput(_)
+            | Self::Busy
+            | Self::HeldLive { .. }
+            | Self::Stale { .. }
+            | Self::NotOwner { .. }
+            | Self::AddressMismatch { .. }
+            | Self::LegacyLock { .. }
+            | Self::Corrupt { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for LeaseError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for LeaseError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, LeaseError>;
+
+/// Native owner-lease store rooted at one explicit `.work` directory.
+#[derive(Debug, Clone)]
+pub struct LeaseStore {
+    work: PathBuf,
+}
+
+/// A native renewal worker for a live processor lease.
+///
+/// The worker uses the owner id plus the generation returned by [`LeaseStore::acquire`] as an
+/// optimistic ownership proof for every renewal.  It does not attempt to take over, repair, or
+/// release a lease: if another owner wins or the control plane becomes unavailable, the failure
+/// is retained and exposed as a cancellation probe for the enclosing contained call. `stop`
+/// wakes the worker immediately, so normal CLI cleanup never waits for the renewal interval.
+#[derive(Debug)]
+pub struct LeaseHeartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    failure: Arc<Mutex<Option<String>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseHeartbeatError {
+    Failed(String),
+    WorkerPanicked,
+}
+
+impl fmt::Display for LeaseHeartbeatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(message) => f.write_str(message),
+            Self::WorkerPanicked => f.write_str("native lease-heartbeat worker panicked"),
+        }
+    }
+}
+
+impl std::error::Error for LeaseHeartbeatError {}
+
+impl LeaseHeartbeat {
+    /// Start renewing `record` at most sixty seconds apart and at least three times within its
+    /// TTL.  The lower one-second clamp avoids a busy loop for intentionally short test leases.
+    pub fn start(store: LeaseStore, record: &LeaseRecord) -> Self {
+        let interval = Duration::from_secs((record.ttl_seconds / 3).clamp(1, 60));
+        Self::start_with_interval(store, record.owner_id.clone(), record.generation, interval)
+    }
+
+    fn start_with_interval(
+        store: LeaseStore,
+        owner: String,
+        generation: u64,
+        interval: Duration,
+    ) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let failure = Arc::new(Mutex::new(None));
+        let failure_for_worker = Arc::clone(&failure);
+        let worker = thread::spawn(move || {
+            let mut generation = generation;
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                match store.heartbeat(&owner, Some(generation), system_now_secs()) {
+                    Ok(record) => generation = record.generation,
+                    Err(error) => {
+                        if let Ok(mut failure) = failure_for_worker.lock() {
+                            *failure = Some(format!("native lease heartbeat failed: {error}"));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            stop: Some(stop_tx),
+            failure,
+            worker: Some(worker),
+        }
+    }
+
+    /// Produce a read-only cancellation fact for supervised children. A failed owner/generation
+    /// renewal means the process may no longer authorize a leaf result, so the child must be
+    /// contained and stopped rather than allowed to spend its remaining deadline.
+    pub fn cancellation_probe(&self) -> CancellationProbe {
+        let failure = Arc::clone(&self.failure);
+        CancellationProbe::new(move || {
+            failure
+                .lock()
+                .map(|failure| failure.is_some())
+                .unwrap_or(true)
+        })
+    }
+
+    /// Stop the worker, wait for it, and surface any lost-ownership or persistence failure.
+    /// This consumes the monitor so a caller cannot accidentally leave a detached renewal thread
+    /// alive after releasing its lease.
+    pub fn stop(mut self) -> std::result::Result<(), LeaseHeartbeatError> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            return Err(LeaseHeartbeatError::WorkerPanicked);
+        }
+        match self.failure.lock() {
+            Ok(failure) => match failure.as_ref() {
+                Some(message) => Err(LeaseHeartbeatError::Failed(message.clone())),
+                None => Ok(()),
+            },
+            Err(_) => Err(LeaseHeartbeatError::WorkerPanicked),
+        }
+    }
+}
+
+fn system_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+impl LeaseStore {
+    pub fn new(work: impl Into<PathBuf>) -> Self {
+        Self { work: work.into() }
+    }
+
+    pub fn work(&self) -> &Path {
+        &self.work
+    }
+
+    pub fn lock_directory(&self) -> PathBuf {
+        self.work.join(LOCK_DIRECTORY)
+    }
+
+    /// Inspect without creating `.work`, the lease directory, or a serialization lock.
+    pub fn status(&self, now_secs: u64) -> Result<LeaseStatus> {
+        self.read_status(now_secs)
+    }
+
+    /// Acquire only a vacant lease. A stale record is intentionally not adopted here: callers
+    /// must make the takeover decision explicit and auditable.
+    pub fn acquire(
+        &self,
+        owner: &str,
+        root: &Path,
+        ttl_seconds: u64,
+        now_secs: u64,
+    ) -> Result<LeaseRecord> {
+        self.with_transaction(|| match self.read_status(now_secs)? {
+            LeaseStatus::Vacant => {
+                self.write_new_record(owner, root, ttl_seconds, now_secs, 1, None)
+            }
+            LeaseStatus::Live { record, .. } => Err(LeaseError::HeldLive {
+                owner: record.owner_id,
+                role: record.role,
+            }),
+            LeaseStatus::Stale { record, .. } => Err(LeaseError::Stale {
+                owner: record.owner_id,
+            }),
+            LeaseStatus::LegacyLock { detail } => Err(LeaseError::LegacyLock { detail }),
+            LeaseStatus::Corrupt { detail } => Err(LeaseError::Corrupt { detail }),
+        })
+    }
+
+    /// Replace a demonstrably stale structured lease under the shared transaction lock. A record
+    /// that becomes live while waiting is refused; no `force` operation exists in this API.
+    pub fn takeover(
+        &self,
+        owner: &str,
+        root: &Path,
+        ttl_seconds: u64,
+        now_secs: u64,
+    ) -> Result<LeaseRecord> {
+        self.with_transaction(|| match self.read_status(now_secs)? {
+            LeaseStatus::Stale { record, .. } => self.write_new_record(
+                owner,
+                root,
+                ttl_seconds,
+                now_secs,
+                record.generation.saturating_add(1),
+                Some(record.owner_id),
+            ),
+            LeaseStatus::Vacant => {
+                self.write_new_record(owner, root, ttl_seconds, now_secs, 1, None)
+            }
+            LeaseStatus::Live { record, .. } => Err(LeaseError::HeldLive {
+                owner: record.owner_id,
+                role: record.role,
+            }),
+            LeaseStatus::LegacyLock { detail } => Err(LeaseError::LegacyLock { detail }),
+            LeaseStatus::Corrupt { detail } => Err(LeaseError::Corrupt { detail }),
+        })
+    }
+
+    /// Atomically adopt a stale predecessor only when it remains addressed to the expected
+    /// project root and role.  `processor --continue` must use this rather than observing the
+    /// address and then calling [`Self::takeover`] separately: another writer could otherwise
+    /// replace the stale record in that gap.  A vacant record is still a normal fresh acquisition.
+    pub fn takeover_addressed(
+        &self,
+        owner: &str,
+        root: &Path,
+        expected_role: &str,
+        ttl_seconds: u64,
+        now_secs: u64,
+    ) -> Result<LeaseRecord> {
+        self.with_transaction(|| match self.read_status(now_secs)? {
+            LeaseStatus::Stale { record, .. } => {
+                if record.role != expected_role || !roots_equivalent(Path::new(&record.root), root)
+                {
+                    return Err(LeaseError::AddressMismatch {
+                        expected_role: expected_role.into(),
+                        actual_role: record.role,
+                        expected_root: lexical_absolute_path(root)
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+                        actual_root: record.root,
+                    });
+                }
+                if record.owner_id == owner {
+                    return Err(LeaseError::InvalidInput(
+                        "addressed stale takeover needs a new owner distinct from the stale record"
+                            .into(),
+                    ));
+                }
+                self.write_new_record(
+                    owner,
+                    root,
+                    ttl_seconds,
+                    now_secs,
+                    record.generation.saturating_add(1),
+                    Some(record.owner_id),
+                )
+            }
+            LeaseStatus::Vacant => {
+                self.write_new_record(owner, root, ttl_seconds, now_secs, 1, None)
+            }
+            LeaseStatus::Live { record, .. } => Err(LeaseError::HeldLive {
+                owner: record.owner_id,
+                role: record.role,
+            }),
+            LeaseStatus::LegacyLock { detail } => Err(LeaseError::LegacyLock { detail }),
+            LeaseStatus::Corrupt { detail } => Err(LeaseError::Corrupt { detail }),
+        })
+    }
+
+    /// Renew exactly the caller's ownership record. `expected_generation` gives a caller an
+    /// optional optimistic-CAS boundary on top of the directory transaction lock.
+    pub fn heartbeat(
+        &self,
+        owner: &str,
+        expected_generation: Option<u64>,
+        now_secs: u64,
+    ) -> Result<LeaseRecord> {
+        validate_owner(owner)?;
+        self.with_transaction(|| {
+            let (LeaseStatus::Live { mut record, .. } | LeaseStatus::Stale { mut record, .. }) =
+                self.read_status(now_secs)?
+            else {
+                return self.status_error_for_mutation(now_secs);
+            };
+            if record.owner_id != owner {
+                return Err(LeaseError::NotOwner {
+                    owner: record.owner_id,
+                });
+            }
+            if expected_generation.is_some_and(|value| value != record.generation) {
+                return Err(LeaseError::InvalidInput(format!(
+                    "lease generation mismatch: expected {:?}, current {}",
+                    expected_generation, record.generation
+                )));
+            }
+            record.heartbeat = epoch_to_iso(now_secs);
+            record.generation = record.generation.saturating_add(1);
+            self.write_record(&record)?;
+            Ok(record)
+        })
+    }
+
+    /// Owner-checked release. The lock directory is removed only when it is empty after deleting
+    /// the known lease file; foreign entries are never recursively deleted.
+    pub fn release(&self, owner: &str, now_secs: u64) -> Result<bool> {
+        validate_owner(owner)?;
+        self.with_transaction(|| match self.read_status(now_secs)? {
+            LeaseStatus::Vacant => Ok(false),
+            LeaseStatus::Live { record, .. } | LeaseStatus::Stale { record, .. } => {
+                if record.owner_id != owner {
+                    return Err(LeaseError::NotOwner {
+                        owner: record.owner_id,
+                    });
+                }
+                fs::remove_file(self.lease_path())?;
+                self.remove_empty_lock_directory()?;
+                Ok(true)
+            }
+            LeaseStatus::LegacyLock { detail } => Err(LeaseError::LegacyLock { detail }),
+            LeaseStatus::Corrupt { detail } => Err(LeaseError::Corrupt { detail }),
+        })
+    }
+
+    fn write_new_record(
+        &self,
+        owner: &str,
+        root: &Path,
+        ttl_seconds: u64,
+        now_secs: u64,
+        generation: u64,
+        taken_over_from: Option<String>,
+    ) -> Result<LeaseRecord> {
+        validate_owner(owner)?;
+        if ttl_seconds == 0 {
+            return Err(LeaseError::InvalidInput(
+                "lease TTL must be at least one second".into(),
+            ));
+        }
+        let root = absolute_root(root)?;
+        let now = epoch_to_iso(now_secs);
+        let record = LeaseRecord {
+            schema: LEASE_SCHEMA.into(),
+            role: ENGINE_ROLE.into(),
+            owner_id: owner.into(),
+            session_id: owner.into(),
+            root,
+            host: host_name(),
+            // A portable heartbeat is the safe liveness proof. Writing a PID without an equally
+            // portable creation-time proof would make a reused PID look live forever to legacy.
+            pid: 0,
+            pid_started: None,
+            acquired: now.clone(),
+            heartbeat: now,
+            ttl_seconds,
+            generation,
+            taken_over_from,
+        };
+        self.write_record(&record)?;
+        Ok(record)
+    }
+
+    fn status_error_for_mutation<T>(&self, now_secs: u64) -> Result<T> {
+        match self.read_status(now_secs)? {
+            LeaseStatus::Vacant => Err(LeaseError::InvalidInput(
+                "no structured lease is present".into(),
+            )),
+            LeaseStatus::LegacyLock { detail } => Err(LeaseError::LegacyLock { detail }),
+            LeaseStatus::Corrupt { detail } => Err(LeaseError::Corrupt { detail }),
+            LeaseStatus::Live { record, .. } | LeaseStatus::Stale { record, .. } => {
+                Err(LeaseError::NotOwner {
+                    owner: record.owner_id,
+                })
+            }
+        }
+    }
+
+    fn read_status(&self, now_secs: u64) -> Result<LeaseStatus> {
+        let work_metadata = match fs::symlink_metadata(&self.work) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(LeaseStatus::Vacant);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        plain_directory(&self.work, &work_metadata)?;
+        let lock = self.lock_directory();
+        let lock_metadata = match fs::symlink_metadata(&lock) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(LeaseStatus::Vacant);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if plain_directory(&lock, &lock_metadata).is_err() {
+            return Ok(LeaseStatus::LegacyLock {
+                detail: format!("lease path {} is not a plain directory", lock.display()),
+            });
+        }
+        let lease = self.lease_path();
+        match fs::symlink_metadata(&lease) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let entries = fs::read_dir(&lock)?
+                    .filter_map(std::result::Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name != STAGING_FILE)
+                    .collect::<Vec<_>>();
+                return if entries.is_empty() {
+                    Ok(LeaseStatus::Vacant)
+                } else {
+                    Ok(LeaseStatus::LegacyLock {
+                        detail: format!(
+                            "lock directory contains non-lease entries without {LEASE_FILE}: {}",
+                            entries.join(", ")
+                        ),
+                    })
+                };
+            }
+            Err(error) => return Err(error.into()),
+            Ok(metadata) => plain_file(&lease, &metadata)?,
+        }
+        let raw = read_plain_lease(&lease)?;
+        let record: LeaseRecord = match serde_json::from_str(&raw) {
+            Ok(record) => record,
+            Err(error) => {
+                return Ok(LeaseStatus::Corrupt {
+                    detail: format!("cannot parse {}: {error}", lease.display()),
+                });
+            }
+        };
+        if let Err(detail) = validate_record(&record) {
+            return Ok(LeaseStatus::Corrupt { detail });
+        }
+        let heartbeat = iso_to_epoch(&record.heartbeat).ok_or_else(|| {
+            LeaseError::InvalidInput(format!(
+                "validated heartbeat no longer parses: {:?}",
+                record.heartbeat
+            ))
+        })?;
+        let age = now_secs.saturating_sub(heartbeat);
+        // A future heartbeat (clock skew) is never considered stale; fail closed until a later
+        // observation catches up rather than permitting a second writer on a skewed clock.
+        let live = now_secs < heartbeat || age < record.ttl_seconds;
+        let liveness = LeaseLiveness {
+            live,
+            heartbeat_age_secs: age,
+            basis: "heartbeat",
+        };
+        Ok(if live {
+            LeaseStatus::Live { record, liveness }
+        } else {
+            LeaseStatus::Stale { record, liveness }
+        })
+    }
+
+    fn write_record(&self, record: &LeaseRecord) -> Result<()> {
+        let lock = self.lock_directory();
+        match fs::symlink_metadata(&lock) {
+            Ok(metadata) => plain_directory(&lock, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&lock)?;
+                plain_directory(&lock, &fs::symlink_metadata(&lock)?)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let lease = self.lease_path();
+        match fs::symlink_metadata(&lease) {
+            Ok(metadata) => plain_file(&lease, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let staging = lock.join(STAGING_FILE);
+        let payload = serde_json::to_vec(record)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        let write = (|| -> io::Result<()> {
+            file.write_all(&payload)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(error) = write {
+            let _ = fs::remove_file(&staging);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&staging, &lease) {
+            let _ = fs::remove_file(&staging);
+            return Err(error.into());
+        }
+        plain_file(&lease, &fs::symlink_metadata(&lease)?)?;
+        Ok(())
+    }
+
+    fn with_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        match fs::symlink_metadata(&self.work) {
+            Ok(metadata) => plain_directory(&self.work, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&self.work)?;
+                plain_directory(&self.work, &fs::symlink_metadata(&self.work)?)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let tx = self.work.join(TRANSACTION_LOCK);
+        match fs::create_dir(&tx) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(LeaseError::Busy);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let result = operation();
+        // The native transaction directory is always empty. A failure to remove it is surfaced
+        // only when the operation itself succeeded; otherwise preserve the primary error.
+        match fs::remove_dir(&tx) {
+            Ok(()) => result,
+            Err(error) if result.is_ok() => Err(error.into()),
+            Err(_) => result,
+        }
+    }
+
+    fn remove_empty_lock_directory(&self) -> Result<()> {
+        let lock = self.lock_directory();
+        match fs::symlink_metadata(&lock) {
+            Ok(metadata) => plain_directory(&lock, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        match fs::remove_dir(&lock) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn lease_path(&self) -> PathBuf {
+        self.lock_directory().join(LEASE_FILE)
+    }
+}
+
+fn validate_owner(owner: &str) -> Result<()> {
+    if owner.trim().is_empty() || owner.contains(['\0', '\n', '\r']) {
+        Err(LeaseError::InvalidInput(format!(
+            "invalid lease owner {owner:?}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_record(record: &LeaseRecord) -> std::result::Result<(), String> {
+    if record.schema != LEASE_SCHEMA {
+        return Err(format!("unsupported lease schema {:?}", record.schema));
+    }
+    if record.role.trim().is_empty()
+        || record.owner_id.trim().is_empty()
+        || record.root.trim().is_empty()
+        || record.host.trim().is_empty()
+        || record.ttl_seconds == 0
+        || record.generation == 0
+    {
+        return Err("lease record has a required empty/zero field".into());
+    }
+    if iso_to_epoch(&record.heartbeat).is_none() || iso_to_epoch(&record.acquired).is_none() {
+        return Err("lease record has an invalid UTC timestamp".into());
+    }
+    Ok(())
+}
+
+fn absolute_root(root: &Path) -> Result<String> {
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        env::current_dir()?.join(root)
+    };
+    Ok(root.to_string_lossy().into_owned())
+}
+
+/// Compare project-root addresses with the same lexical rules as Orchestra's lease verifier.
+///
+/// This deliberately does not resolve symlinks: a lease address is the user-visible project
+/// root, and resolving a junction/symlink would both require the path to exist and can turn a
+/// harmless spelling difference into a different extended Windows path.  It does, however,
+/// collapse `.`/`..`, ignore a trailing separator, and follows the host platform's ordinary path
+/// case rule.  Invalid/unresolvable relative input fails closed as a non-match.
+pub fn roots_equivalent(left: &Path, right: &Path) -> bool {
+    let Some(left) = lexical_absolute_path(left) else {
+        return false;
+    };
+    let Some(right) = lexical_absolute_path(right) else {
+        return false;
+    };
+
+    let left = left.to_string_lossy();
+    let right = right.to_string_lossy();
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
+}
+
+fn lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().ok()?.join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `Path.GetFullPath` (the interoperable legacy comparator) retains the root
+                // rather than escaping it when a path starts with more `..` components.
+                let _ = normalized.pop();
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    Some(normalized)
+}
+
+fn host_name() -> String {
+    env::var("COMPUTERNAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn work(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "orchestrail-native-lease-{label}-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn acquire_heartbeat_and_owner_checked_release_are_durable() {
+        let work = work("lifecycle");
+        let store = LeaseStore::new(&work);
+        let record = store.acquire("engine-a", Path::new("."), 10, 100).unwrap();
+        assert_eq!(record.role, ENGINE_ROLE);
+        assert_eq!(record.generation, 1);
+        assert!(matches!(
+            store.status(101).unwrap(),
+            LeaseStatus::Live { .. }
+        ));
+
+        let renewed = store.heartbeat("engine-a", Some(1), 102).unwrap();
+        assert_eq!(renewed.generation, 2);
+        assert!(matches!(
+            store.release("engine-b", 103),
+            Err(LeaseError::NotOwner { .. })
+        ));
+        assert!(store.release("engine-a", 103).unwrap());
+        assert_eq!(store.status(103).unwrap(), LeaseStatus::Vacant);
+        assert!(!store.lock_directory().exists());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn stale_lease_needs_explicit_takeover_and_old_owner_loses_access() {
+        let work = work("takeover");
+        let store = LeaseStore::new(&work);
+        store.acquire("engine-a", Path::new("."), 10, 100).unwrap();
+        assert!(matches!(
+            store.status(110).unwrap(),
+            LeaseStatus::Stale { .. }
+        ));
+        assert!(matches!(
+            store.acquire("engine-b", Path::new("."), 10, 110),
+            Err(LeaseError::Stale { .. })
+        ));
+        let adopted = store.takeover("engine-b", Path::new("."), 10, 110).unwrap();
+        assert_eq!(adopted.generation, 2);
+        assert_eq!(adopted.taken_over_from.as_deref(), Some("engine-a"));
+        assert!(matches!(
+            store.heartbeat("engine-a", None, 111),
+            Err(LeaseError::NotOwner { .. })
+        ));
+        assert!(store.release("engine-b", 111).unwrap());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn legacy_and_corrupt_lock_states_are_never_overwritten() {
+        let work = work("foreign");
+        let store = LeaseStore::new(&work);
+        fs::create_dir_all(store.lock_directory()).unwrap();
+        fs::write(store.lock_directory().join("info"), "legacy").unwrap();
+        assert!(matches!(
+            store.status(100).unwrap(),
+            LeaseStatus::LegacyLock { .. }
+        ));
+        assert!(matches!(
+            store.acquire("engine", Path::new("."), 10, 100),
+            Err(LeaseError::LegacyLock { .. })
+        ));
+        fs::remove_file(store.lock_directory().join("info")).unwrap();
+        fs::write(store.lease_path(), "not-json").unwrap();
+        assert!(matches!(
+            store.status(100).unwrap(),
+            LeaseStatus::Corrupt { .. }
+        ));
+        assert!(matches!(
+            store.takeover("engine", Path::new("."), 10, 100),
+            Err(LeaseError::Corrupt { .. })
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn stale_legacy_shape_is_read_and_taken_over_without_running_powershell() {
+        let work = work("interop");
+        let store = LeaseStore::new(&work);
+        fs::create_dir_all(store.lock_directory()).unwrap();
+        let legacy = serde_json::json!({
+            "schema": "orchestra/lease@1",
+            "role": "processor",
+            "owner_id": "legacy-owner",
+            "session_id": "legacy-session",
+            "root": "D:/legacy",
+            "host": "other-host",
+            "pid": 0,
+            "pid_started": null,
+            "acquired": "1970-01-01T00:01:40Z",
+            "heartbeat": "1970-01-01T00:01:40Z",
+            "ttl_seconds": 10,
+            "generation": 7,
+            "taken_over_from": null
+        });
+        fs::write(store.lease_path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(matches!(
+            store.status(110).unwrap(),
+            LeaseStatus::Stale { .. }
+        ));
+        let new = store.takeover("engine", Path::new("."), 10, 110).unwrap();
+        assert_eq!(new.generation, 8);
+        assert_eq!(new.taken_over_from.as_deref(), Some("legacy-owner"));
+        assert!(store.release("engine", 111).unwrap());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn addressed_takeover_refuses_a_stale_record_with_a_foreign_root_or_role() {
+        let work = work("addressed-takeover");
+        let store = LeaseStore::new(&work);
+        let root = std::env::current_dir().expect("current directory");
+        let other_root = root.join("other-project");
+        let first = store
+            .acquire("foreign-root", &other_root, 10, 100)
+            .expect("seed foreign-root stale lease");
+
+        assert!(matches!(
+            store.takeover_addressed("resumer", &root, ENGINE_ROLE, 10, 111),
+            Err(LeaseError::AddressMismatch { .. })
+        ));
+        assert!(matches!(
+            store.status(111),
+            Ok(LeaseStatus::Stale { ref record, .. })
+                if record.owner_id == first.owner_id && record.root == first.root
+        ));
+
+        let mut foreign_role = first;
+        foreign_role.root = root.to_string_lossy().into_owned();
+        foreign_role.role = "merger".into();
+        fs::write(
+            store.lease_path(),
+            serde_json::to_vec(&foreign_role).expect("serialize stale foreign-role lease"),
+        )
+        .expect("replace fixture lease record");
+        assert!(matches!(
+            store.takeover_addressed("resumer", &root, ENGINE_ROLE, 10, 111),
+            Err(LeaseError::AddressMismatch { .. })
+        ));
+        assert!(matches!(
+            store.status(111),
+            Ok(LeaseStatus::Stale { ref record, .. }) if record.role == "merger"
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn addressed_takeover_requires_a_new_owner_inside_the_transaction() {
+        let work = work("addressed-takeover-owner");
+        let store = LeaseStore::new(&work);
+        let root = std::env::current_dir().expect("current directory");
+        let seeded = store
+            .acquire("interrupted-owner", &root, 10, 100)
+            .expect("seed addressed stale lease");
+
+        assert!(matches!(
+            store.takeover_addressed("interrupted-owner", &root, ENGINE_ROLE, 10, 111),
+            Err(LeaseError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            store.status(111),
+            Ok(LeaseStatus::Stale { ref record, .. })
+                if record.owner_id == seeded.owner_id && record.generation == seeded.generation
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn renewal_worker_keeps_the_owner_lease_live_and_stops_promptly() {
+        let work = work("renewal-worker");
+        let store = LeaseStore::new(&work);
+        let initial = store
+            .acquire("engine-a", Path::new("."), 60, 100)
+            .expect("acquire test lease");
+        let worker = LeaseHeartbeat::start_with_interval(
+            store.clone(),
+            initial.owner_id.clone(),
+            initial.generation,
+            Duration::from_millis(5),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let renewed = loop {
+            let status = store.status(system_now_secs()).expect("read lease");
+            if let LeaseStatus::Live { record, .. } = status
+                && record.generation > initial.generation
+            {
+                break record;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not renew lease"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(renewed.owner_id, "engine-a");
+        worker.stop().expect("stop clean renewal worker");
+        assert!(store.release("engine-a", system_now_secs()).unwrap());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn heartbeat_cancellation_probe_latches_lost_ownership() {
+        let work = work("renewal-lost-owner");
+        let store = LeaseStore::new(&work);
+        let initial = store
+            .acquire("engine-a", Path::new("."), 60, system_now_secs())
+            .expect("acquire test lease");
+        let worker = LeaseHeartbeat::start_with_interval(
+            store.clone(),
+            initial.owner_id.clone(),
+            initial.generation,
+            Duration::from_millis(5),
+        );
+        let probe = worker.cancellation_probe();
+        store
+            .takeover(
+                "engine-b",
+                Path::new("."),
+                60,
+                system_now_secs().saturating_add(61),
+            )
+            .expect("explicitly replace stale owner in fixture");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !probe.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lost ownership did not reach the containment cancellation probe"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            worker.stop().is_err(),
+            "the monitoring owner must surface its CAS failure"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn redirected_work_or_lease_file_is_never_followed() {
+        let real_work = work("redirect-real");
+        let redirected_work = work("redirect-link");
+        fs::create_dir(&real_work).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&real_work, &redirected_work).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real_work, &redirected_work).is_ok();
+        if linked {
+            let store = LeaseStore::new(&redirected_work);
+            assert!(matches!(
+                store.acquire("engine-a", Path::new("."), 60, 100),
+                Err(LeaseError::Io(_))
+            ));
+            assert_eq!(fs::read_dir(&real_work).unwrap().count(), 0);
+        }
+        let _ = fs::remove_dir_all(redirected_work);
+        let _ = fs::remove_dir_all(real_work);
+
+        let work = work("redirect-file");
+        let store = LeaseStore::new(&work);
+        fs::create_dir_all(store.lock_directory()).unwrap();
+        let external = work.with_extension("external.json");
+        fs::write(&external, "external sentinel\n").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&external, store.lease_path()).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&external, store.lease_path()).is_ok();
+        if linked {
+            assert!(matches!(store.status(100), Err(LeaseError::Io(_))));
+            assert_eq!(
+                fs::read_to_string(&external).unwrap(),
+                "external sentinel\n"
+            );
+        }
+        let _ = fs::remove_file(&external);
+        let _ = fs::remove_dir_all(work);
+    }
+}

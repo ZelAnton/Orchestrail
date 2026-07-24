@@ -1,0 +1,29 @@
+[workspace]
+members = ["engine", "tui"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+# `vcs-core` 0.9 (the mandatory typed Git/JJ boundary) supports Rust 1.88 and later.
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/ZelAnton/Orchestrail"
+authors = ["Zhelezniakou Anton <github@zelanton.net>"]
+
+[workspace.dependencies]
+# Contained, async execution of every external program launched by the engine or TUI.
+processkit = "2.3"
+# Typed, async facade for Git and Jujutsu operations used by product code.
+vcs-core = "0.9"
+# Managed CLI wrappers, retries, credential injection, and ProcessKit error classifiers.
+vcs-cli-support = "0.7"
+# Pure Rust parsing and data model for Git-format diffs.
+vcs-diff = "0.7"
+# Typed backend-specific operations where the common facade intentionally has no mutation form.
+vcs-git = "0.11"
+vcs-jj = "0.11"
+# Typed GitHub Actions/check-runs client used by the native CI publication gate.
+vcs-github = "0.11"
+
+[profile.release]
+opt-level = 2

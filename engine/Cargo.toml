@@ -1,0 +1,79 @@
+[package]
+name = "orchestrail-engine"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Deterministic orchestration engine primitives, state resolvers, and event contracts."
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# `claude/codex/contract/jsonline` stay dependency-free. The events module uses
+# `serde_json` for robust parsing of the `.work/events.jsonl` outbox.
+
+[dependencies]
+# Durable processor checkpoints use a typed, versioned JSON representation.
+serde = { version = "1", features = ["derive"] }
+# Typed decoding for the durable JSONL event outbox and leaf-agent transcripts.
+serde_json = "1"
+# SHA-256 for the timestamp/event-id-independent parity fingerprint shared with the legacy harness.
+sha2 = "0.10"
+# Contained process execution for every production external-tool launch.
+processkit.workspace = true
+# The engine exposes a synchronous boundary while ProcessKit is async.  Rolling
+# task fan-out needs more than one worker so independent contained leaves can be
+# driven concurrently on Windows as well as Unix.
+tokio = { version = "1.39", features = ["rt", "rt-multi-thread", "time"] }
+# Typed repository discovery, worktree/workspace lifecycle, commits, and publication. Product
+# VCS code must not reimplement git/jj command wrappers.
+vcs-core.workspace = true
+# Input guard and ProcessKit-aware command policy shared by the VCS backends.
+vcs-cli-support.workspace = true
+# Stable typed diff models used by the VCS service's review/verification boundary.
+vcs-diff.workspace = true
+# Typed real merge operations behind the `vcs-core` discovery facade.
+vcs-git.workspace = true
+vcs-jj.workspace = true
+# Typed `gh api` client for commit-SHA-bound GitHub CI polling.
+vcs-github.workspace = true
+# A fresh v4 owner UUID prevents PID reuse from sharing authority with an interrupted lease;
+# deterministic event identities use the legacy contract's standard URL-namespace UUIDv5.
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+# Property tests for parser and state-machine panic-freedom.
+proptest = { version = "=1.0.0", default-features = false, features = ["std"] }
+
+[lib]
+name = "orchestrail_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orchestrail-engine"
+path = "src/main.rs"
+
+# Test-only argv-compatible stand-in for hermetic ProcessKit-backed headless-agent fixtures.
+[[bin]]
+name = "orchestrail-fixture-claude"
+path = "tests/support/fixture_claude.rs"
+test = false
+
+# Test-only process boundary used to prove that a merger-conflict checkpoint written by one
+# process is restored inspect-first by a different process.
+[[bin]]
+name = "orchestrail-fixture-runtime"
+path = "tests/support/fixture_runtime.rs"
+test = false
+
+# Test-only stdin/JSONL stand-in for a contained read-only Codex reviewer.
+[[bin]]
+name = "orchestrail-fixture-codex"
+path = "tests/support/fixture_codex.rs"
+test = false
+
+# Test-only ProcessKit-only descendant fixture used to prove Windows Job containment tears down
+# a nested child when the outer engine deadline expires.
+[[bin]]
+name = "orchestrail-fixture-process-tree"
+path = "tests/support/fixture_process_tree.rs"
+test = false
