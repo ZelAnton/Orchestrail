@@ -4762,11 +4762,12 @@ mod tests {
             .verify_release_tag("2.0.0", None, &synced.current, &base)
             .unwrap();
         assert_eq!(evidence.revision, expected);
-        assert_eq!(
-            service
-                .published_primary_workspace(&base, &expected)
-                .unwrap(),
-            local.path
+        let published_workspace = service
+            .published_primary_workspace(&base, &expected)
+            .unwrap();
+        assert!(
+            same_path(&published_workspace, &local.path),
+            "published release workspace must resolve to the local checkout"
         );
         assert!(!service.snapshot().unwrap().dirty);
     }
@@ -5093,6 +5094,7 @@ mod tests {
         let repository = TestRepository::new();
         let git = Git::hardened();
         git_block_on(git.init(&repository.path));
+        git_block_on(git.config_set(&repository.path, "core.autocrlf", "false"));
         git_block_on(git.config_set(&repository.path, "user.name", "Orchestrail Test"));
         git_block_on(git.config_set(
             &repository.path,
@@ -5176,7 +5178,11 @@ mod tests {
             "implemented"
         );
 
-        assert!(git_block_on(git.status(&task.path)).is_empty());
+        let task_status = git_block_on(git.status(&task.path));
+        assert!(
+            task_status.is_empty(),
+            "merged task workspace must remain clean: {task_status:?}"
+        );
     }
 
     #[test]
