@@ -21,7 +21,7 @@ fn main() {
     let Ok(current_dir) = std::env::current_dir() else {
         fail("could not read child working directory");
     };
-    if current_dir != Path::new(worktree) {
+    if !same_path(&current_dir, Path::new(worktree)) {
         fail("child current directory differs from Codex -C worktree");
     }
     let mut prompt = String::new();
@@ -120,6 +120,13 @@ fn argv_worktree(args: &[String]) -> Option<&str> {
 fn token_after<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.split_whitespace()
         .find_map(|word| word.strip_prefix(prefix))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    fs::canonicalize(left)
+        .ok()
+        .zip(fs::canonicalize(right).ok())
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn canonical_task_id(value: &str) -> bool {

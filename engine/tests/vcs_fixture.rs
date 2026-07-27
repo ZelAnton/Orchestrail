@@ -86,7 +86,10 @@ fn typed_vcs_service_creates_commits_and_cleans_a_guarded_task_worktree() {
         .ensure_task_workspace(&work, "T-1", "main")
         .expect("create typed task worktree");
     assert_eq!(workspace.branch, "task/T-1");
-    assert!(workspace.path.starts_with(work.join("worktrees")));
+    let physical_workspace = fs::canonicalize(&workspace.path).expect("resolve task worktree");
+    let physical_worktrees =
+        fs::canonicalize(work.join("worktrees")).expect("resolve guarded worktree root");
+    assert!(physical_workspace.starts_with(physical_worktrees));
     let empty_task = vcs
         .task_recovery_observation(&work, "T-1", &base)
         .expect("observe empty task branch through vcs-core");
