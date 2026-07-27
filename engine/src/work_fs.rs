@@ -430,7 +430,10 @@ mod tests {
             assert!(read_optional_text(&work, &nested, 32).is_err());
             assert!(replace_file(&work, &nested, b"changed", 32).is_err());
             assert_eq!(fs::read_to_string(&external_file).unwrap(), "outside\n");
+            #[cfg(windows)]
             fs::remove_dir(&linked_dir).unwrap();
+            #[cfg(unix)]
+            fs::remove_file(&linked_dir).unwrap();
         }
 
         let _ = fs::remove_dir_all(work);

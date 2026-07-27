@@ -5,8 +5,6 @@
 //! `VERIFICATION_COMMANDS` cannot quietly regain pipes, redirects, expansion, or a second
 //! command through `cmd`/`sh`.
 
-use std::path::Path;
-
 /// Decode one operator configuration entry into a program and typed arguments.
 ///
 /// Whitespace separates arguments outside `'…'`/`"…"`; backslash escapes only a quote or another
@@ -74,9 +72,11 @@ pub fn validate_direct_program(program: &str) -> Result<(), String> {
     if program.is_empty() || program.contains(['\0', '\n', '\r']) {
         return Err("executable must be non-empty and contain no NUL or line break".into());
     }
-    let executable = Path::new(program)
-        .file_name()
-        .and_then(|value| value.to_str())
+    // `Path` parses only the host platform's separators. Configuration is portable, so a
+    // Windows shell path must still be recognized (and rejected) on Unix, and vice versa.
+    let executable = program
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or(program)
         .to_ascii_lowercase();
     if matches!(

@@ -1513,6 +1513,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
+            let path = crate::dependency_graph::canonical_project_root(&path).unwrap();
             Self { path }
         }
 

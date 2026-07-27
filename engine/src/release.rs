@@ -1222,11 +1222,13 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
     fn temp(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "orchestrail-release-{label}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+        ));
+        fs::create_dir_all(&path).unwrap();
+        crate::dependency_graph::canonical_project_root(&path).unwrap()
     }
 
     #[test]

@@ -4793,8 +4793,12 @@ mod tests {
             "user.email",
             "orchestrail-test@example.invalid",
         ));
+        fs::write(repository.path.join(".gitignore"), ".work/\n").unwrap();
         fs::write(repository.path.join("base.txt"), "base\n").unwrap();
-        git_block_on(git.add(&repository.path, &[PathBuf::from("base.txt")]));
+        git_block_on(git.add(
+            &repository.path,
+            &[PathBuf::from(".gitignore"), PathBuf::from("base.txt")],
+        ));
         git_block_on(git.commit(&repository.path, "Initial base"));
         let initial_branch = git_block_on(git.current_branch(&repository.path)).unwrap();
         if initial_branch != "main" {
@@ -5095,8 +5099,12 @@ mod tests {
             "user.email",
             "orchestrail-test@example.invalid",
         ));
+        fs::write(repository.path.join(".gitignore"), ".work/\n").expect("ignore control plane");
         fs::write(repository.path.join("base.txt"), "base\n").expect("write base file");
-        git_block_on(git.add(&repository.path, &[PathBuf::from("base.txt")]));
+        git_block_on(git.add(
+            &repository.path,
+            &[PathBuf::from(".gitignore"), PathBuf::from("base.txt")],
+        ));
         git_block_on(git.commit(&repository.path, "Initial base"));
 
         let initial_branch =
@@ -5405,11 +5413,12 @@ mod tests {
                 .trim(),
             "released"
         );
-        assert_eq!(
-            service
-                .published_primary_workspace("main", &published)
-                .expect("prove clean published Git workspace"),
-            repository.path
+        let published_workspace = service
+            .published_primary_workspace("main", &published)
+            .expect("prove clean published Git workspace");
+        assert!(
+            same_path(&published_workspace, &repository.path),
+            "published Git workspace must resolve to the test repository"
         );
         fs::write(repository.path.join("ci-fix.txt"), "green\n").expect("write primary CI repair");
         let repaired = service
@@ -5445,8 +5454,12 @@ mod tests {
             "user.email",
             "orchestrail-test@example.invalid",
         ));
+        fs::write(repository.path.join(".gitignore"), ".work/\n").unwrap();
         fs::write(repository.path.join("base.txt"), "base\n").unwrap();
-        git_block_on(git.add(&repository.path, &[PathBuf::from("base.txt")]));
+        git_block_on(git.add(
+            &repository.path,
+            &[PathBuf::from(".gitignore"), PathBuf::from("base.txt")],
+        ));
         git_block_on(git.commit(&repository.path, "Initial base"));
         let initial_branch = git_block_on(git.current_branch(&repository.path)).unwrap();
         if initial_branch != "main" {
@@ -6123,11 +6136,12 @@ mod tests {
             jj_bookmark_target(&bookmarks, &integration.branch)
                 .expect("integration target after publication")
         );
-        assert_eq!(
-            service
-                .published_primary_workspace("main", &published)
-                .expect("prove clean published JJ primary child"),
-            repository.path
+        let published_workspace = service
+            .published_primary_workspace("main", &published)
+            .expect("prove clean published JJ primary child");
+        assert!(
+            same_path(&published_workspace, &repository.path),
+            "published JJ workspace must resolve to the test repository"
         );
         fs::write(repository.path.join("ci-fix.txt"), "green\n")
             .expect("write primary JJ CI repair");

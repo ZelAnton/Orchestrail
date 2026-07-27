@@ -3961,6 +3961,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&root).unwrap();
+            let root = dependency_graph::canonical_project_root(&root).unwrap();
             Self {
                 root,
                 auxiliary_paths: Vec::new(),
@@ -4021,7 +4022,7 @@ mod tests {
     fn terminal_archive_degrades_metrics_when_the_event_sink_is_unavailable() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
         fs::write(
@@ -4069,7 +4070,7 @@ mod tests {
     fn knowledge_preflight_skips_absent_empty_and_already_curated_kb() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         let port = FileVcsPort::discover(&work, &repository.root, StubExternal { planned: false })
@@ -4140,7 +4141,7 @@ mod tests {
         fs::create_dir_all(&external).unwrap();
         fs::write(external.join("B-20260725T120000Z.done"), "done\n").unwrap();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("knowledge")).unwrap();
         let redirected = work.join("knowledge/.curated");
@@ -4173,7 +4174,7 @@ mod tests {
     fn archive_preflight_preserves_only_direct_codex_artifacts_for_env_limit_attempts() {
         let mut repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         let task = work.join("tasks/T-1");
         fs::create_dir_all(task.join("nested")).unwrap();
@@ -4236,7 +4237,7 @@ mod tests {
     fn knowledge_preflight_requires_nonempty_merged_task_learnings() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("knowledge")).unwrap();
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
@@ -4260,7 +4261,7 @@ mod tests {
     fn completed_knowledge_curator_requires_the_exact_batch_sentinel() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("knowledge/.curated")).unwrap();
         let mut port =
@@ -4300,7 +4301,7 @@ mod tests {
     fn knowledge_preflight_matches_index_scope_against_exact_batch_diff() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(&repository.root, "user.email", "orchestrail@example.test"));
         fs::write(repository.root.join("base.txt"), "base\n").unwrap();
@@ -4362,6 +4363,12 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(future).unwrap()
+    }
+
+    fn init_git_repository(git: &Git, root: &Path) {
+        block_on(git.init(root));
+        fs::write(root.join(".git/info/exclude"), ".work/\n.inbox/\n")
+            .expect("exclude private control-plane fixtures");
     }
 
     fn jj_run(jj: &Jj, dir: &Path, args: &[&str]) {
@@ -4683,7 +4690,7 @@ mod tests {
     fn archive_preflight_reconfirms_only_an_effective_remote_required_ci_route() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         fs::write(
@@ -4737,7 +4744,7 @@ mod tests {
     fn phase_zero_legacy_recheck_closes_open_admission_when_native_telemetry_is_unavailable() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         let port = FileVcsPort::discover(&work, &repository.root, StubExternal { planned: false })
@@ -4823,7 +4830,7 @@ mod tests {
     fn denylisted_candidate_is_left_uncaptured_before_any_workspace_is_created() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
         fs::write(
@@ -4896,7 +4903,7 @@ mod tests {
     fn queue_inbox_drain_precedes_the_planner_boundary() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("queue_inbox")).unwrap();
         fs::write(
@@ -4946,7 +4953,7 @@ mod tests {
     fn native_inbox_intake_reconciles_curation_provenance_before_planning() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         let message_id = "msg-00000001";
         fs::create_dir_all(work.join("queue_inbox")).unwrap();
@@ -5033,7 +5040,7 @@ mod tests {
     fn native_dependency_curator_candidate_is_cas_synced_without_registry_write_authority() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         let registry = work.join("registry/projects.json");
@@ -5096,7 +5103,7 @@ mod tests {
     fn a_stale_present_verification_evidence_cannot_acknowledge_a_fresh_integration_tip() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(&repository.root, "user.email", "orchestrail@example.test"));
         fs::write(repository.root.join("base.txt"), "base\n").unwrap();
@@ -5198,7 +5205,7 @@ mod tests {
     fn typed_docs_only_range_creates_evidence_without_launching_the_profile() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(&repository.root, "user.email", "orchestrail@example.test"));
         fs::write(repository.root.join("base.txt"), "base\n").unwrap();
@@ -5291,7 +5298,7 @@ mod tests {
     fn publication_rechecks_the_committed_integration_range_against_the_current_denylist() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(&repository.root, "user.email", "orchestrail@example.test"));
         fs::write(repository.root.join("base.txt"), "base\n").unwrap();
@@ -5374,7 +5381,7 @@ mod tests {
     fn a_required_policy_command_change_holds_the_stale_verification_profile() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         fs::write(
@@ -5412,7 +5419,7 @@ mod tests {
     fn inbox_finalizer_cannot_claim_success_while_a_terminal_reply_is_still_pending() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         let message_id = "msg-00000001";
         fs::create_dir_all(&work).unwrap();
@@ -5478,7 +5485,7 @@ mod tests {
     fn planner_cannot_admit_a_descriptor_that_omits_an_unfinished_queue_dependency() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
         fs::write(
@@ -5520,7 +5527,7 @@ mod tests {
     fn planner_cannot_replace_the_descriptor_risk_before_capture() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
         fs::write(
@@ -5573,7 +5580,7 @@ mod tests {
     fn concurrent_task_review_writes_its_typed_range_before_external_dispatch() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -5747,7 +5754,7 @@ mod tests {
     fn queue_inbox_quarantine_uses_the_checkpointed_cohort_clock_on_replayable_boundary() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("queue_inbox")).unwrap();
         fs::write(
@@ -5796,7 +5803,7 @@ mod tests {
     fn denylisted_leaf_evidence_cannot_create_a_task_commit() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -5897,7 +5904,7 @@ mod tests {
     fn failed_per_merge_verification_rolls_back_only_that_git_candidate_and_quarantines_it() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6008,7 +6015,7 @@ mod tests {
     fn failed_verification_of_a_replayed_legacy_merge_preserves_it_for_inspection() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6109,7 +6116,7 @@ mod tests {
     fn requested_push_without_a_remote_publishes_locally_and_completes_without_legacy_scripts() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6231,7 +6238,7 @@ mod tests {
     fn policy_push_approval_holds_before_publication_then_rejection_escalates_the_batch() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6428,7 +6435,7 @@ mod tests {
     fn approved_policy_push_resumes_after_phase_zero_and_publishes_the_exact_batch() {
         let mut repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6566,7 +6573,7 @@ mod tests {
     fn queue_draining_scheduler_reuses_its_lease_for_the_next_native_cohort() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6652,7 +6659,7 @@ mod tests {
     fn interrupted_cleanup_is_retried_before_the_next_native_cohort() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6779,7 +6786,7 @@ mod tests {
     fn post_archive_dependency_sync_crash_is_held_after_real_git_cleanup() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -6918,7 +6925,7 @@ mod tests {
         let mut repository = Repository::new();
         let sender = repository.auxiliary_path("final-inbox-sender");
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -7347,7 +7354,7 @@ mod tests {
     fn queue_draining_scheduler_blocks_a_zero_admission_cohort_instead_of_spinning() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
         fs::write(
@@ -7424,7 +7431,7 @@ mod tests {
     fn queue_draining_scheduler_does_not_open_an_empty_cohort() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
 
@@ -7458,7 +7465,7 @@ mod tests {
     fn queue_draining_scheduler_reports_escalations_without_opening_a_cohort() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         fs::write(
@@ -7493,7 +7500,7 @@ mod tests {
     fn current_queue_readiness_refuses_an_unknown_idle_status() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         fs::write(
@@ -7516,7 +7523,7 @@ mod tests {
     fn idle_phase_zero_executes_only_an_orphaned_queue_repair() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(&work).unwrap();
         fs::write(
@@ -7553,7 +7560,7 @@ mod tests {
     fn idle_phase_zero_removes_an_uncaptured_descriptor_and_its_guarded_workspace() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -7620,7 +7627,7 @@ mod tests {
     fn phase_zero_cleans_a_partial_planner_descriptor_without_capturing_the_queue() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -7684,7 +7691,7 @@ mod tests {
     fn phase_zero_refuses_an_unregistered_interrupted_worktree_without_mutating_control_state() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -7832,7 +7839,7 @@ mod tests {
     fn phase_zero_restores_lost_capture_then_keeps_unproven_task_resume_held() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         let work = repository.root.join(".work");
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
         fs::write(
@@ -7889,7 +7896,7 @@ mod tests {
     fn legacy_working_batch_without_cohort_state_is_imported_closed_and_completed() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -7990,7 +7997,7 @@ mod tests {
     fn closed_ready_legacy_batch_is_imported_then_merged_without_replaying_a_task_leaf() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -8093,7 +8100,7 @@ mod tests {
     fn partial_unreported_legacy_integration_replays_merger_without_duplicate_git_commit() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -8227,7 +8234,7 @@ mod tests {
     fn reported_legacy_merge_is_proven_then_reverified_and_published_on_git() {
         let repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,
@@ -8404,7 +8411,7 @@ mod tests {
     fn published_legacy_batch_is_imported_then_accounted_and_cleaned_on_git() {
         let mut repository = Repository::new();
         let git = Git::hardened();
-        block_on(git.init(&repository.root));
+        init_git_repository(&git, &repository.root);
         block_on(git.config_set(&repository.root, "user.name", "Orchestrail Test"));
         block_on(git.config_set(
             &repository.root,

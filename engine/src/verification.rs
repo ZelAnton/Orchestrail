@@ -797,7 +797,7 @@ mod tests {
         #[cfg(windows)]
         let command = "findstr /M present marker.txt";
         #[cfg(not(windows))]
-        let command = "/usr/bin/test -f marker.txt";
+        let command = "test -f marker.txt";
         let result = verify_integration(
             VerificationMode::Required,
             &[command.into()],

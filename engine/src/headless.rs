@@ -4091,11 +4091,20 @@ fn classify_github_checks(
 }
 
 fn safe_relative_path(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let normalized = text.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        return false;
+    }
+    normalized
+        .split('/')
+        .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
 fn assert_plain_artifact(path: &Path, metadata: &fs::Metadata) -> Result<(), HeadlessError> {
@@ -5150,7 +5159,7 @@ mod tests {
         #[cfg(windows)]
         let command = "findstr /M present marker.txt";
         #[cfg(not(windows))]
-        let command = "/usr/bin/test -f marker.txt";
+        let command = "test -f marker.txt";
         let mut config =
             HeadlessConfig::new(&work, &root, crate::config::EngineConfig::default().codex);
         config.verification_mode = VerificationMode::Required;

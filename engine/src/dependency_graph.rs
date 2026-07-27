@@ -829,6 +829,14 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
     Ok(trim_root(canonical))
 }
 
+/// Canonical project-root spelling used by registry-aware integration fixtures and adapters.
+/// Keeping this normalization in one place avoids platform-specific aliases such as macOS
+/// `/var` versus `/private/var` and Windows short versus long temporary-directory names.
+#[cfg(test)]
+pub(crate) fn canonical_project_root(root: &Path) -> Result<PathBuf> {
+    canonical_root(root)
+}
+
 #[cfg(windows)]
 fn portable_canonical_root(root: PathBuf) -> PathBuf {
     let text = root.to_string_lossy();
