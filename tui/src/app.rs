@@ -72,7 +72,7 @@ pub struct ConfirmedApproval {
 /// The stage a task's status maps to, for the "deviations first, green collapsed" §6.1 layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusClass {
-    /// A normal in-flight phase (в работе / на ревью / готова к слиянию / слита / опубликована).
+    /// A normal in-flight phase (including the automatic `разрешение конфликта` transition).
     Active,
     /// Requires human attention: escalated / merge-conflict / blocked.
     Attention,
@@ -80,16 +80,21 @@ pub enum StatusClass {
     Done,
 }
 
-/// Classify a raw descriptor status string (the `payload.to` of a `task.status_changed`).
+/// Classify the exact projector vocabulary from `events::projector::task_status`.
+///
+/// Unknown strings deliberately remain active: an unrecognized future automatic transition must
+/// not raise a false human-attention alarm merely because it contains an alarming substring.
 pub fn classify(status: &str) -> StatusClass {
-    let s = status.trim();
-    if s.contains("эскалирована") || s.contains("конфликт") || s.contains("блок")
-    {
-        StatusClass::Attention
-    } else if s == "выполнена" {
-        StatusClass::Done
-    } else {
-        StatusClass::Active
+    match status.trim() {
+        "конфликт" | "эскалирована" => StatusClass::Attention,
+        "выполнена" => StatusClass::Done,
+        "в работе"
+        | "на ревью"
+        | "готова к слиянию"
+        | "разрешение конфликта"
+        | "слита"
+        | "опубликована" => StatusClass::Active,
+        _ => StatusClass::Active,
     }
 }
 
@@ -1082,9 +1087,16 @@ mod tests {
         assert_eq!(classify("в работе"), StatusClass::Active);
         assert_eq!(classify("на ревью"), StatusClass::Active);
         assert_eq!(classify("готова к слиянию"), StatusClass::Active);
+        assert_eq!(classify("разрешение конфликта"), StatusClass::Active);
+        assert_eq!(classify("слита"), StatusClass::Active);
         assert_eq!(classify("опубликована"), StatusClass::Active);
         assert_eq!(classify("выполнена"), StatusClass::Done);
         assert_eq!(classify("эскалирована"), StatusClass::Attention);
         assert_eq!(classify("конфликт"), StatusClass::Attention);
+        assert_eq!(classify("предконфликтная проверка"), StatusClass::Active);
+        assert_eq!(
+            classify("неизвестная автоматическая фаза"),
+            StatusClass::Active
+        );
     }
 }
