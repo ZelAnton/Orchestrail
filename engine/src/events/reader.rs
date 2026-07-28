@@ -168,7 +168,8 @@ pub struct Cursor {
 
 impl Cursor {
     /// Serialize to the compact JSON shape used by the reference consumer's
-    /// `events_cursor.json` (`{ "byte_offset": N, "delivered_ids": [...] }`).
+    /// `events_cursor.json` (`{ "byte_offset": N, "delivered_ids": [...],
+    /// "dedupe_filter": "<fixed hex>" }`). Legacy cursors without the filter remain accepted.
     pub fn to_json(&self) -> String {
         let mut obj = Map::new();
         obj.insert("byte_offset".into(), Value::from(self.byte_offset));
