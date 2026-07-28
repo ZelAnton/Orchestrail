@@ -4,16 +4,37 @@
 //! committed prefix before appending and refuses an event-id collision with different content, so
 //! a bad caller cannot turn replay into a silently divergent event stream.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{Event, ParseError, parse_line};
 
 static OUTBOX_ACCESS: Mutex<()> = Mutex::new(());
+
+/// A committed event record may not force an unbounded allocation while the one-time index scan
+/// is catching up. This matches the tail reader's per-record ceiling.
+const MAX_EVENT_LINE_BYTES: u64 = 1024 * 1024;
+const MAX_CACHED_OUTBOXES: usize = 16;
+
+#[derive(Debug, Default)]
+struct CachedIndex {
+    committed_len: u64,
+    committed_lines: usize,
+    semantic_by_id: HashMap<String, [u8; 32]>,
+    scanned_bytes: u64,
+}
+
+/// The process owns one orchestration lease in production, hence normally one cache entry. A
+/// small bound prevents hermetic tests or repeated repository probes from retaining indexes for
+/// every temporary work directory for the lifetime of the process.
+static OUTBOX_INDEXES: LazyLock<Mutex<HashMap<PathBuf, CachedIndex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Serialize native readers which derive an identity from committed history with native appends.
 /// The owner lease excludes another orchestrator process; this guard additionally excludes the
@@ -99,40 +120,35 @@ impl Outbox {
         let path = self.path();
         let desired = event.to_json_line();
         let mut file = open_plain_outbox(&path)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let committed_len = if contents.is_empty() || contents.ends_with('\n') {
-            contents.len()
-        } else {
-            contents.rfind('\n').map_or(0, |index| index + 1)
-        };
-        let committed = &contents[..committed_len];
-        let mut already_present = false;
-        for (index, line) in committed.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let existing = parse_line(line).map_err(|error| OutboxError::InvalidExisting {
-                line: index + 1,
-                error,
-            })?;
-            if existing.event_id == event.event_id {
-                if same_semantic_event(&existing, event) {
-                    already_present = true;
-                } else {
-                    return Err(OutboxError::EventIdCollision {
-                        event_id: event.event_id.clone(),
-                    });
-                }
-            }
+        let file_len = file.metadata()?.len();
+        let committed_len = committed_prefix_len(&mut file, file_len)?;
+        let cache_key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let mut indexes = OUTBOX_INDEXES
+            .lock()
+            .map_err(|_| io::Error::other("native outbox index cache is poisoned"))?;
+        if !indexes.contains_key(&cache_key) && indexes.len() >= MAX_CACHED_OUTBOXES {
+            indexes.clear();
         }
-        if committed_len != contents.len() {
-            file.set_len(u64::try_from(committed_len).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "outbox prefix length overflowed",
-                )
-            })?)?;
+        let index = indexes.entry(cache_key.clone()).or_default();
+        if index.committed_len > committed_len {
+            *index = CachedIndex::default();
+        }
+        if let Err(error) = scan_committed_range(&mut file, index, committed_len) {
+            indexes.remove(&cache_key);
+            return Err(error);
+        }
+        let desired_fingerprint = semantic_fingerprint(event);
+        let already_present = match index.semantic_by_id.get(&event.event_id) {
+            Some(existing) if existing == &desired_fingerprint => true,
+            Some(_) => {
+                return Err(OutboxError::EventIdCollision {
+                    event_id: event.event_id.clone(),
+                });
+            }
+            None => false,
+        };
+        if committed_len != file_len {
+            file.set_len(committed_len)?;
             file.sync_all()?;
         }
         if already_present {
@@ -142,8 +158,132 @@ impl Outbox {
         let line = format!("{desired}\n");
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
+        index.committed_len = index
+            .committed_len
+            .checked_add(u64::try_from(line.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "outbox append length overflowed",
+                )
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "outbox length overflowed")
+            })?;
+        index.committed_lines = index.committed_lines.saturating_add(1);
+        index
+            .semantic_by_id
+            .insert(event.event_id.clone(), desired_fingerprint);
         Ok(AppendOutcome::Appended)
     }
+}
+
+fn committed_prefix_len(file: &mut File, file_len: u64) -> io::Result<u64> {
+    if file_len == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::Start(file_len - 1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(file_len);
+    }
+
+    let inspected = file_len.min(MAX_EVENT_LINE_BYTES + 1);
+    file.seek(SeekFrom::Start(file_len - inspected))?;
+    let mut tail = vec![
+        0_u8;
+        usize::try_from(inspected).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "outbox tail length overflowed")
+        })?
+    ];
+    file.read_exact(&mut tail)?;
+    if let Some(index) = tail.iter().rposition(|byte| *byte == b'\n') {
+        return Ok(file_len - inspected + index as u64 + 1);
+    }
+    if file_len <= MAX_EVENT_LINE_BYTES {
+        return Ok(0);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unterminated events.jsonl tail exceeds {MAX_EVENT_LINE_BYTES} byte limit"),
+    ))
+}
+
+fn scan_committed_range(
+    file: &mut File,
+    index: &mut CachedIndex,
+    committed_len: u64,
+) -> Result<()> {
+    if index.committed_len == committed_len {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(index.committed_len))?;
+    let mut reader = BufReader::new(file);
+    let mut position = index.committed_len;
+    while position < committed_len {
+        let remaining = committed_len - position;
+        let read_limit = remaining.min(MAX_EVENT_LINE_BYTES + 2);
+        let mut bounded = (&mut reader).take(read_limit);
+        let mut raw = Vec::new();
+        let read = bounded.read_until(b'\n', &mut raw)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "outbox ended before its committed prefix",
+            )
+            .into());
+        }
+        let read = u64::try_from(read).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "outbox record length overflowed",
+            )
+        })?;
+        position = position.checked_add(read).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "outbox scan offset overflowed")
+        })?;
+        index.scanned_bytes = index.scanned_bytes.saturating_add(read);
+        index.committed_lines = index.committed_lines.saturating_add(1);
+        if raw.last() != Some(&b'\n') || raw.len() - 1 > MAX_EVENT_LINE_BYTES as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("events.jsonl record exceeds {MAX_EVENT_LINE_BYTES} byte limit"),
+            )
+            .into());
+        }
+        raw.pop();
+        let line = std::str::from_utf8(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("outbox contains non-UTF-8 committed line: {error}"),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let existing = parse_line(line).map_err(|error| OutboxError::InvalidExisting {
+            line: index.committed_lines,
+            error,
+        })?;
+        let fingerprint = semantic_fingerprint(&existing);
+        if let Some(previous) = index
+            .semantic_by_id
+            .insert(existing.event_id.clone(), fingerprint)
+            && previous != fingerprint
+        {
+            return Err(OutboxError::EventIdCollision {
+                event_id: existing.event_id,
+            });
+        }
+    }
+    index.committed_len = committed_len;
+    Ok(())
+}
+
+fn semantic_fingerprint(event: &Event) -> [u8; 32] {
+    let mut semantic = event.clone();
+    semantic.occurred_at.clear();
+    Sha256::digest(semantic.to_json_line().as_bytes()).into()
 }
 
 fn open_plain_outbox(path: &std::path::Path) -> io::Result<File> {
@@ -243,20 +383,6 @@ fn redirected(metadata: &fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
-}
-
-/// Replaying a durable transition may observe a new wall-clock timestamp. The deterministic id
-/// is the authority for that transition, so compare every semantic envelope field except
-/// `occurred_at`; a different payload/type/actor still surfaces as a collision.
-fn same_semantic_event(existing: &Event, desired: &Event) -> bool {
-    existing.schema_version == desired.schema_version
-        && existing.event_id == desired.event_id
-        && existing.event_type == desired.event_type
-        && existing.actor == desired.actor
-        && existing.batch_id == desired.batch_id
-        && existing.task_id == desired.task_id
-        && existing.payload_version == desired.payload_version
-        && existing.payload == desired.payload
 }
 
 /// Convert a stable semantic key into the legacy contract's standard URL-namespace UUIDv5. The
@@ -427,6 +553,68 @@ mod tests {
             .map(|event| event.event_id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ids.len(), 8);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn large_existing_journal_is_indexed_once_and_followup_appends_scan_only_new_bytes() {
+        let work = temp_work("large-index");
+        fs::create_dir_all(&work).unwrap();
+        let mut journal = String::new();
+        for index in 0..4096 {
+            journal.push_str(&event(&format!("existing-{index}")).to_json_line());
+            journal.push('\n');
+        }
+        fs::write(work.join(OUTBOX_FILE), &journal).unwrap();
+        let outbox = Outbox::new(&work);
+        assert_eq!(
+            outbox.append_idempotent(&event("new-after-index")).unwrap(),
+            AppendOutcome::Appended
+        );
+        let key = fs::canonicalize(outbox.path()).unwrap();
+        let scanned_after_index = OUTBOX_INDEXES
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .scanned_bytes;
+        assert_eq!(scanned_after_index, journal.len() as u64);
+
+        assert_eq!(
+            Outbox::new(&work)
+                .append_idempotent(&event("second-after-index"))
+                .unwrap(),
+            AppendOutcome::Appended
+        );
+        assert_eq!(
+            OUTBOX_INDEXES
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .scanned_bytes,
+            scanned_after_index,
+            "a fresh Outbox handle must reuse the committed index instead of rescanning history"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn oversized_committed_record_fails_at_the_explicit_line_ceiling() {
+        let work = temp_work("oversized-record");
+        fs::create_dir_all(&work).unwrap();
+        let mut record = vec![b'x'; MAX_EVENT_LINE_BYTES as usize + 1];
+        record.push(b'\n');
+        fs::write(work.join(OUTBOX_FILE), record).unwrap();
+        let error = Outbox::new(&work)
+            .append_idempotent(&event("after-oversized"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("record exceeds 1048576 byte limit"),
+            "unexpected bounded-read error: {error}"
+        );
         let _ = fs::remove_dir_all(work);
     }
 
