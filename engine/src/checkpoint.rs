@@ -117,16 +117,20 @@ impl CheckpointStore {
             .transpose()
     }
 
-    /// Write JSON to a same-directory uniquely named file, flush it, then replace the target.
-    /// A same-directory rename prevents a cross-device partial copy. The processor lease is the
-    /// single-writer guard; failure leaves the old complete checkpoint intact whenever the platform
-    /// supports atomic replacement, and never deliberately truncates the target first.
+    /// Write JSON to a same-directory uniquely named file, flush it, then replace the target and
+    /// sync its parent directory on Unix. A same-directory rename prevents a cross-device partial
+    /// copy. The processor lease is the single-writer guard; a failure before rename leaves the old
+    /// complete checkpoint intact whenever the platform supports atomic replacement. A reported
+    /// parent-sync failure means the new checkpoint may be visible but its crash durability is not
+    /// proven, so recovery must inspect it rather than assuming the old version remains.
     pub fn save(&self, state: &ProcessorState) -> Result<()> {
         self.save_json(state)
     }
 
-    /// Atomically save any typed JSON checkpoint.  The caller owns the schema; this storage layer
-    /// owns only same-directory durable replacement.
+    /// Atomically save any typed JSON checkpoint. The caller owns the schema; this storage layer
+    /// owns same-directory replacement plus POSIX parent-directory durability. Windows has no
+    /// portable directory-sync primitive in `std`, so only the atomic replacement is guaranteed
+    /// there.
     pub fn save_json<T: Serialize>(&self, state: &T) -> Result<()> {
         work_fs::ensure_plain_directory(&self.work)?;
         let mut payload = serde_json::to_vec_pretty(state)?;

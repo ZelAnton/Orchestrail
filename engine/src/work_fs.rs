@@ -1,4 +1,9 @@
 //! Confined filesystem operations for authority-bearing artifacts below one `.work` root.
+//!
+//! Atomic replacement flushes the temporary file before rename and, on Unix, flushes the plain
+//! parent directory afterwards so the new directory entry is durable across a power loss. Rust's
+//! standard library exposes no equivalent portable directory flush on Windows; that platform
+//! therefore revalidates confinement after rename but otherwise relies on its rename semantics.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -352,6 +357,42 @@ pub(crate) fn read_required_text(work: &Path, path: &Path, max_bytes: u64) -> io
     })
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
+    ensure_plain_parent(work, path)?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "artifact path has no parent")
+    })?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    add_no_follow(&mut options);
+    let directory = options.open(parent)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "control-plane parent is not a directory: {}",
+                parent.display()
+            ),
+        ));
+    }
+    require_plain_directory(parent)?;
+    directory.sync_all()?;
+    ensure_plain_parent(work, path)
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
+    // `std` has no portable directory fsync on Windows. Keep the no-op explicit and retain both
+    // post-rename confinement checks so callers do not mistake a redirected parent for success.
+    ensure_plain_parent(work, path)
+}
+
+/// Replace one control-plane artifact without exposing a partially written target.
+///
+/// The temporary file is synced before the same-directory rename. After rename, the parent
+/// directory is synced on Unix; if that final sync fails, the target may already contain the new
+/// payload but its crash durability is unproven, so the error is deliberately returned.
 pub(crate) fn replace_file(
     work: &Path,
     path: &Path,
@@ -398,7 +439,7 @@ pub(crate) fn replace_file(
         return Err(error);
     }
     require_plain_file(path, &fs::symlink_metadata(path)?)?;
-    ensure_plain_parent(work, path)
+    sync_parent_directory(work, path)
 }
 
 pub(crate) fn plain_directory_entries(

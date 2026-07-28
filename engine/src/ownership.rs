@@ -623,6 +623,9 @@ impl LeaseStore {
         })
     }
 
+    /// Replace the lease as one complete document. The shared storage primitive flushes the file
+    /// before rename and the parent directory afterwards on Unix, so an acknowledged heartbeat is
+    /// not lost solely because the directory entry was never made durable.
     fn write_record(&self, record: &LeaseRecord) -> Result<()> {
         let lock = self.lock_directory();
         work_fs::ensure_plain_parent(&self.work, &self.lease_path())?;
