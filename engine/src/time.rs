@@ -1,14 +1,17 @@
-//! Dependency-free UTC ISO-8601 helpers — validation plus epoch↔ISO conversion — shared by the
-//! engine and its consumers.
+//! Dependency-free UTC ISO-8601 helpers — validation, chronological comparison and epoch↔ISO
+//! conversion — shared by the engine and its consumers.
 //!
 //! The same three concerns used to live in four hand-rolled copies across the crate: a strict
 //! `YYYY-MM-DDTHH:MM:SS(.d{1,3})?Z` format validator (duplicated in `contract.rs` and
 //! `events/parse.rs`), and the two directions of Howard Hinnant's calendar algorithm — the
 //! forward `civil_from_days` inside [`epoch_to_iso`] and the inverse `days_from_civil` inside
 //! `main.rs`'s timestamp parser. This module is their single home: [`is_iso_utc`] is the one
-//! format validator, [`epoch_to_iso`] / [`iso_to_epoch`] the paired conversions, and
-//! [`days_from_civil`] the shared calendar core a leniently-formatted parser (`main.rs`) can reuse
-//! without re-deriving the arithmetic. Still dependency-free on purpose (see `lib.rs` / Cargo.toml).
+//! format validator, [`iso_chrono_cmp`] the one fractional-second-aware comparator,
+//! [`epoch_to_iso`] / [`iso_to_epoch`] the paired conversions, and [`days_from_civil`] the shared
+//! calendar core a leniently-formatted parser (`main.rs`) can reuse without re-deriving the
+//! arithmetic. Still dependency-free on purpose (see `lib.rs` / Cargo.toml).
+
+use std::cmp::Ordering;
 
 /// Convert Unix epoch seconds (UTC) to `YYYY-MM-DDTHH:MM:SSZ` at second precision.
 ///
@@ -45,6 +48,20 @@ pub fn iso_to_epoch_millis(value: &str) -> Option<u64> {
         })
         .unwrap_or(0);
     seconds.checked_mul(1_000)?.checked_add(fraction)
+}
+
+/// Chronologically compare two strict UTC timestamps accepted by [`is_iso_utc`].
+///
+/// Optional fractional seconds are normalized through [`iso_to_epoch_millis`], so equivalent
+/// forms such as `.5Z` and `.500Z` compare equal and `.05Z` correctly precedes `.5Z`. Callers that
+/// accept untrusted input should validate it first. The lexical fallback preserves deterministic,
+/// panic-free ordering for defensive call sites whose surrounding parser already guarantees the
+/// strict format.
+pub fn iso_chrono_cmp(a: &str, b: &str) -> Ordering {
+    match (iso_to_epoch_millis(a), iso_to_epoch_millis(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => a.cmp(b),
+    }
 }
 
 /// Strict inverse of [`epoch_to_iso`]: parse the exact `YYYY-MM-DDTHH:MM:SS(.d{1,3})?Z` shape
@@ -156,9 +173,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        days_from_civil, epoch_millis_to_iso, epoch_to_iso, is_iso_utc, iso_to_epoch,
-        iso_to_epoch_millis,
+        days_from_civil, epoch_millis_to_iso, epoch_to_iso, is_iso_utc, iso_chrono_cmp,
+        iso_to_epoch, iso_to_epoch_millis,
     };
+    use std::cmp::Ordering;
 
     #[test]
     fn epoch_to_iso_formats_known_utc_instants() {
@@ -181,6 +199,25 @@ mod tests {
         assert_eq!(
             iso_to_epoch_millis("2021-01-01T00:00:00.5Z"),
             Some(1_609_459_200_500)
+        );
+    }
+
+    #[test]
+    fn chronological_comparison_normalizes_fractional_widths() {
+        let whole = "2021-01-01T00:00:00Z";
+        let fifty_ms = "2021-01-01T00:00:00.05Z";
+        let five_hundred_ms = "2021-01-01T00:00:00.5Z";
+        let same_five_hundred_ms = "2021-01-01T00:00:00.500Z";
+
+        assert_eq!(iso_chrono_cmp(whole, fifty_ms), Ordering::Less);
+        assert_eq!(iso_chrono_cmp(fifty_ms, five_hundred_ms), Ordering::Less);
+        assert_eq!(
+            iso_chrono_cmp(five_hundred_ms, same_five_hundred_ms),
+            Ordering::Equal
+        );
+        assert_eq!(
+            iso_chrono_cmp("2021-01-01T00:00:01Z", five_hundred_ms),
+            Ordering::Greater
         );
     }
 

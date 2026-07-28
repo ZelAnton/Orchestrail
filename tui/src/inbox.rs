@@ -33,7 +33,7 @@ use std::fs;
 use std::path::Path;
 
 use orchestrail_engine::state::{Snapshot, TaskState};
-use orchestrail_engine::time::{is_iso_utc, iso_to_epoch};
+use orchestrail_engine::time::{is_iso_utc, iso_chrono_cmp};
 
 /// One escalated task — terminal, requires an explicit operator decision (§6.2 Q1/Q2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,32 +264,7 @@ fn approval_deadline_reached(deadline: Option<&str>, now_iso8601: &str) -> Optio
     if !is_iso_utc(deadline) || !is_iso_utc(now_iso8601) {
         return None;
     }
-    let deadline_secs = iso_to_epoch(deadline)?;
-    let now_secs = iso_to_epoch(now_iso8601)?;
-    match deadline_secs.cmp(&now_secs) {
-        std::cmp::Ordering::Less => Some(true),
-        std::cmp::Ordering::Greater => Some(false),
-        std::cmp::Ordering::Equal => {
-            Some(fractional_millis(deadline)? <= fractional_millis(now_iso8601)?)
-        }
-    }
-}
-
-/// Milliseconds in a timestamp that [`is_iso_utc`] has already accepted. No fractional part means
-/// zero; one or two digits are right-padded so `.5Z` and `.500Z` compare as the same instant.
-fn fractional_millis(iso: &str) -> Option<u16> {
-    let Some((_, fraction)) = iso.split_once('.') else {
-        return Some(0);
-    };
-    let fraction = fraction.strip_suffix('Z')?;
-    let digits = fraction.parse::<u16>().ok()?;
-    let scale = match fraction.len() {
-        1 => 100,
-        2 => 10,
-        3 => 1,
-        _ => return None,
-    };
-    Some(digits * scale)
+    Some(iso_chrono_cmp(deadline, now_iso8601) != std::cmp::Ordering::Greater)
 }
 
 fn approval_string(value: &serde_json::Value, key: &str) -> Option<String> {

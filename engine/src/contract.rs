@@ -20,6 +20,8 @@
 
 use std::cmp::Ordering;
 
+use crate::time::iso_chrono_cmp;
+
 /// A finding's lifecycle status (the four words the contract uses, plus a catch-all).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -164,46 +166,6 @@ impl ReviewParse {
     }
 }
 
-/// Chronologically compare two UTC ISO-8601 timestamps of the fixed-width
-/// `YYYY-MM-DDTHH:MM:SS[.d{1,3}]Z` shape [`is_utc_timestamp`] accepts (both `SUMMARY-*` ids and the
-/// `since` freshness cutoff take this form).
-///
-/// The whole-seconds prefix (`YYYY-MM-DDTHH:MM:SS`, the first 19 bytes) is most-significant-first,
-/// fixed-width and zero-padded, so comparing it lexically is already chronological. The hazard this
-/// closes is the OPTIONAL fractional-seconds tail: `.` (0x2E) sorts before `Z` (0x5A), so a raw
-/// whole-string compare reads `…:00.5Z` as EARLIER than the same second's `…:00Z` even though it is
-/// 500 ms later (and `since`, at second precision from `epoch_to_iso`, has no tail at all). We
-/// therefore compare the second-prefix lexically and break same-second ties on the fractional part
-/// normalized to milliseconds — the freshness gate's true ordering, replacing the whole-string
-/// lexical compare it used to do.
-fn iso_chrono_cmp(a: &str, b: &str) -> Ordering {
-    match (a.get(..19), b.get(..19)) {
-        (Some(pa), Some(pb)) => pa
-            .cmp(pb)
-            .then_with(|| iso_frac_millis(a).cmp(&iso_frac_millis(b))),
-        // Defensive: a string shorter than the validated fixed-width shape should never reach the
-        // gate; fall back to a whole-string lexical compare rather than panic on the slice.
-        _ => a.cmp(b),
-    }
-}
-
-/// The fractional-seconds tail of an ISO-8601 timestamp normalized to milliseconds, 0 when absent:
-/// `…:00Z`→0, `…:00.5Z`→500, `…:00.05Z`→50, `…:00.005Z`→5. Right-padding the 1..3-digit tail to a
-/// constant 3 digits is what lets same-second marks compare chronologically. A tail that is not the
-/// `.d{1,3}` form [`is_utc_timestamp`] already vetted yields 0 (only reachable defensively).
-fn iso_frac_millis(ts: &str) -> u16 {
-    let Some(frac) = ts.get(19..).and_then(|rest| rest.strip_prefix('.')) else {
-        return 0;
-    };
-    let digits = frac.strip_suffix('Z').unwrap_or(frac);
-    if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|c| c.is_ascii_digit()) {
-        return 0; // not the `.d{1,3}` form `is_utc_timestamp` vets; treat as no fraction
-    }
-    // `.5`==500ms, `.05`==50ms, `.005`==5ms: scale the parsed value to a 3-digit-milliseconds base.
-    let value: u16 = digits.parse().unwrap_or(0);
-    value * 10u16.pow(3 - digits.len() as u32)
-}
-
 /// One task's line in `merge_report.md` (`agents/merger.md`, "Формат `merge_report.md`"): a task
 /// is either `merged=<SHA>` (optionally `conflict-resolved`) or `quarantined=<причина>`. Parsed
 /// deterministically so the engine's Phase 4.3 merge/quarantine decision reads the merger's own
@@ -329,9 +291,9 @@ fn is_marker_id(id: &str) -> bool {
 
 /// Whether `timestamp` is the strict `YYYY-MM-DDTHH:MM:SS(.d{1,3})?Z` UTC shape a `SUMMARY-*`
 /// marker id carries. Single-sourced with the event-outbox parser (`events/parse.rs`) on
-/// [`crate::time::is_iso_utc`]; kept as a local alias so the gate's own vocabulary and the
-/// `iso_chrono_cmp` / `iso_frac_millis` doc references below stay stable. The `.d{1,3}` fractional
-/// tail it admits is exactly what [`iso_frac_millis`] normalizes, so the two stay in lock-step.
+/// [`crate::time::is_iso_utc`]; kept as a local alias so the gate's own vocabulary stays stable.
+/// Fractional-second comparison is delegated to [`crate::time::iso_chrono_cmp`] from the same
+/// shared module, keeping validation, normalization and ordering in one contract.
 fn is_utc_timestamp(timestamp: &str) -> bool {
     crate::time::is_iso_utc(timestamp)
 }
