@@ -9,8 +9,8 @@
 
 use std::env;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::supervise::CancellationProbe;
 use crate::time::{epoch_to_iso, iso_to_epoch};
+use crate::work_fs;
 
 pub const ENGINE_ROLE: &str = "engine";
 const LEASE_SCHEMA: &str = "orchestra/lease@1";
@@ -34,91 +35,6 @@ const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSACTION_LOCK_RETRY: Duration = Duration::from_millis(50);
 static TRANSACTION_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-fn plain_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.is_dir() && !redirected(metadata) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("lease path is not a plain directory: {}", path.display()),
-        ))
-    }
-}
-
-fn plain_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.is_file() && !redirected(metadata) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("lease path is not a plain file: {}", path.display()),
-        ))
-    }
-}
-
-fn read_plain_lease(path: &Path) -> io::Result<String> {
-    let before = fs::symlink_metadata(path)?;
-    plain_file(path, &before)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x0020_0000);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0o400_000);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0x0100);
-    }
-    let mut file = options.open(path)?;
-    let metadata = file.metadata()?;
-    plain_file(path, &metadata)?;
-    if metadata.len() > MAX_LEASE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "lease is oversized",
-        ));
-    }
-    let mut raw = String::new();
-    (&mut file)
-        .take(MAX_LEASE_BYTES + 1)
-        .read_to_string(&mut raw)?;
-    if raw.len() as u64 > MAX_LEASE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "lease grew oversized",
-        ));
-    }
-    plain_file(path, &fs::symlink_metadata(path)?)?;
-    Ok(raw)
-}
 
 /// The interoperable lease document written by both control planes. Numeric time enters the
 /// native API explicitly and is rendered in the established UTC ISO form at the file boundary.
@@ -627,23 +543,23 @@ impl LeaseStore {
     }
 
     fn read_status(&self, now_secs: u64) -> Result<LeaseStatus> {
-        let work_metadata = match fs::symlink_metadata(&self.work) {
-            Ok(metadata) => metadata,
+        match fs::symlink_metadata(&self.work) {
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(LeaseStatus::Vacant);
             }
             Err(error) => return Err(error.into()),
-        };
-        plain_directory(&self.work, &work_metadata)?;
+        }
+        work_fs::require_plain_directory(&self.work)?;
         let lock = self.lock_directory();
-        let lock_metadata = match fs::symlink_metadata(&lock) {
-            Ok(metadata) => metadata,
+        match fs::symlink_metadata(&lock) {
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(LeaseStatus::Vacant);
             }
             Err(error) => return Err(error.into()),
-        };
-        if plain_directory(&lock, &lock_metadata).is_err() {
+        }
+        if work_fs::require_plain_directory(&lock).is_err() {
             return Ok(LeaseStatus::LegacyLock {
                 detail: format!("lease path {} is not a plain directory", lock.display()),
             });
@@ -653,8 +569,11 @@ impl LeaseStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let entries = fs::read_dir(&lock)?
                     .filter_map(std::result::Result::ok)
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .filter(|name| name != STAGING_FILE)
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        (name != STAGING_FILE && !work_fs::is_replace_temp_for(&lease, &name))
+                            .then(|| name.to_string_lossy().into_owned())
+                    })
                     .collect::<Vec<_>>();
                 return if entries.is_empty() {
                     Ok(LeaseStatus::Vacant)
@@ -668,9 +587,9 @@ impl LeaseStore {
                 };
             }
             Err(error) => return Err(error.into()),
-            Ok(metadata) => plain_file(&lease, &metadata)?,
+            Ok(metadata) => work_fs::require_plain_file(&lease, &metadata)?,
         }
-        let raw = read_plain_lease(&lease)?;
+        let raw = work_fs::read_plain_text(&lease, MAX_LEASE_BYTES)?;
         let record: LeaseRecord = match serde_json::from_str(&raw) {
             Ok(record) => record,
             Err(error) => {
@@ -706,42 +625,12 @@ impl LeaseStore {
 
     fn write_record(&self, record: &LeaseRecord) -> Result<()> {
         let lock = self.lock_directory();
-        match fs::symlink_metadata(&lock) {
-            Ok(metadata) => plain_directory(&lock, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&lock)?;
-                plain_directory(&lock, &fs::symlink_metadata(&lock)?)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        work_fs::ensure_plain_parent(&self.work, &self.lease_path())?;
+        work_fs::ensure_plain_directory(&lock)?;
         let lease = self.lease_path();
-        match fs::symlink_metadata(&lease) {
-            Ok(metadata) => plain_file(&lease, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let staging = lock.join(STAGING_FILE);
-        let payload = serde_json::to_vec(record)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)?;
-        let write = (|| -> io::Result<()> {
-            file.write_all(&payload)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        drop(file);
-        if let Err(error) = write {
-            let _ = fs::remove_file(&staging);
-            return Err(error.into());
-        }
-        if let Err(error) = fs::rename(&staging, &lease) {
-            let _ = fs::remove_file(&staging);
-            return Err(error.into());
-        }
-        plain_file(&lease, &fs::symlink_metadata(&lease)?)?;
+        let mut payload = serde_json::to_vec(record)?;
+        payload.push(b'\n');
+        work_fs::replace_file(&self.work, &lease, &payload, MAX_LEASE_BYTES)?;
         Ok(())
     }
 
@@ -760,10 +649,9 @@ impl LeaseStore {
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         match fs::symlink_metadata(&self.work) {
-            Ok(metadata) => plain_directory(&self.work, &metadata)?,
+            Ok(_) => work_fs::require_plain_directory(&self.work)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&self.work)?;
-                plain_directory(&self.work, &fs::symlink_metadata(&self.work)?)?;
+                work_fs::ensure_plain_directory(&self.work)?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -782,7 +670,7 @@ impl LeaseStore {
     fn remove_empty_lock_directory(&self) -> Result<()> {
         let lock = self.lock_directory();
         match fs::symlink_metadata(&lock) {
-            Ok(metadata) => plain_directory(&lock, &metadata)?,
+            Ok(_) => work_fs::require_plain_directory(&lock)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         }
@@ -902,7 +790,7 @@ fn acquire_transaction_lock(
 }
 
 fn create_transaction_lock(path: &Path, owner: &str) -> io::Result<bool> {
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+    let mut file = match work_fs::create_new_plain_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(_error) if fs::symlink_metadata(path).is_ok() => {
@@ -930,15 +818,15 @@ fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot>
     let age_ms = stamp
         .and_then(|stamp| SystemTime::now().duration_since(stamp).ok())
         .map(|age| age.as_millis());
-    let kind = if redirected(&metadata) {
+    let kind = if work_fs::redirected(&metadata) {
         TransactionLockKind::Redirected
     } else if metadata.is_file() {
-        let owner = read_plain_lease(path)?;
+        let owner = work_fs::read_plain_text(path, MAX_LEASE_BYTES)?;
         TransactionLockKind::File {
             owner: owner.trim().chars().take(128).collect(),
         }
     } else if metadata.is_dir() {
-        plain_directory(path, &metadata)?;
+        work_fs::require_plain_directory(path)?;
         if fs::read_dir(path)?.next().transpose()?.is_none() {
             TransactionLockKind::EmptyDirectory
         } else {
@@ -1252,6 +1140,29 @@ mod tests {
         assert!(matches!(
             store.takeover("engine", Path::new("."), 10, 100),
             Err(LeaseError::Corrupt { .. })
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn unique_replace_temp_is_recoverable_but_arbitrary_lock_content_is_not() {
+        let work = work("replace-temp-recovery");
+        let store = LeaseStore::new(&work);
+        fs::create_dir_all(store.lock_directory()).unwrap();
+        let recoverable = store
+            .lock_directory()
+            .join(format!(".{LEASE_FILE}.{}.17.tmp", process::id()));
+        fs::write(&recoverable, "partial lease").unwrap();
+        assert_eq!(store.status(100).unwrap(), LeaseStatus::Vacant);
+
+        fs::write(
+            store.lock_directory().join(".lease.json.owner.tmp"),
+            "foreign",
+        )
+        .unwrap();
+        assert!(matches!(
+            store.status(100).unwrap(),
+            LeaseStatus::LegacyLock { .. }
         ));
         let _ = fs::remove_dir_all(work);
     }

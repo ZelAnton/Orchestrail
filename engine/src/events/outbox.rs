@@ -6,7 +6,7 @@
 //! into a silently divergent event stream.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{Event, ParseError, parse_line};
+use crate::work_fs;
 
 static OUTBOX_ACCESS: Mutex<()> = Mutex::new(());
 
@@ -288,102 +289,21 @@ fn semantic_fingerprint(event: &Event) -> [u8; 32] {
 }
 
 fn open_plain_outbox(path: &std::path::Path) -> io::Result<File> {
-    open_checked_outbox(path, true)
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "event outbox has no parent"))?;
+    work_fs::ensure_plain_directory(parent)?;
+    work_fs::open_plain_file_read_write(path, true)
 }
 
 /// Open an existing outbox for readers without following a symlink/reparse-point replacement.
 /// Missing files remain `NotFound`; readers must decide whether that means empty or unavailable.
 pub(crate) fn open_existing_plain_outbox(path: &std::path::Path) -> io::Result<File> {
-    open_checked_outbox(path, false)
-}
-
-fn open_checked_outbox(path: &std::path::Path, create: bool) -> io::Result<File> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "event outbox has no parent"))?;
-    match fs::symlink_metadata(parent) {
-        Ok(metadata) => assert_plain_outbox_directory(parent, &metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-            fs::create_dir(parent)?;
-            assert_plain_outbox_directory(parent, &fs::symlink_metadata(parent)?)?;
-        }
-        Err(error) => return Err(error),
-    }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => assert_plain_outbox(path, &metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).write(create).create(create);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    let file = options.open(path)?;
-    assert_plain_outbox(path, &file.metadata()?)?;
-    assert_plain_outbox(path, &fs::symlink_metadata(path)?)?;
-    Ok(file)
-}
-
-fn assert_plain_outbox(path: &std::path::Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if !metadata.is_file() || redirected(metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("event outbox is not a plain file: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-fn assert_plain_outbox_directory(
-    path: &std::path::Path,
-    metadata: &fs::Metadata,
-) -> io::Result<()> {
-    if !metadata.is_dir() || redirected(metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "event outbox parent is not a plain directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+    work_fs::require_plain_directory(parent)?;
+    work_fs::open_existing_plain_file(path)
 }
 
 /// Convert a stable semantic key into the legacy contract's standard URL-namespace UUIDv5. The

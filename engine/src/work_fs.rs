@@ -1,12 +1,37 @@
 //! Confined filesystem operations for authority-bearing artifacts below one `.work` root.
 
-use std::fs::{self, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const MAX_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Recognize only the unique same-directory temporary name emitted by [`replace_file`] for one
+/// exact target. Recovery code may ignore such a crash residue without treating arbitrary hidden
+/// files as owned scratch state.
+pub(crate) fn is_replace_temp_for(target: &Path, candidate: &OsStr) -> bool {
+    let (Some(target_name), Some(candidate)) = (target.file_name(), candidate.to_str()) else {
+        return false;
+    };
+    let prefix = format!(".{}.", target_name.to_string_lossy());
+    let Some(coordinates) = candidate
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = coordinates.split('.');
+    let pid = parts.next().unwrap_or_default();
+    let sequence = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 pub(crate) fn redirected(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -36,7 +61,7 @@ pub(crate) fn require_plain_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn require_plain_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+pub(crate) fn require_plain_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if metadata.is_file() && !redirected(metadata) {
         Ok(())
     } else {
@@ -48,6 +73,124 @@ fn require_plain_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
             ),
         ))
     }
+}
+
+/// Create one directory when absent and prove that the resulting entry is neither a symlink nor
+/// a Windows reparse point. Callers use this for the selected `.work` root before confined walks.
+pub(crate) fn ensure_plain_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => require_plain_directory(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            require_plain_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn add_no_follow(options: &mut OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0o400_000;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0x0100;
+        options.custom_flags(O_NOFOLLOW);
+    }
+}
+
+fn open_plain_file(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create: bool,
+    create_new: bool,
+) -> io::Result<File> {
+    if !create_new {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => require_plain_file(path, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create(create)
+        .create_new(create_new);
+    add_no_follow(&mut options);
+    let file = options.open(path)?;
+    require_plain_file(path, &file.metadata()?)?;
+    require_plain_file(path, &fs::symlink_metadata(path)?)?;
+    Ok(file)
+}
+
+pub(crate) fn open_existing_plain_file(path: &Path) -> io::Result<File> {
+    open_plain_file(path, true, false, false, false)
+}
+
+pub(crate) fn open_plain_file_read_write(path: &Path, create: bool) -> io::Result<File> {
+    open_plain_file(path, true, true, create, false)
+}
+
+pub(crate) fn create_new_plain_file(path: &Path) -> io::Result<File> {
+    open_plain_file(path, false, true, false, true)
+}
+
+pub(crate) fn read_plain_bytes(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut file = open_existing_plain_file(path)?;
+    if file.metadata()?.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "control-plane artifact exceeds {max_bytes} bytes: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "control-plane artifact grew beyond {max_bytes} bytes: {}",
+                path.display()
+            ),
+        ));
+    }
+    require_plain_file(path, &fs::symlink_metadata(path)?)?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_plain_text(path: &Path, max_bytes: u64) -> io::Result<String> {
+    String::from_utf8(read_plain_bytes(path, max_bytes)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "control-plane artifact is not UTF-8: {} ({error})",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn relative_below<'a>(work: &Path, path: &'a Path) -> io::Result<&'a Path> {
@@ -155,63 +298,12 @@ pub(crate) fn read_optional_bytes(
     if !plain_parent_exists(work, path)? {
         return Ok(None);
     }
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => require_plain_file(path, &metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
-    };
-    require_plain_file(path, &before)?;
-    if before.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane artifact exceeds {max_bytes} bytes: {}",
-                path.display()
-            ),
-        ));
     }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    require_plain_file(path, &file.metadata()?)?;
-    let mut bytes = Vec::new();
-    (&mut file).take(max_bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane artifact grew beyond {max_bytes} bytes: {}",
-                path.display()
-            ),
-        ));
-    }
-    require_plain_file(path, &fs::symlink_metadata(path)?)?;
+    let bytes = read_plain_bytes(path, max_bytes)?;
     assert_plain_parent(work, path)?;
     Ok(Some(bytes))
 }
@@ -290,10 +382,7 @@ pub(crate) fn replace_file(
         name.to_string_lossy(),
         std::process::id()
     ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
+    let mut file = create_new_plain_file(&temp)?;
     let result = (|| {
         file.write_all(payload)?;
         file.sync_all()

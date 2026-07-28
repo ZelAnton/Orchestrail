@@ -4,59 +4,24 @@
 //! module guarantees a checkpoint is either the complete previous JSON document or the complete
 //! next one.  It never creates a second source of truth from temporary files.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::processor::ProcessorState;
+use crate::work_fs;
 
 /// File name under `.work/` used by the native deterministic engine.
 pub const CHECKPOINT_FILE: &str = "processor-state.json";
 
+#[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
-
-fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-fn require_plain_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.is_dir() && !redirected(metadata) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "checkpoint root is not a plain directory: {}",
-                path.display()
-            ),
-        ))
-    }
-}
-
-fn require_plain_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.is_file() && !redirected(metadata) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("checkpoint is not a plain regular file: {}", path.display()),
-        ))
-    }
-}
 
 #[derive(Debug)]
 pub enum CheckpointError {
@@ -140,75 +105,16 @@ impl CheckpointStore {
 
     /// Load an independently versioned JSON checkpoint from this guarded store.
     pub fn load_json<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        let work_metadata = match fs::symlink_metadata(&self.work) {
-            Ok(metadata) => metadata,
+        match fs::symlink_metadata(&self.work) {
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
-        };
-        require_plain_directory(&self.work, &work_metadata)?;
+        }
+        work_fs::require_plain_directory(&self.work)?;
         let path = self.path();
-        let before = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        require_plain_file(&path, &before)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_NOFOLLOW: i32 = 0o400_000;
-            options.custom_flags(O_NOFOLLOW);
-        }
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_NOFOLLOW: i32 = 0x0100;
-            options.custom_flags(O_NOFOLLOW);
-        }
-        let mut file = options.open(&path)?;
-        let opened = file.metadata()?;
-        require_plain_file(&path, &opened)?;
-        if opened.len() > MAX_CHECKPOINT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "checkpoint exceeds the {MAX_CHECKPOINT_BYTES}-byte limit: {}",
-                    path.display()
-                ),
-            )
-            .into());
-        }
-        let mut text = String::new();
-        (&mut file)
-            .take(MAX_CHECKPOINT_BYTES + 1)
-            .read_to_string(&mut text)?;
-        if text.len() as u64 > MAX_CHECKPOINT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "checkpoint grew beyond the {MAX_CHECKPOINT_BYTES}-byte limit: {}",
-                    path.display()
-                ),
-            )
-            .into());
-        }
-        require_plain_file(&path, &fs::symlink_metadata(&path)?)?;
-        Ok(Some(serde_json::from_str(&text)?))
+        work_fs::read_optional_text(&self.work, &path, MAX_CHECKPOINT_BYTES)?
+            .map(|text| serde_json::from_str(&text).map_err(CheckpointError::from))
+            .transpose()
     }
 
     /// Write JSON to a same-directory uniquely named file, flush it, then replace the target.
@@ -222,15 +128,8 @@ impl CheckpointStore {
     /// Atomically save any typed JSON checkpoint.  The caller owns the schema; this storage layer
     /// owns only same-directory durable replacement.
     pub fn save_json<T: Serialize>(&self, state: &T) -> Result<()> {
-        match fs::symlink_metadata(&self.work) {
-            Ok(metadata) => require_plain_directory(&self.work, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&self.work)?;
-                require_plain_directory(&self.work, &fs::symlink_metadata(&self.work)?)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let payload = serde_json::to_vec_pretty(state)?;
+        work_fs::ensure_plain_directory(&self.work)?;
+        let mut payload = serde_json::to_vec_pretty(state)?;
         if payload.len().saturating_add(1) as u64 > MAX_CHECKPOINT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -238,45 +137,11 @@ impl CheckpointStore {
             )
             .into());
         }
+        payload.push(b'\n');
         let target = self.path();
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) => require_plain_file(&target, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let temp = self.temp_path();
-        let mut file = create_new(&temp)?;
-        let write_result = (|| -> io::Result<()> {
-            file.write_all(&payload)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        drop(file);
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        if let Err(error) = fs::rename(&temp, &target) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        require_plain_file(&target, &fs::symlink_metadata(&target)?)?;
+        work_fs::replace_file(&self.work, &target, &payload, MAX_CHECKPOINT_BYTES)?;
         Ok(())
     }
-
-    fn temp_path(&self) -> PathBuf {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.work.join(format!(
-            ".{}.{}.{sequence}.tmp",
-            self.file_name,
-            std::process::id()
-        ))
-    }
-}
-
-fn create_new(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(test)]
