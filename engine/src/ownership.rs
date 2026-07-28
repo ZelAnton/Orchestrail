@@ -13,6 +13,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +33,7 @@ const MAX_LEASE_BYTES: u64 = 64 * 1024;
 const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSACTION_LOCK_RETRY: Duration = Duration::from_millis(50);
+static TRANSACTION_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn redirected(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -865,7 +867,11 @@ fn acquire_transaction_lock(
     timeout: Duration,
     stale_after: Duration,
 ) -> Result<TransactionLockGuard> {
-    let owner = process::id().to_string();
+    let owner = format!(
+        "{}:{}",
+        process::id(),
+        TRANSACTION_OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
     let deadline = Instant::now() + timeout;
     loop {
         if create_transaction_lock(path, &owner)? {
@@ -1161,7 +1167,12 @@ mod tests {
                 .with_transaction_policy(Duration::from_millis(20), Duration::ZERO, || {
                     let metadata = fs::symlink_metadata(&tx).unwrap();
                     assert!(metadata.is_file(), "native acquisition uses CreateNew file");
-                    assert_eq!(fs::read_to_string(&tx).unwrap(), process::id().to_string());
+                    assert!(
+                        fs::read_to_string(&tx)
+                            .unwrap()
+                            .starts_with(&format!("{}:", process::id())),
+                        "native lock identity contains the process id and a unique sequence"
+                    );
                     Ok(())
                 })
                 .unwrap();
@@ -1171,6 +1182,27 @@ mod tests {
             );
             let _ = fs::remove_dir_all(work);
         }
+    }
+
+    #[test]
+    fn obsolete_same_process_guard_cannot_release_a_recreated_transaction_lock() {
+        let work = work("recreated-transaction-lock");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "123:old").unwrap();
+        let mut obsolete = TransactionLockGuard {
+            path: tx.clone(),
+            owner: "123:old".into(),
+            armed: true,
+        };
+        fs::remove_file(&tx).unwrap();
+        fs::write(&tx, "123:new").unwrap();
+
+        let error = obsolete.release().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&tx).unwrap(), "123:new");
+        obsolete.armed = false;
+        let _ = fs::remove_dir_all(work);
     }
 
     #[test]

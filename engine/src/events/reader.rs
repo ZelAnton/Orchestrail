@@ -103,7 +103,7 @@ fn dedupe_bits(event_id: &str) -> [usize; 4] {
         let start = index * 8;
         let mut bytes = [0_u8; 8];
         bytes.copy_from_slice(&digest[start..start + 8]);
-        (u64::from_le_bytes(bytes) as usize) % bit_len
+        (u64::from_le_bytes(bytes) % bit_len as u64) as usize
     })
 }
 

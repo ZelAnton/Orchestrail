@@ -1,8 +1,9 @@
 //! Append-only, idempotent writer for the typed `.work/events.jsonl` outbox.
 //!
-//! The engine lease is the single-writer interlock. This module nevertheless validates the full
-//! committed prefix before appending and refuses an event-id collision with different content, so
-//! a bad caller cannot turn replay into a silently divergent event stream.
+//! The engine lease is the single-writer interlock. This module validates the committed prefix
+//! once into a process-local semantic index, incrementally validates any newly observed range,
+//! and refuses an event-id collision with different content, so a bad caller cannot turn replay
+//! into a silently divergent event stream.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
