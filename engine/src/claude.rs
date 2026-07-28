@@ -110,7 +110,6 @@ pub struct StreamResult {
 /// `{"type":"result", ...}` line is authoritative; earlier lines are assistant / tool
 /// events the engine can log but does not decide on.
 pub fn parse_transcript(transcript: &str) -> StreamResult {
-    use crate::jsonline::top_level;
     let mut out = StreamResult {
         result_seen: false,
         subtype: None,
@@ -124,23 +123,27 @@ pub fn parse_transcript(transcript: &str) -> StreamResult {
         if line.is_empty() {
             continue;
         }
-        match top_level(line, "type").and_then(|v| v.as_str().map(|s| s.to_string())) {
-            Some(t) if t == "result" => {
-                out.result_seen = true;
-                out.subtype =
-                    top_level(line, "subtype").and_then(|v| v.as_str().map(|s| s.to_string()));
-                out.is_error = top_level(line, "is_error").and_then(|v| v.as_bool());
-                out.num_turns = top_level(line, "num_turns")
-                    .and_then(|v| v.as_num())
-                    .map(|n| n as u32);
-                out.result_text =
-                    top_level(line, "result").and_then(|v| v.as_str().map(|s| s.to_string()));
-                out.usage = serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|value| usage_from_result(&value));
-            }
-            _ => {}
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("result") {
+            continue;
         }
+        out.result_seen = true;
+        out.subtype = value
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        out.is_error = value.get("is_error").and_then(serde_json::Value::as_bool);
+        out.num_turns = value
+            .get("num_turns")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|turns| u32::try_from(turns).ok());
+        out.result_text = value
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        out.usage = usage_from_result(&value);
     }
     out
 }
@@ -265,5 +268,35 @@ mod tests {
         let r = parse_transcript(transcript);
         assert_eq!(r.subtype.as_deref(), Some("success"));
         assert_eq!(r.is_error, Some(false));
+    }
+
+    #[test]
+    fn malformed_or_nested_result_markers_never_override_a_valid_result() {
+        let transcript = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"ok"}"#,
+            "\n",
+            r#"{"message":{"type":"result"},"result":"nested"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"broken","result":"trailing"} garbage"#,
+            "\n",
+        );
+        let parsed = parse_transcript(transcript);
+        assert!(parsed.result_seen);
+        assert_eq!(parsed.subtype.as_deref(), Some("success"));
+        assert_eq!(parsed.result_text.as_deref(), Some("ok"));
+        assert_eq!(parsed.num_turns, Some(2));
+    }
+
+    #[test]
+    fn result_scalars_follow_strict_serde_json_types_and_u32_range() {
+        for invalid_turns in ["-1", "1.5", "4294967296", r#""2""#] {
+            let parsed = parse_transcript(&format!(
+                r#"{{"type":"result","is_error":"false","num_turns":{invalid_turns},"result":7}}"#
+            ));
+            assert!(parsed.result_seen);
+            assert_eq!(parsed.is_error, None);
+            assert_eq!(parsed.num_turns, None);
+            assert_eq!(parsed.result_text, None);
+        }
     }
 }

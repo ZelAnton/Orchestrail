@@ -8,9 +8,9 @@
 //! stream-json line uses at the top level: JSON strings (with `\" \\ \n \t \uXXXX`
 //! escapes), `true`/`false`/`null`, and numbers.
 //!
-//! The PRODUCTION engine should parse stream-json with `serde_json` (see README). This
-//! spike-grade scanner exists only to prove — offline and with zero dependencies — that
-//! the structured leaf-agent transcript is machine-parseable without free-text guessing.
+//! The production engine parses stream-json with `serde_json` in `claude::parse_transcript`.
+//! This spike-grade scanner remains only as an isolated parser experiment proving — offline and
+//! with zero dependencies — that structured lines can be inspected without free-text guessing.
 
 /// A top-level JSON value we care about for the spike's contract.
 #[derive(Debug, Clone, PartialEq)]
