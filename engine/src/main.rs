@@ -1039,7 +1039,7 @@ fn native_lease_error(operation: &str, error: LeaseError) -> i32 {
         LeaseError::InvalidInput(_) => lease_exit::USAGE,
         LeaseError::Io(_)
         | LeaseError::Json(_)
-        | LeaseError::Busy
+        | LeaseError::Busy { .. }
         | LeaseError::Stale { .. }
         | LeaseError::AddressMismatch { .. } => lease_exit::FAILED,
     };

@@ -3,17 +3,19 @@
 //! Orchestra's historical control plane stores an `orchestra/lease@1` JSON record in that
 //! directory. During catch-up development Orchestrail must coexist with a running Orchestra
 //! process, so this implementation preserves the record shape and the same `state-tx.lock`
-//! serialization directory. It does not invoke the PowerShell script and never recursively
-//! removes a lock directory: a foreign/corrupt lock remains an operator-visible refusal.
+//! CreateNew-file interlock. It also recognizes the directory lock written by older native builds.
+//! It does not invoke the PowerShell script and never recursively removes a lock directory: a
+//! foreign/corrupt lock remains an operator-visible refusal.
 
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +29,9 @@ const LEASE_FILE: &str = "lease.json";
 const STAGING_FILE: &str = "lease.json.tmp";
 const TRANSACTION_LOCK: &str = "state-tx.lock";
 const MAX_LEASE_BYTES: u64 = 64 * 1024;
+const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+const TRANSACTION_LOCK_RETRY: Duration = Duration::from_millis(50);
 
 fn redirected(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -168,7 +173,10 @@ pub enum LeaseError {
     Io(io::Error),
     Json(serde_json::Error),
     InvalidInput(String),
-    Busy,
+    Busy {
+        age_ms: Option<u128>,
+        kind: String,
+    },
     HeldLive {
         owner: String,
         role: String,
@@ -201,7 +209,16 @@ impl fmt::Display for LeaseError {
             Self::InvalidInput(message)
             | Self::LegacyLock { detail: message }
             | Self::Corrupt { detail: message } => f.write_str(message),
-            Self::Busy => f.write_str("lease transaction lock is held; retry after inspection"),
+            Self::Busy { age_ms, kind } => match age_ms {
+                Some(age_ms) => write!(
+                    f,
+                    "lease transaction lock is held ({kind}, age={age_ms}ms); retry after inspection or wait for the 300000ms stale-recovery threshold"
+                ),
+                None => write!(
+                    f,
+                    "lease transaction lock is held ({kind}, age unavailable); inspect .work/state-tx.lock before retrying"
+                ),
+            },
             Self::HeldLive { owner, role } => {
                 write!(f, "lease is held live by owner={owner} role={role}")
             }
@@ -229,7 +246,7 @@ impl std::error::Error for LeaseError {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::InvalidInput(_)
-            | Self::Busy
+            | Self::Busy { .. }
             | Self::HeldLive { .. }
             | Self::Stale { .. }
             | Self::NotOwner { .. }
@@ -727,6 +744,19 @@ impl LeaseStore {
     }
 
     fn with_transaction<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_transaction_policy(
+            TRANSACTION_LOCK_TIMEOUT,
+            TRANSACTION_LOCK_STALE_AFTER,
+            operation,
+        )
+    }
+
+    fn with_transaction_policy<T>(
+        &self,
+        timeout: Duration,
+        stale_after: Duration,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         match fs::symlink_metadata(&self.work) {
             Ok(metadata) => plain_directory(&self.work, &metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -736,17 +766,11 @@ impl LeaseStore {
             Err(error) => return Err(error.into()),
         }
         let tx = self.work.join(TRANSACTION_LOCK);
-        match fs::create_dir(&tx) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(LeaseError::Busy);
-            }
-            Err(error) => return Err(error.into()),
-        }
+        let mut guard = acquire_transaction_lock(&tx, timeout, stale_after)?;
         let result = operation();
-        // The native transaction directory is always empty. A failure to remove it is surfaced
-        // only when the operation itself succeeded; otherwise preserve the primary error.
-        match fs::remove_dir(&tx) {
+        // A failure to remove our owner-checked CreateNew file is surfaced only when the operation
+        // itself succeeded; otherwise preserve the primary error. Drop is a best-effort panic path.
+        match guard.release() {
             Ok(()) => result,
             Err(error) if result.is_ok() => Err(error.into()),
             Err(_) => result,
@@ -770,6 +794,195 @@ impl LeaseStore {
 
     fn lease_path(&self) -> PathBuf {
         self.lock_directory().join(LEASE_FILE)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransactionLockKind {
+    File { owner: String },
+    EmptyDirectory,
+    NonEmptyDirectory,
+    Redirected,
+    Other,
+}
+
+impl TransactionLockKind {
+    fn describe(&self) -> String {
+        match self {
+            Self::File { owner } => format!("CreateNew file owner={owner:?}"),
+            Self::EmptyDirectory => "legacy native empty directory".into(),
+            Self::NonEmptyDirectory => "non-empty directory (automatic removal refused)".into(),
+            Self::Redirected => "symlink/reparse point (automatic removal refused)".into(),
+            Self::Other => "unsupported filesystem entry (automatic removal refused)".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransactionLockSnapshot {
+    kind: TransactionLockKind,
+    stamp: Option<SystemTime>,
+    age_ms: Option<u128>,
+}
+
+struct TransactionLockGuard {
+    path: PathBuf,
+    owner: String,
+    armed: bool,
+}
+
+impl TransactionLockGuard {
+    fn release(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        let snapshot = transaction_lock_snapshot(&self.path)?;
+        match snapshot.kind {
+            TransactionLockKind::File { owner } if owner == self.owner => {
+                fs::remove_file(&self.path)?;
+                self.armed = false;
+                Ok(())
+            }
+            kind => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to release replaced state transaction lock: {}",
+                    kind.describe()
+                ),
+            )),
+        }
+    }
+}
+
+impl Drop for TransactionLockGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn acquire_transaction_lock(
+    path: &Path,
+    timeout: Duration,
+    stale_after: Duration,
+) -> Result<TransactionLockGuard> {
+    let owner = process::id().to_string();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if create_transaction_lock(path, &owner)? {
+            return Ok(TransactionLockGuard {
+                path: path.to_path_buf(),
+                owner,
+                armed: true,
+            });
+        }
+        let snapshot = match transaction_lock_snapshot(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if break_stale_transaction_lock(path, &snapshot, stale_after)? {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return Err(LeaseError::Busy {
+                age_ms: snapshot.age_ms,
+                kind: snapshot.kind.describe(),
+            });
+        }
+        thread::sleep(
+            TRANSACTION_LOCK_RETRY.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn create_transaction_lock(path: &Path, owner: &str) -> io::Result<bool> {
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(_error) if fs::symlink_metadata(path).is_ok() => {
+            // Windows reports AccessDenied rather than AlreadyExists when CreateNew targets the
+            // directory lock left by an older native build. An entry proven to exist is still
+            // contention; any absent-path/open failure retains its original diagnostic.
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = (|| -> io::Result<()> {
+        file.write_all(owner.as_bytes())?;
+        file.sync_all()
+    })() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot> {
+    let metadata = fs::symlink_metadata(path)?;
+    let stamp = metadata.created().or_else(|_| metadata.modified()).ok();
+    let age_ms = stamp
+        .and_then(|stamp| SystemTime::now().duration_since(stamp).ok())
+        .map(|age| age.as_millis());
+    let kind = if redirected(&metadata) {
+        TransactionLockKind::Redirected
+    } else if metadata.is_file() {
+        let owner = read_plain_lease(path)?;
+        TransactionLockKind::File {
+            owner: owner.trim().chars().take(128).collect(),
+        }
+    } else if metadata.is_dir() {
+        plain_directory(path, &metadata)?;
+        if fs::read_dir(path)?.next().transpose()?.is_none() {
+            TransactionLockKind::EmptyDirectory
+        } else {
+            TransactionLockKind::NonEmptyDirectory
+        }
+    } else {
+        TransactionLockKind::Other
+    };
+    Ok(TransactionLockSnapshot {
+        kind,
+        stamp,
+        age_ms,
+    })
+}
+
+fn break_stale_transaction_lock(
+    path: &Path,
+    decided: &TransactionLockSnapshot,
+    stale_after: Duration,
+) -> io::Result<bool> {
+    if decided
+        .age_ms
+        .is_none_or(|age_ms| age_ms <= stale_after.as_millis())
+    {
+        return Ok(false);
+    }
+    let confirmed = match transaction_lock_snapshot(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if decided.kind != confirmed.kind
+        || decided.stamp != confirmed.stamp
+        || confirmed
+            .age_ms
+            .is_none_or(|age_ms| age_ms <= stale_after.as_millis())
+    {
+        return Ok(false);
+    }
+    let removal = match confirmed.kind {
+        TransactionLockKind::File { .. } => fs::remove_file(path),
+        TransactionLockKind::EmptyDirectory => fs::remove_dir(path),
+        TransactionLockKind::NonEmptyDirectory
+        | TransactionLockKind::Redirected
+        | TransactionLockKind::Other => return Ok(false),
+    };
+    match removal {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -902,6 +1115,62 @@ mod tests {
         assert_eq!(store.status(103).unwrap(), LeaseStatus::Vacant);
         assert!(!store.lock_directory().exists());
         let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn fresh_transaction_lock_times_out_with_owner_and_age_diagnostics() {
+        let work = work("fresh-transaction-lock");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "foreign-pid").unwrap();
+        let store = LeaseStore::new(&work);
+        let error =
+            store
+                .with_transaction_policy(Duration::from_millis(5), Duration::from_secs(300), || {
+                    Ok(())
+                })
+                .unwrap_err();
+        assert!(matches!(
+            &error,
+            LeaseError::Busy {
+                age_ms: Some(_),
+                kind
+            } if kind.contains("foreign-pid")
+        ));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("age="));
+        assert!(diagnostic.contains("300000ms stale-recovery threshold"));
+        assert_eq!(fs::read_to_string(&tx).unwrap(), "foreign-pid");
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn stale_file_and_legacy_directory_transaction_locks_are_recovered() {
+        for (label, directory) in [("file", false), ("directory", true)] {
+            let work = work(&format!("stale-transaction-{label}"));
+            fs::create_dir_all(&work).unwrap();
+            let tx = work.join(TRANSACTION_LOCK);
+            if directory {
+                fs::create_dir(&tx).unwrap();
+            } else {
+                fs::write(&tx, "crashed-pid").unwrap();
+            }
+            thread::sleep(Duration::from_millis(2));
+            let store = LeaseStore::new(&work);
+            store
+                .with_transaction_policy(Duration::from_millis(20), Duration::ZERO, || {
+                    let metadata = fs::symlink_metadata(&tx).unwrap();
+                    assert!(metadata.is_file(), "native acquisition uses CreateNew file");
+                    assert_eq!(fs::read_to_string(&tx).unwrap(), process::id().to_string());
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                !tx.exists(),
+                "owner-checked release removes the native lock"
+            );
+            let _ = fs::remove_dir_all(work);
+        }
     }
 
     #[test]
