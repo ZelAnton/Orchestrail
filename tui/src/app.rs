@@ -22,7 +22,7 @@ use orchestrail_engine::events::{Event, EventType};
 use serde_json::{Map, Value};
 
 use crate::commands::{ApprovalDecision, LeaseStatus};
-use crate::inbox::{ApprovalCard, DecisionInbox};
+use crate::inbox::{ApprovalBackend, ApprovalCard, DecisionInbox};
 
 /// Which of the two screens (§6.1 overview / §6.2 Decision Inbox) is currently drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,6 +65,7 @@ pub enum Modal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedApproval {
     pub id: String,
+    pub backend: ApprovalBackend,
     pub decision: ApprovalDecision,
     pub rejection_reason: Option<String>,
 }
@@ -219,6 +220,9 @@ pub struct AppState {
     /// Approval id captured when an approve/reject flow is armed. The confirmation gate is bound
     /// to this immutable id rather than whichever card happens to be selected after a refresh.
     approval_modal_id: Option<String>,
+    /// Backend captured with [`Self::approval_modal_id`]. Reusing an id under the other durable
+    /// schema during a modal refresh invalidates the confirmation instead of switching mutators.
+    approval_modal_backend: Option<ApprovalBackend>,
     /// Rejection explanation being entered in the modal.
     pub rejection_reason: String,
     /// An open modal overlay capturing input for a destructive command.
@@ -544,11 +548,9 @@ impl AppState {
             });
         if self.approval_modal_active()
             && let Some(captured_id) = self.approval_modal_id.as_deref()
-            && !self
-                .inbox
-                .approvals
-                .iter()
-                .any(|card| card.id == captured_id)
+            && !self.inbox.approvals.iter().any(|card| {
+                card.id == captured_id && Some(card.backend) == self.approval_modal_backend
+            })
         {
             let captured_id = captured_id.to_string();
             self.dismiss_modal();
@@ -577,10 +579,14 @@ impl AppState {
 
     /// Arm approval of the selected pending card. Returns false when there is no actionable card.
     pub fn arm_approve(&mut self) -> bool {
-        let Some(id) = self.pending_approval().map(|card| card.id.clone()) else {
+        let Some((id, backend)) = self
+            .pending_approval()
+            .map(|card| (card.id.clone(), card.backend))
+        else {
             return false;
         };
         self.approval_modal_id = Some(id);
+        self.approval_modal_backend = Some(backend);
         self.rejection_reason.clear();
         self.modal = Modal::ConfirmApprove;
         true
@@ -589,10 +595,14 @@ impl AppState {
     /// Start the reject flow for the selected pending card. The reason is entered before the
     /// separate confirmation step.
     pub fn arm_reject(&mut self) -> bool {
-        let Some(id) = self.pending_approval().map(|card| card.id.clone()) else {
+        let Some((id, backend)) = self
+            .pending_approval()
+            .map(|card| (card.id.clone(), card.backend))
+        else {
             return false;
         };
         self.approval_modal_id = Some(id);
+        self.approval_modal_backend = Some(backend);
         self.rejection_reason.clear();
         self.modal = Modal::EnterRejectReason;
         true
@@ -632,15 +642,18 @@ impl AppState {
             _ => return None,
         };
         let captured_id = self.approval_modal_id.clone();
-        let selection_matches = captured_id
-            .as_deref()
-            .is_some_and(|id| self.pending_approval().is_some_and(|card| card.id == id));
+        let captured_backend = self.approval_modal_backend;
+        let selection_matches = captured_id.as_deref().is_some_and(|id| {
+            self.pending_approval()
+                .is_some_and(|card| card.id == id && Some(card.backend) == captured_backend)
+        });
         if !selection_matches {
             self.dismiss_modal();
             self.notice = Some("выбор approval изменился; попробуйте снова".to_string());
             return None;
         }
         let id = captured_id.expect("captured approval id checked above");
+        let backend = captured_backend.expect("captured approval backend checked above");
         let rejection_reason = if decision == ApprovalDecision::Reject {
             Some(self.rejection_reason.clone())
         } else {
@@ -648,8 +661,10 @@ impl AppState {
         };
         self.modal = Modal::None;
         self.approval_modal_id = None;
+        self.approval_modal_backend = None;
         Some(ConfirmedApproval {
             id,
+            backend,
             decision,
             rejection_reason,
         })
@@ -661,6 +676,7 @@ impl AppState {
     /// explicit second keystroke, does (§6.2).
     pub fn arm_force_lock(&mut self) {
         self.approval_modal_id = None;
+        self.approval_modal_backend = None;
         self.modal = Modal::ConfirmForceLock;
     }
 
@@ -682,6 +698,7 @@ impl AppState {
     pub fn dismiss_modal(&mut self) {
         self.modal = Modal::None;
         self.approval_modal_id = None;
+        self.approval_modal_backend = None;
         self.rejection_reason.clear();
     }
 
@@ -923,6 +940,7 @@ mod tests {
 
     fn approval(id: &str) -> ApprovalCard {
         ApprovalCard {
+            backend: ApprovalBackend::Legacy,
             id: id.to_string(),
             subject: "task:T-250|batch:".to_string(),
             task: Some("T-250".to_string()),
@@ -944,6 +962,7 @@ mod tests {
         assert_eq!(app.modal, Modal::ConfirmApprove);
         let action = app.take_approval_confirmation().unwrap();
         assert_eq!(action.id, "apr-a");
+        assert_eq!(action.backend, ApprovalBackend::Legacy);
         assert_eq!(action.decision, ApprovalDecision::Approve);
         assert!(action.rejection_reason.is_none());
         assert!(app.take_approval_confirmation().is_none());
@@ -995,6 +1014,28 @@ mod tests {
         });
 
         assert_eq!(app.pending_approval().map(|a| a.id.as_str()), Some("apr-b"));
+        assert_eq!(app.modal, Modal::None);
+        assert!(app.take_approval_confirmation().is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("выбор изменился"))
+        );
+    }
+
+    #[test]
+    fn reload_during_approval_modal_rejects_the_same_id_on_another_backend() {
+        let mut app = AppState::new();
+        app.inbox.approvals = vec![approval("apr-a")];
+        assert!(app.arm_approve());
+
+        let mut replacement = approval("apr-a");
+        replacement.backend = ApprovalBackend::Native;
+        app.replace_inbox(DecisionInbox {
+            approvals: vec![replacement],
+            ..DecisionInbox::default()
+        });
+
         assert_eq!(app.modal, Modal::None);
         assert!(app.take_approval_confirmation().is_none());
         assert!(

@@ -19,10 +19,11 @@
 //! destructive command, gated behind an explicit confirmation modal (`y` to confirm), routing
 //! through the single transactional `tools/state-tx.ps1 release --force` path (the same path
 //! `cc-processor.sh --force-lock` now uses). On the Decision Inbox,
-//! `a`/`d` arm approve/reject for the selected pending request; Rust never writes approval JSON —
-//! it delegates that transaction to `tools/policy.ps1`. The TUI never touches the queue / task
-//! descriptors / code and never calls `processor` or a launcher. Both approval actions
-//! require a second explicit confirmation and run under the engine supervisor.
+//! `a`/`d` arm approve/reject for the selected pending request. Native Orchestrail approvals go
+//! through the engine's typed [`orchestrail_engine::approval::ApprovalStore`]; legacy Orchestra
+//! approvals retain the contained `tools/policy.ps1` compatibility path. The TUI never touches
+//! the queue / task descriptors / code and never calls `processor` or a launcher. Both approval
+//! actions require a second explicit confirmation.
 //!
 //! The terminal is always restored — normal quit, error return, or panic (see [`terminal`]).
 
@@ -42,9 +43,13 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orchestrail_engine::events::TailReader;
 use orchestrail_engine::state::Snapshot;
+use orchestrail_engine::work_fs;
 
 use app::{AppState, InboxPanel, Modal, Screen};
 use cli::{Cli, Config};
+
+const MAX_PAUSE_BYTES: u64 = 4 * 1024;
+const MAX_DONE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn main() {
     let cfg = match cli::parse(std::env::args().skip(1)) {
@@ -255,12 +260,13 @@ fn handle_modal_key(app: &mut AppState, work_dir: &Path, k: KeyEvent) {
                     let result = commands::decide_approval(
                         work_dir,
                         &action.id,
+                        action.backend,
                         action.decision,
                         action.rejection_reason.as_deref(),
                     );
                     app.notice = Some(result.summary());
-                    // policy.ps1 may have consumed the card or found it expired/consumed by
-                    // another operator. Reload immediately so no stale actionable card remains.
+                    // The selected backend may have consumed the card or found it expired/consumed
+                    // by another operator. Reload immediately so no stale actionable card remains.
                     app.replace_inbox(load_inbox(work_dir));
                 } else if app.notice.is_none() {
                     // Defensive fallback: AppState normally supplies the specific mismatch notice.
@@ -330,14 +336,26 @@ fn run_resume(app: &mut AppState, work_dir: &Path, last_status_reload: &mut Inst
 fn load_inbox(work_dir: &Path) -> inbox::DecisionInbox {
     let snapshot = Snapshot::load(work_dir);
     let pause_path = work_dir.join("PAUSE");
-    let paused = pause_path.exists();
-    let pause_note = if paused {
-        std::fs::read_to_string(&pause_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        None
+    let (paused, pause_note, pause_error) = match work_fs::entry_exists(work_dir, &pause_path) {
+        Ok(false) => (false, None, None),
+        Ok(true) => match work_fs::read_optional_text(work_dir, &pause_path, MAX_PAUSE_BYTES) {
+            Ok(Some(text)) => (
+                true,
+                Some(text.trim().to_string()).filter(|text| !text.is_empty()),
+                None,
+            ),
+            Ok(None) => (false, None, None),
+            Err(error) => (
+                true,
+                Some("PAUSE присутствует, но не является читаемым plain-файлом".to_string()),
+                Some(format!("PAUSE: {error}")),
+            ),
+        },
+        Err(error) => (
+            true,
+            Some("состояние PAUSE не удалось безопасно проверить".to_string()),
+            Some(format!("PAUSE: {error}")),
+        ),
     };
     let done_ids = done_task_ids(work_dir);
     let mut decision_inbox = inbox::build(&snapshot, paused, pause_note, &done_ids);
@@ -345,6 +363,9 @@ fn load_inbox(work_dir: &Path) -> inbox::DecisionInbox {
     decision_inbox.approvals = approvals.pending;
     decision_inbox.expired_approvals = approvals.expired;
     decision_inbox.approval_errors = approvals.errors;
+    if let Some(error) = pause_error {
+        decision_inbox.approval_errors.push(error);
+    }
     decision_inbox
 }
 
@@ -358,7 +379,11 @@ fn load_inbox(work_dir: &Path) -> inbox::DecisionInbox {
 /// of this observer's "total loading" convention (see `Snapshot::load`) — used only by
 /// `inbox::build` to confirm, not to invent, a predecessor's completion (R-2).
 fn done_task_ids(work_dir: &Path) -> BTreeSet<String> {
-    let text = std::fs::read_to_string(work_dir.join("Tasks_Done.md")).unwrap_or_default();
+    let path = work_dir.join("Tasks_Done.md");
+    let text = work_fs::read_optional_text(work_dir, &path, MAX_DONE_BYTES)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     text.lines()
         .filter_map(orchestrail_engine::state::archive_header_task_id)
         .map(str::to_owned)
@@ -371,6 +396,7 @@ mod tests {
 
     fn pending_card() -> inbox::ApprovalCard {
         inbox::ApprovalCard {
+            backend: inbox::ApprovalBackend::Legacy,
             id: "apr-key".to_string(),
             subject: "task:T-250|batch:".to_string(),
             task: Some("T-250".to_string()),

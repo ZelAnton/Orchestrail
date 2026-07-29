@@ -29,11 +29,19 @@
 //! the corresponding suffix (`причина=`, `попытка=`, …) is itself absent from the artifact.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
+#[cfg(test)]
+use std::fs;
+
+use orchestrail_engine::approval::{APPROVAL_SCHEMA, ApprovalRecord, ApprovalStore};
 use orchestrail_engine::state::{Snapshot, TaskState};
-use orchestrail_engine::time::{is_iso_utc, iso_chrono_cmp};
+use orchestrail_engine::time::{epoch_to_iso, is_iso_utc, iso_chrono_cmp};
+use orchestrail_engine::work_fs;
+
+const LEGACY_APPROVAL_SCHEMA: &str = "orchestra/approval@1";
+const MAX_APPROVAL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_APPROVAL_ENTRIES: usize = 4_096;
 
 /// One escalated task — terminal, requires an explicit operator decision (§6.2 Q1/Q2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,8 +85,15 @@ pub struct BlockedCard {
 
 /// One persistent human-gate request decoded from `.work/approvals/<id>.json`. Only undecided
 /// records are loaded: decided records are one-time consumed and disappear from the pending list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalBackend {
+    Native,
+    Legacy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalCard {
+    pub backend: ApprovalBackend,
     pub id: String,
     pub subject: String,
     pub task: Option<String>,
@@ -146,40 +161,51 @@ impl DecisionInbox {
 /// deadline is no later than `now_iso8601`.
 pub fn load_approvals(work_dir: &Path, now_iso8601: &str) -> ApprovalProjection {
     let dir = work_dir.join("approvals");
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ApprovalProjection::default();
-        }
-        Err(error) => {
-            return ApprovalProjection {
-                errors: vec![format!("approvals/: {error}")],
-                ..ApprovalProjection::default()
-            };
-        }
-    };
+    let entries =
+        match work_fs::plain_directory_entries_bounded(work_dir, &dir, MAX_APPROVAL_ENTRIES) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return ApprovalProjection::default(),
+            Err(error) => {
+                return ApprovalProjection {
+                    errors: vec![format!("approvals/: {error}")],
+                    ..ApprovalProjection::default()
+                };
+            }
+        };
 
     let mut projection = ApprovalProjection::default();
     let mut paths = Vec::new();
     for entry in entries {
-        match entry {
-            Ok(entry) if entry.path().extension().and_then(|x| x.to_str()) == Some("json") => {
-                paths.push(entry.path())
-            }
-            Ok(_) => {}
-            Err(error) => projection.errors.push(format!("approvals/: {error}")),
+        let path = entry.path();
+        let is_json = path.extension().and_then(|x| x.to_str()) == Some("json");
+        let is_manifest = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .is_some_and(|name| name.ends_with(".manifest.json"));
+        if is_json && !is_manifest {
+            paths.push(path);
         }
     }
     paths.sort();
 
+    let native_store = match ApprovalStore::new(work_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            projection
+                .errors
+                .push(format!("approvals/: native store unavailable: {error}"));
+            return projection;
+        }
+    };
     for path in paths {
         let name = path
             .file_name()
             .and_then(|x| x.to_str())
             .unwrap_or("<неизвестный файл>")
             .to_string();
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let text = match work_fs::read_optional_text(work_dir, &path, MAX_APPROVAL_BYTES) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
             Err(error) => {
                 projection.errors.push(format!("{name}: {error}"));
                 continue;
@@ -194,46 +220,37 @@ pub fn load_approvals(work_dir: &Path, now_iso8601: &str) -> ApprovalProjection 
                 continue;
             }
         };
-        if value.get("schema").and_then(|x| x.as_str()) != Some("orchestra/approval@1") {
-            projection
-                .errors
-                .push(format!("{name}: неподдерживаемая schema approval"));
-            continue;
-        }
-        let id = match value.get("id").and_then(|x| x.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
+        let card = match value.get("schema").and_then(|x| x.as_str()) {
+            Some(APPROVAL_SCHEMA) => {
+                let Some(id) = approval_id_from_path(&path) else {
+                    projection
+                        .errors
+                        .push(format!("{name}: некорректное имя native approval"));
+                    continue;
+                };
+                match native_store.load(&id) {
+                    Ok(Some(record)) if record.decision.is_none() => native_approval_card(record),
+                    Ok(Some(_)) | Ok(None) => continue,
+                    Err(error) => {
+                        projection.errors.push(format!("{name}: {error}"));
+                        continue;
+                    }
+                }
+            }
+            Some(LEGACY_APPROVAL_SCHEMA) => match legacy_approval_card(&path, &value) {
+                Ok(Some(card)) => card,
+                Ok(None) => continue,
+                Err(error) => {
+                    projection.errors.push(format!("{name}: {error}"));
+                    continue;
+                }
+            },
             _ => {
-                projection.errors.push(format!("{name}: отсутствует id"));
+                projection
+                    .errors
+                    .push(format!("{name}: неподдерживаемая schema approval"));
                 continue;
             }
-        };
-        if path.file_stem().and_then(|x| x.to_str()) != Some(id.as_str()) {
-            projection
-                .errors
-                .push(format!("{name}: id '{id}' не совпадает с именем файла"));
-            continue;
-        }
-        // A non-empty decision means policy.ps1 already consumed this one-time id.
-        if value
-            .get("decision")
-            .and_then(|x| x.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .is_some()
-        {
-            continue;
-        }
-
-        let card = ApprovalCard {
-            id,
-            subject: approval_string(&value, "subject").unwrap_or_else(|| "не указан".into()),
-            task: approval_string(&value, "task"),
-            batch: approval_string(&value, "batch"),
-            reason: approval_string(&value, "reason").unwrap_or_else(|| "не указана".into()),
-            created_at: approval_string(&value, "created_at"),
-            deadline: approval_string(&value, "deadline"),
-            fingerprint: approval_string(&value, "fingerprint"),
-            policy_hash: approval_string(&value, "policy_hash"),
         };
         match approval_deadline_reached(card.deadline.as_deref(), now_iso8601) {
             Some(true) => projection.expired.push(card),
@@ -253,6 +270,63 @@ pub fn load_approvals(work_dir: &Path, now_iso8601: &str) -> ApprovalProjection 
     });
     projection.expired.sort_by(|a, b| a.id.cmp(&b.id));
     projection
+}
+
+fn approval_id_from_path(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+}
+
+fn native_approval_card(record: ApprovalRecord) -> ApprovalCard {
+    ApprovalCard {
+        backend: ApprovalBackend::Native,
+        id: record.id,
+        subject: record.subject,
+        task: record.task_id,
+        batch: record.batch_id,
+        reason: record.reason,
+        created_at: Some(epoch_to_iso(record.created_at_secs)),
+        deadline: Some(epoch_to_iso(record.deadline_at_secs)),
+        fingerprint: Some(record.fingerprint),
+        policy_hash: Some(record.policy_hash),
+    }
+}
+
+fn legacy_approval_card(
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<Option<ApprovalCard>, String> {
+    let id = value
+        .get("id")
+        .and_then(|x| x.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "отсутствует id".to_string())?
+        .to_string();
+    if path.file_stem().and_then(|x| x.to_str()) != Some(id.as_str()) {
+        return Err(format!("id '{id}' не совпадает с именем файла"));
+    }
+    // A non-empty decision means policy.ps1 already consumed this one-time id.
+    if value
+        .get("decision")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .is_some_and(|decision| !decision.is_empty())
+    {
+        return Ok(None);
+    }
+    Ok(Some(ApprovalCard {
+        backend: ApprovalBackend::Legacy,
+        id,
+        subject: approval_string(value, "subject").unwrap_or_else(|| "не указан".into()),
+        task: approval_string(value, "task"),
+        batch: approval_string(value, "batch"),
+        reason: approval_string(value, "reason").unwrap_or_else(|| "не указана".into()),
+        created_at: approval_string(value, "created_at"),
+        deadline: approval_string(value, "deadline"),
+        fingerprint: approval_string(value, "fingerprint"),
+        policy_hash: approval_string(value, "policy_hash"),
+    }))
 }
 
 /// Return whether an approval deadline has been reached (`deadline <= now`). Both values must be
@@ -693,6 +767,69 @@ mod tests {
                 .iter()
                 .chain(loaded.expired.iter())
                 .any(|a| a.id == "apr-consumed")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_loader_projects_native_records_and_ignores_their_manifests() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestrail-tui-inbox-native-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let store = ApprovalStore::new(&root).unwrap();
+        let now = 1_800_000_000;
+        let fingerprint = "a".repeat(64);
+        let policy_hash = "b".repeat(64);
+        let record = store
+            .request(orchestrail_engine::approval::ApprovalRequest {
+                task_id: Some("T-250".to_string()),
+                batch_id: Some("B-native".to_string()),
+                reason: "human-review".to_string(),
+                fingerprint,
+                policy_hash,
+                now_secs: now,
+                deadline_secs: 60,
+            })
+            .unwrap();
+        fs::write(
+            store
+                .directory()
+                .join(format!("{}.manifest.json", record.id)),
+            "not an approval record\n",
+        )
+        .unwrap();
+
+        let loaded = load_approvals(&root, &epoch_to_iso(now + 1));
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(loaded.pending.len(), 1);
+        assert_eq!(loaded.pending[0].id, record.id);
+        assert_eq!(loaded.pending[0].task.as_deref(), Some("T-250"));
+        assert_eq!(loaded.pending[0].batch.as_deref(), Some("B-native"));
+        assert_eq!(
+            loaded.pending[0].deadline.as_deref(),
+            Some(epoch_to_iso(now + 60).as_str())
+        );
+
+        store
+            .decide(
+                &record.id,
+                orchestrail_engine::approval::ApprovalDecision::Approve,
+                "test-operator",
+                None,
+                now + 2,
+            )
+            .unwrap();
+        assert!(
+            load_approvals(&root, &epoch_to_iso(now + 3))
+                .pending
+                .is_empty()
         );
 
         let _ = fs::remove_dir_all(root);

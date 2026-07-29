@@ -307,7 +307,9 @@ impl ApprovalStore {
         let Some(text) = read_plain_approval(&self.work, &self.directory, &path)? else {
             return Ok(None);
         };
-        Ok(Some(serde_json::from_str(&text)?))
+        let record: ApprovalRecord = serde_json::from_str(&text)?;
+        validate_record(&record, id)?;
+        Ok(Some(record))
     }
 
     /// Atomically persist the content manifest for an existing approval. A caller cannot attach
@@ -842,6 +844,24 @@ mod tests {
         assert!(matches!(
             store.save_manifest(&record.id, &mismatched),
             Err(ApprovalError::Invalid(_))
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn public_load_rejects_a_record_whose_id_disagrees_with_its_filename() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        let record = store.request(request(10)).unwrap();
+        let path = store.path(&record.id);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["id"] = serde_json::Value::String(format!("apr-{}", "f".repeat(32)));
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        assert!(matches!(
+            store.load(&record.id),
+            Err(ApprovalError::Corrupt(_))
         ));
         let _ = fs::remove_dir_all(work);
     }

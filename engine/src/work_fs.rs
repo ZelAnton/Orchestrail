@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const MAX_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CONTROL_DIRECTORY_ENTRIES: usize = 100_000;
 
 /// Recognize only the unique same-directory temporary name emitted by [`replace_file`] for one
 /// exact target. Recovery code may ignore such a crash residue without treating arbitrary hidden
@@ -273,7 +274,7 @@ fn plain_parent_exists(work: &Path, path: &Path) -> io::Result<bool> {
 /// presence itself fail closed (for example PAUSE markers and checkpoint routing). A dangling
 /// symlink or Windows reparse point therefore counts as present and is rejected later by the
 /// typed reader instead of being mistaken for absence.
-pub(crate) fn entry_exists(work: &Path, path: &Path) -> io::Result<bool> {
+pub fn entry_exists(work: &Path, path: &Path) -> io::Result<bool> {
     if !plain_parent_exists(work, path)? {
         return Ok(false);
     }
@@ -313,11 +314,7 @@ pub(crate) fn read_optional_bytes(
     Ok(Some(bytes))
 }
 
-pub(crate) fn read_optional_text(
-    work: &Path,
-    path: &Path,
-    max_bytes: u64,
-) -> io::Result<Option<String>> {
+pub fn read_optional_text(work: &Path, path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
     read_optional_bytes(work, path, max_bytes)?
         .map(|bytes| {
             String::from_utf8(bytes).map_err(|error| {
@@ -393,12 +390,7 @@ fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
 /// The temporary file is synced before the same-directory rename. After rename, the parent
 /// directory is synced on Unix; if that final sync fails, the target may already contain the new
 /// payload but its crash durability is unproven, so the error is deliberately returned.
-pub(crate) fn replace_file(
-    work: &Path,
-    path: &Path,
-    payload: &[u8],
-    max_bytes: u64,
-) -> io::Result<()> {
+pub fn replace_file(work: &Path, path: &Path, payload: &[u8], max_bytes: u64) -> io::Result<()> {
     if payload.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -442,9 +434,17 @@ pub(crate) fn replace_file(
     sync_parent_directory(work, path)
 }
 
-pub(crate) fn plain_directory_entries(
+pub fn plain_directory_entries(work: &Path, path: &Path) -> io::Result<Option<Vec<fs::DirEntry>>> {
+    plain_directory_entries_bounded(work, path, MAX_CONTROL_DIRECTORY_ENTRIES)
+}
+
+/// Enumerate a confined plain directory without allowing a hostile control plane to grow one
+/// observer allocation without bound. The ordinary engine-facing wrapper retains a generous
+/// global ceiling; small consumers such as the TUI approval inbox can select a tighter limit.
+pub fn plain_directory_entries_bounded(
     work: &Path,
     path: &Path,
+    max_entries: usize,
 ) -> io::Result<Option<Vec<fs::DirEntry>>> {
     if !plain_parent_exists(work, path)? {
         return Ok(None);
@@ -454,13 +454,25 @@ pub(crate) fn plain_directory_entries(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     }
-    let entries = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        if entries.len() >= max_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "control-plane directory exceeds {max_entries} entries: {}",
+                    path.display()
+                ),
+            ));
+        }
+        entries.push(entry?);
+    }
     require_plain_directory(path)?;
     assert_plain_parent(work, path)?;
     Ok(Some(entries))
 }
 
-pub(crate) fn remove_plain_file(work: &Path, path: &Path) -> io::Result<bool> {
+pub fn remove_plain_file(work: &Path, path: &Path) -> io::Result<bool> {
     if !plain_parent_exists(work, path)? {
         return Ok(false);
     }
@@ -513,6 +525,21 @@ mod tests {
         assert!(read_optional_text(&work, &path, 4).is_err());
         assert!(replace_file(&work, &path, b"too large", 4).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "state\n");
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn bounded_directory_enumeration_fails_loudly_at_its_ceiling() {
+        let work = temp_root("bounded-directory");
+        let directory = work.join("approvals");
+        fs::create_dir(&work).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("one.json"), "{}\n").unwrap();
+        fs::write(directory.join("two.json"), "{}\n").unwrap();
+
+        let error = plain_directory_entries_bounded(&work, &directory, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 1 entries"));
         let _ = fs::remove_dir_all(work);
     }
 

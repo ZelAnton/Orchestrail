@@ -52,8 +52,8 @@ pub fn usage() -> String {
         "The TUI observes read-only by default — it tails <WORK_DIR>/events.jsonl and reads \
 <WORK_DIR>/status.md —\nbut can also send a small, named command subset downward, each mirroring \
 an existing launcher/tool. Pause touches only its established control file; force-lock runs \
-tools/state-tx.ps1 release --force and approval decisions run tools/policy.ps1, both under \
-supervision (approval never writes approvals JSON from Rust). The TUI\nnever touches the queue, task descriptors, or code, and never runs the processor itself.\n\n",
+tools/state-tx.ps1 release --force under supervision. Native approvals use the engine's typed \
+approval store; legacy approvals use contained tools/policy.ps1. The TUI\nnever touches the queue, task descriptors, or code, and never runs the processor itself.\n\n",
     );
     s.push_str("KEYS:\n");
     s.push_str(

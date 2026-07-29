@@ -10,8 +10,11 @@
 //! **Read-only:** this module only ever *reads* the file. It never writes, locks, or creates it.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
+
+use orchestrail_engine::work_fs;
+
+const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Human metadata for one task, lifted from the status.md table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,7 +40,10 @@ pub struct StatusSnapshot {
 /// Load and parse `path` (e.g. `.work/status.md`). Returns `None` if the file is absent or
 /// unreadable — the TUI degrades to the event-only projection.
 pub fn load(path: &Path) -> Option<StatusSnapshot> {
-    let text = fs::read_to_string(path).ok()?;
+    let work = path.parent()?;
+    let text = work_fs::read_optional_text(work, path, MAX_STATUS_BYTES)
+        .ok()
+        .flatten()?;
     Some(parse(&text))
 }
 

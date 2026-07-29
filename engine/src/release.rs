@@ -24,6 +24,9 @@ const MAX_RELEASE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 262_144;
 const NOTES_RECEIPT_SCHEMA: &str = "orchestrail/release-notes-receipt@1";
 const MAX_PROTECTED_WORK_ENTRIES: usize = 8_192;
+// One directory can also contain the small set of leaf-owned exclusions that are deliberately
+// omitted from the global protected-path count. Keep that allowance bounded too.
+const MAX_PROTECTED_DIRECTORY_ENTRIES: usize = MAX_PROTECTED_WORK_ENTRIES + 8;
 const MAX_PROTECTED_WORK_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,19 +151,7 @@ fn collect_protected_paths(
     release_id: &str,
     paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let entries = if directory == work {
-        work_fs::require_plain_directory(work)?;
-        let entries = std::fs::read_dir(work)?.collect::<io::Result<Vec<_>>>()?;
-        work_fs::require_plain_directory(work)?;
-        entries
-    } else {
-        work_fs::plain_directory_entries(work, directory)?.ok_or_else(|| {
-            ReleaseError::Invalid(format!(
-                "release control directory disappeared during fingerprinting: {}",
-                directory.display()
-            ))
-        })?
-    };
+    let entries = protected_directory_entries(work, directory, MAX_PROTECTED_DIRECTORY_ENTRIES)?;
     let mut entries = entries
         .into_iter()
         .map(|entry| entry.path())
@@ -238,6 +229,35 @@ fn collect_protected_paths(
         }
     }
     Ok(())
+}
+
+fn protected_directory_entries(
+    work: &Path,
+    directory: &Path,
+    max_entries: usize,
+) -> Result<Vec<std::fs::DirEntry>> {
+    if directory == work {
+        work_fs::require_plain_directory(work)?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(work)? {
+            if entries.len() >= max_entries {
+                return Err(ReleaseError::Invalid(format!(
+                    "release control directory exceeds {max_entries} entries: {}",
+                    work.display()
+                )));
+            }
+            entries.push(entry?);
+        }
+        work_fs::require_plain_directory(work)?;
+        Ok(entries)
+    } else {
+        work_fs::plain_directory_entries_bounded(work, directory, max_entries)?.ok_or_else(|| {
+            ReleaseError::Invalid(format!(
+                "release control directory disappeared during fingerprinting: {}",
+                directory.display()
+            ))
+        })
+    }
 }
 
 /// Read an operator- or curator-produced canonical notes file. The file must be an immediate
@@ -1341,6 +1361,18 @@ mod tests {
             protected_work_fingerprint(&work, ReleaseLeafSurface::Notes, release_id).unwrap(),
             notes_before_queue_change
         );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn protected_work_directory_enumeration_fails_loudly_before_unbounded_collection() {
+        let work = temp("bounded-protected-directory");
+        fs::write(work.join("one"), "1\n").unwrap();
+        fs::write(work.join("two"), "2\n").unwrap();
+
+        let error = protected_directory_entries(&work, &work, 1).unwrap_err();
+        assert!(matches!(error, ReleaseError::Invalid(_)));
+        assert!(error.to_string().contains("exceeds 1 entries"));
         let _ = fs::remove_dir_all(work);
     }
 

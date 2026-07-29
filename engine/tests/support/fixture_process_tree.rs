@@ -2,15 +2,19 @@
 //!
 //! `spawn` launches this same executable as `mark` through ProcessKit and waits for it.  The
 //! integration test places `spawn` under the engine supervisor then expires the outer deadline.
-//! A delayed marker is stronger than PID inspection: Windows can retain an already-terminated
-//! process object temporarily, whereas a marker proves a descendant continued to execute.
+//! A release-gated marker is stronger than PID inspection: Windows can retain an
+//! already-terminated process object temporarily, whereas a marker written after the outer
+//! supervisor returned proves a descendant continued to execute.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use processkit::{Command, OutputBufferPolicy};
 
-const INNER_DEADLINE: Duration = Duration::from_secs(10);
+// Stay well beyond the outer supervisor's ten-second deadline. Otherwise the nested command's
+// own timeout could kill the marker child at the same boundary and make the containment proof
+// pass for the wrong reason before the test sends its post-teardown release signal.
+const INNER_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn main() {
@@ -60,15 +64,24 @@ fn write_delayed_marker(marker: PathBuf) {
     let ready = ready_marker(&marker);
     std::fs::write(&ready, "nested-child-started")
         .unwrap_or_else(|error| fail(&format!("write nested-child readiness: {error}")));
-    std::thread::sleep(Duration::from_secs(4));
+    let release = release_marker(&marker);
+    while !release.is_file() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     std::fs::write(marker, "descendant-ran")
-        .unwrap_or_else(|error| fail(&format!("write delayed marker: {error}")));
+        .unwrap_or_else(|error| fail(&format!("write released marker: {error}")));
 }
 
 fn ready_marker(marker: &std::path::Path) -> PathBuf {
     let mut ready = marker.as_os_str().to_os_string();
     ready.push(".ready");
     PathBuf::from(ready)
+}
+
+fn release_marker(marker: &std::path::Path) -> PathBuf {
+    let mut release = marker.as_os_str().to_os_string();
+    release.push(".release");
+    PathBuf::from(release)
 }
 
 fn fail(message: &str) -> ! {

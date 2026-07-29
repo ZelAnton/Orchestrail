@@ -1,7 +1,7 @@
 //! The TUI's small, safe **command channel "downward"** to a running orchestrator (intent doc
 //! §5 / §6.2). Everything else in this crate only *observes* `.work/`; this module is the sole
 //! mutation boundary. Pause/force-lock mirror their established control files; approval decisions
-//! delegate to `tools/policy.ps1`, never to direct Rust writes of approval artifacts.
+//! use the native typed store or the contained legacy `tools/policy.ps1` compatibility path.
 //!
 //! Six commands, each a faithful mirror of a mechanism that already exists:
 //!
@@ -28,28 +28,42 @@
 //!   supervised state-tx spawn but with the `release --force` verb the engine's own owner-checked
 //!   `lease` helpers deliberately never emit — forcing over a live/legacy/corrupt lease is an
 //!   operator decision, not something the engine does on its own (K-003).
-//! * **approval-approve / approval-reject** — consume a pending human-gate request strictly via
-//!   `tools/policy.ps1`, resolved through the same checkout-vs-cc-sync rule and launched through
-//!   the same engine supervisor as `state-tx status`. Rust never writes `.work/approvals/`
-//!   directly. The structured result distinguishes an applied approval/rejection from a request
-//!   that another operator already consumed, an expired request, and an execution failure.
+//! * **approval-approve / approval-reject** — consume a native request through the engine's typed
+//!   [`ApprovalStore`]. Legacy `orchestra/approval@1` requests retain their `tools/policy.ps1`
+//!   compatibility path, resolved through the same checkout-vs-cc-sync rule and launched through
+//!   the engine supervisor. The structured result distinguishes an applied approval/rejection
+//!   from a request another operator consumed, an expired request, and an execution failure.
 //!
 //! **Testable core.** As with [`crate::app`], the decision/format/parse logic here is pure and
-//! unit-tested without a terminal; the only impure pieces are the two thin filesystem writes
-//! (`pause` / `resume`) and the supervised PowerShell spawns in [`query_lease_status`] /
-//! [`force_lock`] / [`decide_approval`]. Callers never issue any command implicitly — a keystroke
-//! in `main.rs` is what triggers one, and every destructive decision additionally requires the
-//! confirmation gate.
+//! unit-tested without a terminal; confined pause/resume and native approval mutation reuse the
+//! engine's checked stores, while legacy commands remain supervised PowerShell spawns. Callers
+//! never issue any command implicitly — a keystroke in `main.rs` is what triggers one, and every
+//! destructive decision additionally requires the confirmation gate.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use orchestrail_engine::{lease, time::epoch_to_iso};
+#[cfg(test)]
+use std::fs;
+
+use orchestrail_engine::{
+    approval::{
+        APPROVAL_SCHEMA, ApprovalDecision as NativeApprovalDecision, ApprovalError, ApprovalStore,
+    },
+    lease,
+    state::now_epoch_secs,
+    time::epoch_to_iso,
+    work_fs,
+};
+
+use crate::inbox::ApprovalBackend;
 
 /// The pause kill switch, relative to the `.work/` directory.
 const PAUSE_FILE: &str = "PAUSE";
+/// The pause marker contains two short informational lines. A larger payload is corruption, not
+/// a reason for the operator console to allocate without a bound.
+const MAX_PAUSE_BYTES: u64 = 4 * 1024;
 /// A policy decision is a tiny local PowerShell transaction; keep the same bounded supervision
 /// window as the state-tx command channel.
 const POLICY_DEADLINE: Duration = Duration::from_secs(120);
@@ -71,7 +85,12 @@ pub fn pause_body(now_iso8601: &str) -> String {
 /// direct file write — no external process is spawned. Returns the path written.
 pub fn pause(work_dir: &Path, now_iso8601: &str) -> io::Result<PathBuf> {
     let path = work_dir.join(PAUSE_FILE);
-    fs::write(&path, pause_body(now_iso8601))?;
+    work_fs::replace_file(
+        work_dir,
+        &path,
+        pause_body(now_iso8601).as_bytes(),
+        MAX_PAUSE_BYTES,
+    )?;
     Ok(path)
 }
 
@@ -80,11 +99,7 @@ pub fn pause(work_dir: &Path, now_iso8601: &str) -> io::Result<PathBuf> {
 /// removed, `false` if there was nothing to clear.
 pub fn resume(work_dir: &Path) -> io::Result<bool> {
     let path = work_dir.join(PAUSE_FILE);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+    work_fs::remove_plain_file(work_dir, &path)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -368,7 +383,7 @@ pub fn query_lease_status(work_dir: &Path) -> LeaseStatus {
 }
 
 // ---------------------------------------------------------------------------------------------
-// approval decisions — supervised tools/policy.ps1, never direct approval-artifact writes
+// approval decisions — the native typed store first, with supervised legacy policy.ps1 fallback
 // ---------------------------------------------------------------------------------------------
 
 /// The irreversible operator decision requested by a pending approval card.
@@ -540,14 +555,19 @@ pub fn parse_approval_result(
     }
 }
 
-/// Apply approve/reject through the supervised PowerShell command channel. This function never
-/// opens or writes an approval JSON file itself.
+/// Apply approve/reject through the native typed store when the id names a native record, or the
+/// supervised PowerShell compatibility channel when it names a legacy record.
 pub fn decide_approval(
     work_dir: &Path,
     id: &str,
+    backend: ApprovalBackend,
     decision: ApprovalDecision,
     rejection_reason: Option<&str>,
 ) -> ApprovalCommandResult {
+    if backend == ApprovalBackend::Native {
+        return decide_native_approval(work_dir, id, decision, rejection_reason);
+    }
+
     let script = match resolve_policy_script(work_dir) {
         Some(path) => path,
         None => {
@@ -574,6 +594,89 @@ pub fn decide_approval(
             outcome: ApprovalOutcome::Failed,
             reason: error,
         },
+    }
+}
+
+/// Consume an Orchestrail-native approval through the engine's typed, owner-checked store. The
+/// backend was captured with the confirmed card, so an absent, redirected, oversized, or
+/// differently shaped artifact fails closed here and never falls through to another mutator.
+fn decide_native_approval(
+    work_dir: &Path,
+    id: &str,
+    decision: ApprovalDecision,
+    rejection_reason: Option<&str>,
+) -> ApprovalCommandResult {
+    let store = match ApprovalStore::new(work_dir) {
+        Ok(store) => store,
+        Err(error) => return native_approval_failure(id, error),
+    };
+    let record = match store.load(id) {
+        Ok(Some(record)) if record.schema == APPROVAL_SCHEMA => record,
+        Ok(Some(_)) | Ok(None) => {
+            return ApprovalCommandResult {
+                id: id.to_string(),
+                outcome: ApprovalOutcome::AlreadyConsumed,
+                reason: "native approval больше не существует в подтверждённой схеме".to_string(),
+            };
+        }
+        Err(error) => return native_approval_failure(id, error),
+    };
+    if record.id != id {
+        return ApprovalCommandResult {
+            id: id.to_string(),
+            outcome: ApprovalOutcome::Failed,
+            reason: "native approval artifact contains a mismatched id".to_string(),
+        };
+    }
+
+    let native_decision = match decision {
+        ApprovalDecision::Approve => NativeApprovalDecision::Approve,
+        ApprovalDecision::Reject => NativeApprovalDecision::Reject,
+    };
+    let note = (decision == ApprovalDecision::Reject)
+        .then(|| {
+            rejection_reason
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .flatten()
+        .map(str::to_string);
+    match store.decide(
+        id,
+        native_decision,
+        "orchestrail-tui",
+        note,
+        now_epoch_secs(),
+    ) {
+        Ok(_) => ApprovalCommandResult {
+            id: id.to_string(),
+            outcome: match decision {
+                ApprovalDecision::Approve => ApprovalOutcome::Approved,
+                ApprovalDecision::Reject => ApprovalOutcome::Rejected,
+            },
+            reason: String::new(),
+        },
+        Err(ApprovalError::AlreadyDecided { .. } | ApprovalError::Missing { .. }) => {
+            ApprovalCommandResult {
+                id: id.to_string(),
+                outcome: ApprovalOutcome::AlreadyConsumed,
+                reason: "native approval уже решён или удалён другим оператором".to_string(),
+            }
+        }
+        Err(ApprovalError::Expired { .. }) => ApprovalCommandResult {
+            id: id.to_string(),
+            outcome: ApprovalOutcome::Expired,
+            reason: "native approval просрочен".to_string(),
+        },
+        Err(error) => native_approval_failure(id, error),
+    }
+}
+
+fn native_approval_failure(id: &str, error: ApprovalError) -> ApprovalCommandResult {
+    ApprovalCommandResult {
+        id: id.to_string(),
+        outcome: ApprovalOutcome::Failed,
+        reason: format!("native approval: {error}"),
     }
 }
 
@@ -653,6 +756,60 @@ mod tests {
         assert!(!w.dir.join("PAUSE").exists());
         // Second resume is again a harmless no-op.
         assert!(!resume(&w.dir).unwrap(), "already cleared");
+    }
+
+    #[test]
+    fn pause_and_resume_refuse_a_redirected_marker_without_touching_its_target() {
+        let w = TmpWork::new();
+        let external = w.dir.join("external.txt");
+        fs::write(&external, "operator-owned\n").unwrap();
+        let marker = w.dir.join(PAUSE_FILE);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&external, &marker).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&external, &marker).is_ok();
+        if !linked {
+            return;
+        }
+
+        assert!(pause(&w.dir, "2026-07-12T01:09:08Z").is_err());
+        assert!(resume(&w.dir).is_err());
+        assert_eq!(fs::read_to_string(&external).unwrap(), "operator-owned\n");
+    }
+
+    #[test]
+    fn native_approval_is_decided_without_a_legacy_policy_script() {
+        let w = TmpWork::new();
+        let now = now_epoch_secs();
+        let fingerprint = "a".repeat(64);
+        let policy_hash = "b".repeat(64);
+        let store = ApprovalStore::new(&w.dir).unwrap();
+        let record = store
+            .request(orchestrail_engine::approval::ApprovalRequest {
+                task_id: Some("T-250".to_string()),
+                batch_id: None,
+                reason: "human-review".to_string(),
+                fingerprint: fingerprint.clone(),
+                policy_hash: policy_hash.clone(),
+                now_secs: now,
+                deadline_secs: 3_600,
+            })
+            .unwrap();
+
+        let result = decide_approval(
+            &w.dir,
+            &record.id,
+            ApprovalBackend::Native,
+            ApprovalDecision::Approve,
+            None,
+        );
+        assert_eq!(result.outcome, ApprovalOutcome::Approved);
+        assert!(matches!(
+            store
+                .status(&record.id, &fingerprint, &policy_hash, now)
+                .unwrap(),
+            orchestrail_engine::approval::ApprovalStatus::Approved { .. }
+        ));
     }
 
     #[test]

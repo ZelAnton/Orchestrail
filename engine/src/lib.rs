@@ -95,4 +95,8 @@ pub mod time;
 pub mod toolscript;
 pub mod vcs;
 pub mod verification;
-pub(crate) mod work_fs;
+/// Confined, bounded filesystem primitives shared by the headless engine and its operator TUI.
+///
+/// Keeping this module public inside the private workspace crates prevents the TUI from growing
+/// a second, weaker implementation for the same authority-bearing `.work` artifacts.
+pub mod work_fs;

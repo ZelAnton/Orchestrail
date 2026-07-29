@@ -650,7 +650,12 @@ mod tests {
             ])
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // A full Windows workspace run creates many real Git/JJ fixtures in parallel. Process
+        // creation can legitimately be delayed beyond five seconds under that load even though
+        // both batch slots were submitted together. A truly sequential implementation still
+        // fails this proof: the first child waits for `release`, so the second cannot become
+        // ready before this entire deadline expires.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline
             && !(first_for_parent.join("ready").is_file()
                 && second_for_parent.join("ready").is_file())

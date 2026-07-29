@@ -1053,6 +1053,7 @@ mod tests {
             paused: true,
             pause_note: Some("оператор остановил конвейер на ночь".to_string()),
             approvals: vec![crate::inbox::ApprovalCard {
+                backend: crate::inbox::ApprovalBackend::Legacy,
                 id: "apr-t250".to_string(),
                 subject: "task:T-250|batch:".to_string(),
                 task: Some("T-250".to_string()),
@@ -1133,6 +1134,7 @@ mod tests {
         let mut app = AppState::new();
         app.screen = Screen::DecisionInbox;
         app.inbox.approvals = vec![crate::inbox::ApprovalCard {
+            backend: crate::inbox::ApprovalBackend::Legacy,
             id: "apr-confirm".to_string(),
             subject: "task:T-250|batch:".to_string(),
             task: Some("T-250".to_string()),
@@ -1166,6 +1168,7 @@ mod tests {
         app.screen = Screen::DecisionInbox;
         app.inbox.approvals = vec![
             crate::inbox::ApprovalCard {
+                backend: crate::inbox::ApprovalBackend::Legacy,
                 id: "apr-long".to_string(),
                 subject: "task:T-250|batch: this deliberately long approval subject wraps across several narrow terminal rows".to_string(),
                 task: Some("T-250".to_string()),
@@ -1177,6 +1180,7 @@ mod tests {
                 policy_hash: Some("bb".to_string()),
             },
             crate::inbox::ApprovalCard {
+                backend: crate::inbox::ApprovalBackend::Legacy,
                 id: "apr-selected".to_string(),
                 subject: "task:T-251|batch:".to_string(),
                 task: Some("T-251".to_string()),
