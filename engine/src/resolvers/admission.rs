@@ -63,17 +63,33 @@ fn matcher(pattern: &str) -> Matcher {
     }
 }
 
+/// Whether `ancestor` names `path` itself or a path component ancestor of it.
+///
+/// A bare conflict-domain can name either a file or a directory. Treating it as a potential
+/// directory makes the matcher conservative without confusing similarly named paths such as
+/// `engine/src` and `engine/src-old`.
+fn is_path_ancestor_or_same(ancestor: &str, path: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// Do two matchers possibly cover a common path? Conservative (prefers a false *overlap* over a
 /// false *disjoint*, matching planner's "при сомнении делай домен шире"):
-/// * two exacts overlap iff equal;
-/// * an exact overlaps a prefix iff the exact starts with the prefix;
+/// * a bare path can be a file or a directory, so two exacts overlap when either is a
+///   component-boundary ancestor of the other;
+/// * an exact overlaps a prefix when the exact could be inside the prefix or the prefix could be
+///   inside the exact's potential directory;
 /// * two prefixes overlap iff one is a string-prefix of the other (both describe "all paths under
 ///   X", so they share paths iff one prefix contains the other).
 fn matchers_overlap(a: &Matcher, b: &Matcher) -> bool {
     match (a, b) {
-        (Matcher::Exact(x), Matcher::Exact(y)) => x == y,
+        (Matcher::Exact(x), Matcher::Exact(y)) => {
+            is_path_ancestor_or_same(x, y) || is_path_ancestor_or_same(y, x)
+        }
         (Matcher::Exact(x), Matcher::Prefix(p)) | (Matcher::Prefix(p), Matcher::Exact(x)) => {
-            x.starts_with(p.as_str())
+            x.starts_with(p.as_str()) || is_path_ancestor_or_same(x, p)
         }
         (Matcher::Prefix(x), Matcher::Prefix(y)) => {
             x.starts_with(y.as_str()) || y.starts_with(x.as_str())
@@ -492,6 +508,11 @@ mod tests {
         assert!(
             !Domain::parse("engine/src/state/**").intersects(&Domain::parse("engine/src/lib.rs"))
         );
+        // A bare path may name a directory, so it overlaps files and globs inside that subtree.
+        assert!(
+            Domain::parse("engine/src").intersects(&Domain::parse("engine/src/lib.rs"))
+        );
+        assert!(Domain::parse("engine/src").intersects(&Domain::parse("engine/src/**")));
         // A superset subtree overlaps its subset subtree.
         assert!(Domain::parse("engine/**").intersects(&Domain::parse("engine/src/state/**")));
         // A multi-glob domain overlaps when ANY pair overlaps.
