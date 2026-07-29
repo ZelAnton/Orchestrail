@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::state::archive_header_task_id;
+use crate::task_id::is_task_id;
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
 const ROADMAP_FILE: &str = "roadmap.md";
@@ -333,7 +334,7 @@ fn milestone_tasks(lines: &[Line<'_>]) -> Result<BTreeSet<String>> {
     }
     let mut tasks = BTreeSet::new();
     for task in raw.split(',').map(str::trim) {
-        if !valid_task_id(task) || !tasks.insert(task.to_owned()) {
+        if !is_task_id(task) || !tasks.insert(task.to_owned()) {
             return Err(RoadmapError::Malformed(format!(
                 "current milestone has invalid or duplicate task id {task:?}"
             )));
@@ -344,12 +345,6 @@ fn milestone_tasks(lines: &[Line<'_>]) -> Result<BTreeSet<String>> {
 
 fn valid_milestone_id(id: &str) -> bool {
     id.strip_prefix('M').is_some_and(|number| {
-        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
-fn valid_task_id(id: &str) -> bool {
-    id.strip_prefix("T-").is_some_and(|number| {
         !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
     })
 }

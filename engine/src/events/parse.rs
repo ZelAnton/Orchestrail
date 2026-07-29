@@ -17,6 +17,8 @@
 
 use serde_json::Value;
 
+use crate::task_id::is_task_id;
+
 use super::model::{Actor, ActorKind, Event, EventType, SCHEMA_VERSION};
 
 /// A human-readable reason one line could not be decoded into a valid [`Event`].
@@ -194,15 +196,6 @@ fn require_int(v: Option<&Value>, field: &str) -> Result<i64, ParseError> {
             .filter(|_| v.is_i64() || v.is_u64())
             .ok_or_else(|| ParseError::new(format!("{field} must be an integer"))),
     }
-}
-
-/// `^T-\d` — a T-id is `T-` followed by at least one digit.
-fn is_task_id(s: &str) -> bool {
-    let rest = match s.strip_prefix("T-") {
-        Some(r) => r,
-        None => return false,
-    };
-    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 fn is_task_coordinate(event_type: EventType, value: &str) -> bool {
