@@ -24,6 +24,7 @@ use crate::resolvers::{
     admission_gate, plan_admission, review_cycle_decision, stagnation_decision,
 };
 use crate::state::DeliveryTarget;
+use crate::task_id::is_task_id;
 
 /// Version of the persisted processor checkpoint.  Bump only with an explicit migration.
 pub const PROCESSOR_STATE_VERSION: u32 = 1;
@@ -4374,10 +4375,7 @@ fn stagnation_reason(signatures: &[AttemptSignature], limit: u32) -> Option<Stri
 }
 
 fn validate_task_id(id: &str) -> Result<(), ProcessorError> {
-    let valid = id.strip_prefix("T-").is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    if valid {
+    if is_task_id(id) {
         Ok(())
     } else {
         Err(ProcessorError::InvalidCommand(format!(

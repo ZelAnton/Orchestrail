@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::supervise::{self, Reason, SpawnSpec};
+use crate::task_id::is_task_id;
 use crate::work_fs;
 
 const NOTIFICATION_SCHEMA: &str = "orchestrail/notification@1";
@@ -431,9 +432,7 @@ fn notification_id(event: NotificationEvent, subject: &str) -> String {
 
 fn valid_subject(event: NotificationEvent, subject: &str) -> bool {
     match event {
-        NotificationEvent::TaskEscalated => subject.strip_prefix("T-").is_some_and(|number| {
-            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-        }),
+        NotificationEvent::TaskEscalated => is_task_id(subject),
         NotificationEvent::ApprovalPending => subject
             .strip_prefix("apr-")
             .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())),

@@ -10,7 +10,8 @@ use std::path::Path;
 
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
-use super::util::{find_batch_id, is_task_id, line_field};
+use super::util::{find_batch_id, line_field};
+use crate::task_id::is_task_id;
 
 /// One admitted task line from `## Задачи`.
 #[derive(Debug, Clone, PartialEq, Eq)]

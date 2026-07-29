@@ -19,6 +19,7 @@ use crate::events::{
     ActorKind, Event, EventType, OUTBOX_FILE, SCHEMA_VERSION, TailReader, deterministic_event_id,
 };
 use crate::time::iso_to_epoch_millis;
+use crate::task_id::is_task_id;
 
 /// Provider-exact token counters captured for one completed model invocation.
 ///
@@ -405,7 +406,7 @@ pub(crate) fn validate_complete_codex_attempt(event: &Event) -> Result<(), Telem
     let task_id = event
         .task_id
         .as_deref()
-        .filter(|task_id| valid_task_id(task_id))
+        .filter(|task_id| is_task_id(task_id))
         .ok_or(TelemetryUnavailable::InvalidEventRecord)?;
     let payload_task = event
         .payload
@@ -503,12 +504,6 @@ pub(crate) fn validate_complete_codex_attempt(event: &Event) -> Result<(), Telem
         return Err(TelemetryUnavailable::InvalidEventRecord);
     }
     Ok(())
-}
-
-fn valid_task_id(value: &str) -> bool {
-    value.strip_prefix("T-").is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    })
 }
 
 fn safe_scalar(value: &str) -> bool {
@@ -790,7 +785,7 @@ impl OperationCompleted {
                 .batch_id
                 .as_deref()
                 .is_none_or(|id| !valid_batch_id(id))
-            || event.task_id.as_deref().is_none_or(|id| !valid_task_id(id))
+            || event.task_id.as_deref().is_none_or(|id| !is_task_id(id))
             || event.payload.len() != OPERATION_KEYS.len() + 1
             || !OPERATION_KEYS
                 .iter()
@@ -901,7 +896,7 @@ impl OperationCompleted {
         occurred_at: &str,
     ) -> Result<Event, TelemetryUnavailable> {
         if !valid_batch_id(batch_id)
-            || !valid_task_id(task_id)
+            || !is_task_id(task_id)
             || !lower_token(&self.operation)
             || !lower_token(&self.role)
             || !lower_token(&self.mode)
@@ -1023,7 +1018,7 @@ pub fn task_execution_metrics(
     batch_id: &str,
     events_outbox_enabled: bool,
 ) -> Result<TaskExecutionMetrics, TelemetryUnavailable> {
-    if !valid_task_id(task_id) || !valid_batch_id(batch_id) {
+    if !is_task_id(task_id) || !valid_batch_id(batch_id) {
         return Err(TelemetryUnavailable::InvalidEventRecord);
     }
     let path = work.join(OUTBOX_FILE);

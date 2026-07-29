@@ -48,6 +48,14 @@ rather than treated as success. With `CI_WATCH: on`, GitHub commit checks are po
 against the exact published SHA; an unsupported forge, empty/unknown checks, transport failure,
 or timeout remains fail-closed rather than becoming an implicit success.
 
+`REVIEW_CYCLE_VERIFICATION: on` additionally runs that profile inside each task's worktree on
+every review/fix cycle, under the same containment and `CALL_OUTPUT_MAX_BYTES` ceiling, and mixes
+a failing result into the task's `review.md` as an open finding before that round's reviewer is
+dispatched — so a broken build reaches the fixer in the round that caused it instead of at the
+publication gate several rounds later. `REVIEW_CYCLE_VERIFICATION_COMMANDS` narrows the per-round
+profile (for example lint and build only, without the heavy tests). The option is off by default,
+and leaving it off keeps verification a Phase-4-only gate.
+
 Published releases use a separate mode and never enter the task queue:
 
 ```pwsh

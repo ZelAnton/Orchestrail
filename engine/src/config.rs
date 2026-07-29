@@ -40,6 +40,15 @@ pub struct EngineConfig {
     /// Exact operator-owned shell commands for Phase 4 verification. They are parsed as JSON so
     /// a Markdown value cannot be split ambiguously into executable fragments.
     pub verification_commands: Vec<String>,
+    /// Whether the verification profile also runs inside every task review/fix cycle (phases
+    /// 2.5/2.8), not only at the Phase-4 publication gate. Off by default: enabling it changes the
+    /// cost and the artifact content of every review round, so it stays an explicit operator
+    /// decision.
+    pub review_cycle_verification: bool,
+    /// Optional narrower profile for the review/fix cycle, so an operator can gate each round on
+    /// a cheap lint/build subset while the full (test-bearing) profile still guards publication.
+    /// Empty means the cycle reuses `VERIFICATION_COMMANDS`/`SMOKE_CMD`.
+    pub review_cycle_verification_commands: Vec<String>,
     /// Legacy one-command fallback used only when `VERIFICATION_COMMANDS` is absent.
     pub smoke_cmd: Option<String>,
     /// Optional typed argv for best-effort operator notifications. An absent or empty legacy
@@ -139,6 +148,8 @@ impl Default for EngineConfig {
             verification_mode: VerificationMode::Disabled,
             verification_mode_explicit: false,
             verification_commands: Vec::new(),
+            review_cycle_verification: false,
+            review_cycle_verification_commands: Vec::new(),
             smoke_cmd: None,
             notify_command: None,
             call_deadline_secs: 1800,
@@ -298,7 +309,15 @@ fn parse_with_environment(
     config.verification_mode_explicit = configured_verification_mode.is_some();
     config.verification_commands = match fields.get("VERIFICATION_COMMANDS") {
         None => Vec::new(),
-        Some(value) => parse_verification_commands(value)?,
+        Some(value) => parse_verification_commands("VERIFICATION_COMMANDS", value)?,
+    };
+    config.review_cycle_verification = optional_bool(&fields, "REVIEW_CYCLE_VERIFICATION")?
+        .unwrap_or(config.review_cycle_verification);
+    config.review_cycle_verification_commands = match fields
+        .get("REVIEW_CYCLE_VERIFICATION_COMMANDS")
+    {
+        None => Vec::new(),
+        Some(value) => parse_verification_commands("REVIEW_CYCLE_VERIFICATION_COMMANDS", value)?,
     };
     config.smoke_cmd = configured_value(&fields, "SMOKE_CMD")
         .map(str::trim)
@@ -335,6 +354,33 @@ fn parse_with_environment(
     // shell-shaped profile text remains in config.md. Validate argv only when a profile can
     // actually reach a ProcessKit launch.
     if config.verification_mode != VerificationMode::Disabled {
+        validate_typed_verification_profile(
+            &config.verification_commands,
+            config.smoke_cmd.as_deref(),
+        )?;
+    }
+    // The review-cycle subset is a new key, so no legacy shell-shaped text can exist for it and
+    // there is nothing to keep compatible: validate typed argv whenever it is present, even while
+    // the gate itself is off, rather than deferring the failure to the first enabled cohort.
+    for command in &config.review_cycle_verification_commands {
+        parse_typed_argv(command).map_err(|error| {
+            invalid(format!(
+                "REVIEW_CYCLE_VERIFICATION_COMMANDS entries must name one executable with typed arguments: {error}"
+            ))
+        })?;
+    }
+    // An enabled gate with nothing to execute would silently degrade to "always green" on every
+    // 2.5/2.8 cycle, which is exactly the failure this option exists to prevent. `SMOKE_CMD` alone
+    // is a legal profile here, so validate its argv even when Phase 4 exempted it as legacy text.
+    if config.review_cycle_verification {
+        if config.review_cycle_verification_commands.is_empty()
+            && config.verification_commands.is_empty()
+            && config.smoke_cmd.is_none()
+        {
+            return Err(invalid(
+                "REVIEW_CYCLE_VERIFICATION requires REVIEW_CYCLE_VERIFICATION_COMMANDS, VERIFICATION_COMMANDS, or SMOKE_CMD",
+            ));
+        }
         validate_typed_verification_profile(
             &config.verification_commands,
             config.smoke_cmd.as_deref(),
@@ -527,22 +573,24 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
-fn parse_verification_commands(value: &str) -> Result<Vec<String>, ConfigError> {
+/// Decode one JSON command-array key. `key` is echoed into every diagnostic so the Phase-4
+/// profile and the review/fix-cycle subset cannot report each other's malformed value.
+fn parse_verification_commands(key: &str, value: &str) -> Result<Vec<String>, ConfigError> {
     let commands: Vec<String> = serde_json::from_str(value).map_err(|error| {
         invalid(format!(
-            "VERIFICATION_COMMANDS must be a JSON array of command strings: {error}"
+            "{key} must be a JSON array of command strings: {error}"
         ))
     })?;
     if commands.is_empty() {
-        return Err(invalid(
-            "VERIFICATION_COMMANDS must contain at least one non-empty command",
-        ));
+        return Err(invalid(format!(
+            "{key} must contain at least one non-empty command"
+        )));
     }
     for command in &commands {
         if command.trim().is_empty() || command.contains('\0') {
-            return Err(invalid(
-                "VERIFICATION_COMMANDS entries must be non-empty and contain no NUL byte",
-            ));
+            return Err(invalid(format!(
+                "{key} entries must be non-empty and contain no NUL byte"
+            )));
         }
     }
     Ok(commands)
@@ -780,6 +828,66 @@ mod tests {
         assert!(parse("VERIFICATION_COMMANDS: [\"\"]\n").is_err());
         assert!(parse("VERIFICATION_COMMANDS: [\"cargo test && cargo fmt\"]\n").is_err());
         assert!(parse("SMOKE_CMD: pwsh -Command cargo test\n").is_err());
+    }
+
+    #[test]
+    fn review_cycle_verification_is_off_by_default_and_needs_an_executable_profile() {
+        let default = parse("VERIFICATION_COMMANDS: [\"cargo test\"]\n").unwrap();
+        assert!(!default.review_cycle_verification);
+        assert!(default.review_cycle_verification_commands.is_empty());
+
+        let reused = parse(
+            "REVIEW_CYCLE_VERIFICATION: on\nVERIFICATION_COMMANDS: [\"cargo fmt --check\", \"cargo test\"]\n",
+        )
+        .unwrap();
+        assert!(reused.review_cycle_verification);
+        assert!(reused.review_cycle_verification_commands.is_empty());
+
+        let subset = parse(
+            "REVIEW_CYCLE_VERIFICATION: true\nREVIEW_CYCLE_VERIFICATION_COMMANDS: [\"cargo clippy --workspace\"]\nVERIFICATION_COMMANDS: [\"cargo test\"]\n",
+        )
+        .unwrap();
+        assert!(subset.review_cycle_verification);
+        assert_eq!(
+            subset.review_cycle_verification_commands,
+            vec!["cargo clippy --workspace"]
+        );
+
+        // The legacy one-command fallback is a legal cycle profile, but its argv must be typed
+        // once it can actually reach a ProcessKit launch on every round.
+        assert!(parse("REVIEW_CYCLE_VERIFICATION: on\nSMOKE_CMD: cargo test\n").is_ok());
+        assert!(
+            parse("REVIEW_CYCLE_VERIFICATION: on\nVERIFICATION_MODE: disabled\nSMOKE_CMD: pwsh -Command cargo test\n").is_err()
+        );
+
+        // An enabled gate with no profile at all would be a silent always-green round.
+        assert!(parse("REVIEW_CYCLE_VERIFICATION: on\n").is_err());
+        assert!(parse("REVIEW_CYCLE_VERIFICATION: maybe\n").is_err());
+    }
+
+    #[test]
+    fn review_cycle_subset_is_validated_even_while_the_gate_is_off() {
+        // The key is new, so no legacy shell text can exist for it: a malformed subset must fail
+        // at parse time rather than at the first cohort that switches the gate on.
+        assert!(
+            parse("REVIEW_CYCLE_VERIFICATION_COMMANDS: [\"cargo fmt && cargo test\"]\n").is_err()
+        );
+        assert!(parse("REVIEW_CYCLE_VERIFICATION_COMMANDS: []\n").is_err());
+        assert!(parse("REVIEW_CYCLE_VERIFICATION_COMMANDS: not-json\n").is_err());
+        assert!(parse("REVIEW_CYCLE_VERIFICATION_COMMANDS: [\"\"]\n").is_err());
+        let error = parse("REVIEW_CYCLE_VERIFICATION_COMMANDS: not-json\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("REVIEW_CYCLE_VERIFICATION_COMMANDS"),
+            "each JSON command key must name itself in diagnostics: {error}"
+        );
+        let inert = parse("REVIEW_CYCLE_VERIFICATION_COMMANDS: [\"cargo clippy\"]\n").unwrap();
+        assert!(!inert.review_cycle_verification);
+        assert_eq!(
+            inert.review_cycle_verification_commands,
+            vec!["cargo clippy"]
+        );
     }
 
     #[test]

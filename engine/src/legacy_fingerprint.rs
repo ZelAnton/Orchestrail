@@ -14,6 +14,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use crate::task_id::is_task_id;
 
 /// A committed tree entry supplied by a typed VCS inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +274,7 @@ fn queue_row(line: &str) -> Option<(&str, &str)> {
     }
     let rest = rest.strip_prefix('[')?;
     let (task_id, _) = rest.split_once(']')?;
-    if !valid_task_id(task_id) {
+    if !is_task_id(task_id) {
         return None;
     }
     // The legacy regex's non-greedy title match backtracks over title dashes until one is
@@ -304,19 +305,13 @@ fn task_ids_in_text(text: &str) -> Vec<String> {
         if end < bytes.len()
             && std::str::from_utf8(&bytes[start..end])
                 .ok()
-                .is_some_and(valid_task_id)
+                .is_some_and(is_task_id)
         {
             ids.push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
         }
         index = end.saturating_add(1);
     }
     ids
-}
-
-fn valid_task_id(value: &str) -> bool {
-    value.strip_prefix("T-").is_some_and(|number| {
-        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-    })
 }
 
 fn decimal_suffix<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
