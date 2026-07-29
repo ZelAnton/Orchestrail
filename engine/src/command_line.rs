@@ -68,29 +68,32 @@ pub fn parse_typed_argv(command: &str) -> Result<Vec<String>, String> {
 
 /// Validate a program field whose arguments are generated separately by typed product code.
 /// Paths may contain spaces, but the executable itself may not be a shell host.
+///
+/// Shell hosts are matched by file name stem, so a Windows install of a Unix shell
+/// (`C:\Program Files\Git\bin\bash.exe`) is refused exactly like the bare `bash` it launches.
 pub fn validate_direct_program(program: &str) -> Result<(), String> {
     if program.is_empty() || program.contains(['\0', '\n', '\r']) {
         return Err("executable must be non-empty and contain no NUL or line break".into());
     }
     // `Path` parses only the host platform's separators. Configuration is portable, so a
     // Windows shell path must still be recognized (and rejected) on Unix, and vice versa.
+    // Windows also drops trailing dots and spaces from the final path component, so `bash.exe.`
+    // must normalize to the same name it actually starts.
     let executable = program
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(program)
+        .trim_end_matches(['.', ' '])
         .to_ascii_lowercase();
+    // Comparing the stem instead of the full file name keeps every shell in this list covered in
+    // both its bare and its executable-extension form; matching only the names Unix uses left
+    // `sh.exe`/`bash.exe` from Git for Windows, MSYS, and Cygwin passing as ordinary programs.
+    let stem = executable
+        .rsplit_once('.')
+        .map_or(executable.as_str(), |(stem, _extension)| stem);
     if matches!(
-        executable.as_str(),
-        "cmd"
-            | "cmd.exe"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "pwsh"
-            | "pwsh.exe"
-            | "powershell"
-            | "powershell.exe"
+        stem,
+        "cmd" | "sh" | "bash" | "dash" | "ksh" | "zsh" | "fish" | "busybox" | "pwsh" | "powershell"
     ) {
         return Err(format!(
             "shell executable {program:?} is not permitted; configure the target executable directly"
@@ -122,10 +125,33 @@ mod tests {
             "cargo test | tee log.txt",
             "cmd.exe /C cargo test",
             "pwsh -Command cargo test",
+            r#""C:\Program Files\Git\bin\bash.exe" -c "cargo test""#,
         ] {
             assert!(parse_typed_argv(command).is_err(), "{command}");
         }
-        assert!(validate_direct_program(r"C:\Windows\System32\cmd.exe").is_err());
-        assert!(validate_direct_program(r"C:\Program Files\Codex\codex.exe").is_ok());
+        // A Windows box reaches a shell through the installed `.exe`, so the deny gate has to
+        // cover those file names as well as the bare Unix ones.
+        for program in [
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\bin\sh.exe",
+            r"C:\Program Files\Git\usr\bin\ZSH.EXE",
+            r"C:\msys64\usr\bin\fish.exe",
+            "C:/Program Files/Git/usr/bin/dash.exe",
+            r"C:\tools\busybox.exe",
+            // Windows resolves a trailing dot away before it starts the program.
+            r"C:\Program Files\Git\bin\bash.exe.",
+            "/usr/bin/fish",
+            "ksh",
+        ] {
+            assert!(validate_direct_program(program).is_err(), "{program}");
+        }
+        for program in [
+            r"C:\Program Files\Codex\codex.exe",
+            r"C:\tools\shellcheck.exe",
+            "cargo",
+        ] {
+            assert!(validate_direct_program(program).is_ok(), "{program}");
+        }
     }
 }
