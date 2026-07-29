@@ -17,6 +17,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::state::{DeliveryTarget, QueueEntry, TaskState, archive_header_task_id};
+use crate::task_id::is_task_id;
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
 const QUEUE_FILE: &str = "Tasks_Queue.md";
@@ -782,7 +783,7 @@ fn validate_task(
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     for predecessor in predecessors {
-        if !valid_task_id(predecessor) || !seen.insert(predecessor.clone()) {
+        if !is_task_id(predecessor) || !seen.insert(predecessor.clone()) {
             return Err(QueueInboxError::Invalid(format!(
                 "task {id} has invalid or duplicate predecessor {predecessor:?}"
             )));
@@ -1225,15 +1226,12 @@ fn is_redirected(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn valid_task_id(id: &str) -> bool {
-    canonical_task_id(id).is_some()
-}
-
 fn task_number(id: &str) -> Option<u32> {
+    if !is_task_id(id) {
+        return None;
+    }
     let digits = id.strip_prefix("T-")?;
-    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| digits.parse().ok())
-        .flatten()
+    digits.parse().ok()
 }
 
 fn canonical_task_id(id: &str) -> Option<String> {

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::dependency_graph::{self, DependencyGraphError, RegisteredProject};
 use crate::state::archive_header_task_id;
+use crate::task_id::is_task_id;
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
 const INBOX_DIRECTORY: &str = ".inbox";
@@ -1096,7 +1097,7 @@ fn parse_task_ids(value: Option<&Value>, file_id: &str) -> Result<BTreeSet<Strin
                 "message {file_id} queue_tasks contains a non-string"
             ))
         })?;
-        if !valid_task_id(task) || !tasks.insert(task.to_owned()) {
+        if !is_task_id(task) || !tasks.insert(task.to_owned()) {
             return Err(InboxError::Malformed(format!(
                 "message {file_id} has invalid or duplicate queue task {task:?}"
             )));
@@ -1191,7 +1192,7 @@ fn task_links(root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
         for entry in entries {
             let entry = entry?;
             let task_id = entry.file_name().to_string_lossy().into_owned();
-            if !valid_task_id(&task_id) {
+            if !is_task_id(&task_id) {
                 continue;
             }
             let task_directory = entry.path();
@@ -1330,7 +1331,7 @@ fn task_header_id(line: &str) -> Option<String> {
             .then(|| id.to_owned())
     });
     if let Some(id) = bracketed {
-        return valid_task_id(&id).then_some(id);
+        return is_task_id(&id).then_some(id);
     }
     legacy_task_header_id(line)
 }
@@ -1343,7 +1344,7 @@ fn legacy_task_header_id(line: &str) -> Option<String> {
     let rest = heading_rest(line)?;
     let prefix = "Активная задача ";
     let id = rest.strip_prefix(prefix)?.split_whitespace().next()?;
-    valid_task_id(id).then_some(id.to_owned())
+    is_task_id(id).then_some(id.to_owned())
 }
 
 fn heading_rest(line: &str) -> Option<&str> {
@@ -1476,12 +1477,6 @@ fn valid_project_id(id: &str) -> bool {
             && suffix
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    })
-}
-
-fn valid_task_id(id: &str) -> bool {
-    id.strip_prefix("T-").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
     })
 }
 

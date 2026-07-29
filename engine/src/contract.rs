@@ -21,6 +21,7 @@
 use std::cmp::Ordering;
 
 use crate::time::iso_chrono_cmp;
+use crate::task_id::is_task_id;
 
 /// A finding's lifecycle status (the four words the contract uses, plus a catch-all).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,11 +204,7 @@ pub fn parse_merge_report(text: &str) -> Vec<MergeLine> {
             continue;
         };
         let id = rest[..close].trim().to_string();
-        let is_task_id = match id.strip_prefix("T-") {
-            Some(d) => !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()),
-            None => false,
-        };
-        if !is_task_id {
+        if !is_task_id(&id) {
             continue;
         }
         let after = rest[close + 1..].trim();
@@ -723,6 +720,7 @@ mod tests {
         let text = "\
 # heading\n\
 - [not-a-task] merged=x\n\
+- [T-1abc] merged=x\n\
 - [T-200] merged=\n\
 - [T-201] неизвестно=y\n\
 - [T-202] merged=ok\n";

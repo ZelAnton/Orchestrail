@@ -90,6 +90,7 @@ pub mod run;
 pub mod runtime;
 pub mod state;
 pub mod supervise;
+pub mod task_id;
 pub mod telemetry;
 pub mod time;
 pub mod toolscript;

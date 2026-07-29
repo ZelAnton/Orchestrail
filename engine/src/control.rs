@@ -12,6 +12,7 @@ use crate::processor::CloseReasonWire;
 use crate::resolvers::Risk;
 use crate::roadmap;
 use crate::state::{Snapshot, TaskState, archive_header_task_id};
+use crate::task_id::is_task_id;
 use crate::telemetry::{BatchTelemetrySummary, batch_telemetry_summary};
 use crate::work_fs;
 
@@ -1564,10 +1565,7 @@ fn valid_task_transition(from: TaskState, to: TaskState) -> bool {
 }
 
 fn validate_task_id(task_id: &str) -> Result<()> {
-    let valid = task_id.strip_prefix("T-").is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    valid.then_some(()).ok_or_else(|| {
+    is_task_id(task_id).then_some(()).ok_or_else(|| {
         ControlError::InvalidInput(format!("invalid task id {task_id:?}; expected T-<digits>"))
     })
 }
