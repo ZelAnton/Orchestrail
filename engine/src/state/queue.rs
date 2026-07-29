@@ -7,7 +7,8 @@
 //! line yields the prerequisite T-ids. Read-only: this only decodes the file's text.
 
 use super::canonical::{TaskState, suffix_field};
-use super::util::{is_task_id, line_field, parse_task_id_list};
+use super::util::{line_field, parse_task_id_list};
+use crate::task_id::is_task_id;
 
 /// Delivery lane of a task (`docs/queue_contract.md` §11.1), decoded from the body's
 /// `Delivery target:` field. `current` is the normal delivery line the ordinary
@@ -203,6 +204,15 @@ mod tests {
         // The leading prose / `------` lines must not become entries.
         assert_eq!(parse_queue(QUEUE).len(), 4);
         assert!(parse_queue("just some text\nno headers here").is_empty());
+    }
+
+    #[test]
+    fn rejects_headers_with_non_numeric_task_ids() {
+        assert!(parse_queue("### [T-1abc] Invalid — статус: не начата\n").is_empty());
+        assert_eq!(
+            parse_queue("### [T-0012] Valid — статус: не начата\n")[0].id,
+            "T-0012"
+        );
     }
 
     #[test]
