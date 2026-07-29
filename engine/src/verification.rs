@@ -1,4 +1,4 @@
-//! ProcessKit-contained Phase-4 integration verification.
+//! ProcessKit-contained verification of an operator command profile.
 //!
 //! The legacy configuration exposes human-authored command strings, so compatibility requires a
 //! platform shell.  The shell itself is still launched only through [`crate::supervise`], with a
@@ -6,6 +6,13 @@
 //! bounded
 //! capture, and tree containment.  This module never treats an absent profile as a successful
 //! build gate.
+//!
+//! Two callers share that one execution body. [`verify_integration`] is the Phase-4 publication
+//! gate: its result authorises (or refuses) a tip and is persisted as durable evidence.
+//! [`verify_review_cycle`] is the optional per-round preview inside a task worktree (phases
+//! 2.5/2.8): it authorises nothing and can only add a review finding, but it must not be allowed
+//! to run under weaker containment than the gate it previews, which is why the two share
+//! `run_command_sequence` rather than each owning a copy.
 
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -424,8 +431,8 @@ pub fn verify_integration(
     cancellation_probe: Option<CancellationProbe>,
 ) -> VerificationRun {
     let profile = profile(mode, verification_commands, smoke_cmd);
-    let commands = match commands(&profile) {
-        VerificationCommands::Exempt { reason } => {
+    match disposition(&profile) {
+        ProfileDisposition::Exempt { reason } => {
             return VerificationRun {
                 outcome: VerificationOutcome::Exempt {
                     reason: reason.into(),
@@ -435,7 +442,7 @@ pub fn verify_integration(
                 commands: Vec::new(),
             };
         }
-        VerificationCommands::Blocked { reason } => {
+        ProfileDisposition::Blocked { reason } => {
             return VerificationRun {
                 outcome: VerificationOutcome::Blocked {
                     reason: reason.into(),
@@ -445,11 +452,85 @@ pub fn verify_integration(
                 commands: Vec::new(),
             };
         }
-        VerificationCommands::Commands(commands) => commands,
-    };
+        ProfileDisposition::Configured => {}
+    }
+    let sequence = run_command_sequence(
+        &profile.commands,
+        INTEGRATION_FINDING_SUBJECT,
+        workspace,
+        deadline,
+        output_max_bytes,
+        cancellation_probe,
+    );
+    VerificationRun {
+        outcome: sequence.outcome,
+        transcript: sequence.transcript,
+        profile,
+        commands: sequence.commands,
+    }
+}
 
+/// Run the operator's review/fix-cycle profile inside one task worktree (`agents/processor.md`
+/// phases 2.5/2.8).
+///
+/// This is deliberately the *same* contained execution as the Phase-4 gate — one `supervise::run`
+/// child per command, the same `call_output_max_bytes` capture ceiling, the same lease-loss
+/// cancellation and the same typed-argv refusal of shell grammar — differing only in the worktree
+/// it runs in and in the fact that it authorizes nothing: its result becomes review evidence for
+/// this round rather than a publication decision, so it writes no `verification.json`.
+pub fn verify_review_cycle(
+    profile: &VerificationProfile,
+    workspace: &Path,
+    deadline: Duration,
+    output_max_bytes: usize,
+    cancellation_probe: Option<CancellationProbe>,
+) -> VerificationRun {
+    let sequence = run_command_sequence(
+        &profile.commands,
+        REVIEW_CYCLE_FINDING_SUBJECT,
+        workspace,
+        deadline,
+        output_max_bytes,
+        cancellation_probe,
+    );
+    VerificationRun {
+        outcome: sequence.outcome,
+        transcript: sequence.transcript,
+        profile: profile.clone(),
+        commands: sequence.commands,
+    }
+}
+
+/// The stable subject halves of the two verification attempt signatures. They are distinct so a
+/// review-cycle failure and a Phase-4 failure of the same command never collapse into one
+/// stagnation fingerprint.
+const INTEGRATION_FINDING_SUBJECT: &str = "integration verification failed";
+const REVIEW_CYCLE_FINDING_SUBJECT: &str = "review-cycle verification failed";
+
+/// The profile-independent half of a verification run: what the contained children did.
+struct CommandSequenceRun {
+    outcome: VerificationOutcome,
+    transcript: String,
+    commands: Vec<VerificationCommandRun>,
+}
+
+/// Execute `commands` sequentially under ProcessKit containment, stopping at the first command
+/// that does not end `ok`.
+///
+/// Both the publication gate and the review/fix-cycle gate share this one body on purpose: a
+/// second copy would let the cheaper, more frequently executed path drift away from the
+/// containment, capture-ceiling, cancellation, and shell-grammar rules the publication gate
+/// establishes.
+fn run_command_sequence(
+    commands: &[String],
+    finding_subject: &str,
+    workspace: &Path,
+    deadline: Duration,
+    output_max_bytes: usize,
+    cancellation_probe: Option<CancellationProbe>,
+) -> CommandSequenceRun {
     let invocations = commands
-        .into_iter()
+        .iter()
         .map(|command| {
             parse_typed_argv(command)
                 .map(|argv| (command, argv))
@@ -459,12 +540,9 @@ pub fn verify_integration(
     let invocations = match invocations {
         Ok(invocations) => invocations,
         Err(reason) => {
-            return VerificationRun {
-                outcome: VerificationOutcome::Blocked {
-                    reason: reason.clone(),
-                },
+            return CommandSequenceRun {
                 transcript: format!("verification=blocked; reason={reason}\n"),
-                profile,
+                outcome: VerificationOutcome::Blocked { reason },
                 commands: Vec::new(),
             };
         }
@@ -492,7 +570,7 @@ pub fn verify_integration(
             one_line(&verdict.outcome_reason),
         ));
         results.push(VerificationCommandRun {
-            command: (*command).into(),
+            command: (*command).clone(),
             reason: verdict.reason.as_str().into(),
             exit_code: verdict.exit_code,
         });
@@ -521,7 +599,7 @@ pub fn verify_integration(
             } else {
                 VerificationOutcome::Failed {
                     signature: AttemptSignature::of_finding(
-                        "integration verification failed",
+                        finding_subject,
                         &format!("{number}:{command}:{}", verdict.reason.as_str()),
                     )
                     .as_str()
@@ -529,40 +607,39 @@ pub fn verify_integration(
                     reason,
                 }
             };
-            return VerificationRun {
+            return CommandSequenceRun {
                 outcome,
                 transcript,
-                profile,
                 commands: results,
             };
         }
     }
-    VerificationRun {
+    CommandSequenceRun {
         outcome: VerificationOutcome::Passed,
         transcript,
-        profile,
         commands: results,
     }
 }
 
-enum VerificationCommands<'a> {
+/// How a resolved profile settles before any child is launched. `Configured` deliberately carries
+/// no command payload: the commands are `profile.commands`, and duplicating them here would create
+/// a second list that could disagree with the hashed snapshot the evidence is bound to.
+enum ProfileDisposition {
     Exempt { reason: &'static str },
     Blocked { reason: &'static str },
-    Commands(Vec<&'a str>),
+    Configured,
 }
 
-fn commands(profile: &VerificationProfile) -> VerificationCommands<'_> {
+fn disposition(profile: &VerificationProfile) -> ProfileDisposition {
     if profile.state == "disabled" {
-        return VerificationCommands::Exempt {
+        return ProfileDisposition::Exempt {
             reason: "operator-disabled",
         };
     }
     if profile.state == "configured" {
-        return VerificationCommands::Commands(
-            profile.commands.iter().map(String::as_str).collect(),
-        );
+        return ProfileDisposition::Configured;
     }
-    VerificationCommands::Blocked {
+    ProfileDisposition::Blocked {
         reason: MISSING_PROFILE_REASON,
     }
 }
@@ -604,6 +681,43 @@ pub fn profile_with_policy_commands(
         VerificationMode::Auto => "auto",
         VerificationMode::Required => "required",
     };
+    fingerprinted_profile(mode, source, commands)
+}
+
+/// Snapshot the exact command profile a review/fix cycle would execute, or `None` when the
+/// operator configured nothing runnable.
+///
+/// Precedence mirrors the Phase-4 rule and then extends it by one step: an explicit
+/// `REVIEW_CYCLE_VERIFICATION_COMMANDS` subset wins over `VERIFICATION_COMMANDS`, which still wins
+/// over the legacy `SMOKE_CMD`. The `source` field records which operator key actually supplied
+/// the commands, so a cycle finding cannot misattribute a cheap lint subset to the full
+/// publication profile. Policy-required `constraints.md` checks are intentionally NOT folded in:
+/// they are a publication precondition, and running them every round would silently redefine
+/// which checks the operator agreed to pay for on each cycle.
+pub fn review_cycle_profile(
+    review_cycle_commands: &[String],
+    verification_commands: &[String],
+    smoke_cmd: Option<&str>,
+) -> Option<VerificationProfile> {
+    let (source, commands) = if !review_cycle_commands.is_empty() {
+        (
+            "REVIEW_CYCLE_VERIFICATION_COMMANDS",
+            review_cycle_commands.to_vec(),
+        )
+    } else if !verification_commands.is_empty() {
+        ("VERIFICATION_COMMANDS", verification_commands.to_vec())
+    } else {
+        ("SMOKE_CMD", vec![smoke_cmd?.to_string()])
+    };
+    // The gate is explicit opt-in, so its snapshot is `required`: it never carries the implicit
+    // `auto`/`disabled` precedence the publication profile inherits from legacy configuration.
+    Some(fingerprinted_profile("required", source.into(), commands))
+}
+
+/// Bind one mode/source/command vector into the legacy-compatible hashed snapshot. Both the
+/// publication profile and the review/fix-cycle profile derive their identity here so a command
+/// list can never be presented under two different fingerprints.
+fn fingerprinted_profile(mode: &str, source: String, commands: Vec<String>) -> VerificationProfile {
     let state = if mode == "disabled" {
         "disabled"
     } else if commands.is_empty() {
@@ -655,27 +769,33 @@ mod tests {
         let mut smoke = None;
         let mut configured = Vec::new();
         assert!(matches!(
-            commands(&profile(mode, &configured, smoke)),
-            VerificationCommands::Exempt { .. }
+            disposition(&profile(mode, &configured, smoke)),
+            ProfileDisposition::Exempt { .. }
         ));
 
         mode = VerificationMode::Required;
         assert!(matches!(
-            commands(&profile(mode, &configured, smoke)),
-            VerificationCommands::Blocked { .. }
+            disposition(&profile(mode, &configured, smoke)),
+            ProfileDisposition::Blocked { .. }
         ));
 
+        // The executable command list is the profile's own hashed vector, so the disposition and
+        // the commands are asserted against that single source of truth.
         smoke = Some("cargo test");
+        let smoke_profile = profile(mode, &configured, smoke);
         assert!(matches!(
-            commands(&profile(mode, &configured, smoke)),
-            VerificationCommands::Commands(commands) if commands == vec!["cargo test"]
+            disposition(&smoke_profile),
+            ProfileDisposition::Configured
         ));
+        assert_eq!(smoke_profile.commands, vec!["cargo test"]);
 
         configured = vec!["cargo fmt --check".into()];
+        let configured_profile = profile(mode, &configured, smoke);
         assert!(matches!(
-            commands(&profile(mode, &configured, smoke)),
-            VerificationCommands::Commands(commands) if commands == vec!["cargo fmt --check"]
+            disposition(&configured_profile),
+            ProfileDisposition::Configured
         ));
+        assert_eq!(configured_profile.commands, vec!["cargo fmt --check"]);
     }
 
     #[test]
@@ -810,6 +930,115 @@ mod tests {
         let _ = fs::remove_dir_all(&workspace);
         assert_eq!(result.outcome, VerificationOutcome::Passed);
         assert!(result.transcript.contains("verdict=ok"));
+    }
+
+    #[test]
+    fn review_cycle_profile_prefers_the_subset_and_stays_absent_without_a_profile() {
+        assert_eq!(review_cycle_profile(&[], &[], None), None);
+
+        let smoke = review_cycle_profile(&[], &[], Some("cargo test")).unwrap();
+        assert_eq!(smoke.source, "SMOKE_CMD");
+        assert_eq!(smoke.commands, vec!["cargo test"]);
+
+        let full = review_cycle_profile(&[], &["cargo test".into()], Some("ignored")).unwrap();
+        assert_eq!(full.source, "VERIFICATION_COMMANDS");
+        assert_eq!(full.commands, vec!["cargo test"]);
+
+        let subset = review_cycle_profile(
+            &["cargo clippy".into()],
+            &["cargo test".into()],
+            Some("ignored"),
+        )
+        .unwrap();
+        assert_eq!(subset.source, "REVIEW_CYCLE_VERIFICATION_COMMANDS");
+        assert_eq!(subset.commands, vec!["cargo clippy"]);
+        assert_eq!(subset.state, "configured");
+        assert_eq!(subset.mode, "required");
+
+        // The same command list under a different operator key is a different profile identity,
+        // so a cycle finding can never be re-read as publication proof.
+        assert_ne!(
+            review_cycle_profile(&["cargo test".into()], &[], None)
+                .unwrap()
+                .fingerprint,
+            full.fingerprint
+        );
+    }
+
+    #[test]
+    fn review_cycle_run_shares_phase_four_containment_and_refuses_shell_grammar() {
+        let workspace = std::env::temp_dir().join(format!(
+            "orchestrail-review-cycle-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("marker.txt"), "present\n").unwrap();
+        #[cfg(windows)]
+        let (passing, failing) = (
+            "findstr /M present marker.txt",
+            "findstr /M absent marker.txt",
+        );
+        #[cfg(not(windows))]
+        let (passing, failing) = ("test -f marker.txt", "test -f absent.txt");
+
+        let passed = verify_review_cycle(
+            &review_cycle_profile(&[passing.into()], &[], None).unwrap(),
+            &workspace,
+            Duration::from_secs(10),
+            1024 * 1024,
+            None,
+        );
+        assert_eq!(passed.outcome, VerificationOutcome::Passed);
+        assert!(passed.transcript.contains("verdict=ok"));
+        assert_eq!(passed.commands.len(), 1);
+
+        let failed = verify_review_cycle(
+            &review_cycle_profile(&[failing.into()], &[], None).unwrap(),
+            &workspace,
+            Duration::from_secs(10),
+            1024 * 1024,
+            None,
+        );
+        let _ = fs::remove_dir_all(&workspace);
+        let VerificationOutcome::Failed { signature, reason } = &failed.outcome else {
+            panic!("a non-zero cycle command must fail: {:?}", failed.outcome);
+        };
+        assert!(reason.contains("verification command #1"));
+        // A cycle failure and a publication failure of the identical command must not collapse
+        // into the same stagnation fingerprint.
+        let integration = verify_integration(
+            VerificationMode::Required,
+            &[failing.into()],
+            None,
+            Path::new("."),
+            Duration::from_secs(10),
+            1024 * 1024,
+            None,
+        );
+        let VerificationOutcome::Failed {
+            signature: integration_signature,
+            ..
+        } = &integration.outcome
+        else {
+            panic!("fixture command must fail at the publication gate too");
+        };
+        assert_ne!(signature, integration_signature);
+
+        // Configuration validation is not the only defence: a bypassed profile is still refused
+        // before any child exists, exactly as on the publication path.
+        let bypassed = verify_review_cycle(
+            &review_cycle_profile(&["cargo test && cargo fmt".into()], &[], None).unwrap(),
+            Path::new("."),
+            Duration::from_secs(1),
+            1024,
+            None,
+        );
+        assert!(matches!(
+            bypassed.outcome,
+            VerificationOutcome::Blocked { ref reason } if reason.contains("shell operator")
+        ));
+        assert!(bypassed.commands.is_empty());
     }
 
     #[test]

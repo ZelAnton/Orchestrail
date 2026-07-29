@@ -122,7 +122,7 @@ pub struct DecisionInbox {
     /// The pause marker's own content, if any (informational only — see `agents/processor.md`
     /// "Пауза — kill switch `.work/PAUSE`": only the file's *existence* gates the processor).
     pub pause_note: Option<String>,
-    /// Undecided, unexpired one-time human-gate requests, newest deadline first.
+    /// Undecided, unexpired one-time human-gate requests, earliest deadline first.
     pub approvals: Vec<ApprovalCard>,
     /// Undecided requests whose deadline has passed. Visible but never actionable.
     pub expired_approvals: Vec<ApprovalCard>,
@@ -262,11 +262,11 @@ pub fn load_approvals(work_dir: &Path, now_iso8601: &str) -> ApprovalProjection 
     }
 
     projection.pending.sort_by(|a, b| {
-        a.deadline
-            .as_deref()
-            .unwrap_or("")
-            .cmp(b.deadline.as_deref().unwrap_or(""))
-            .then_with(|| a.id.cmp(&b.id))
+        iso_chrono_cmp(
+            a.deadline.as_deref().unwrap_or(""),
+            b.deadline.as_deref().unwrap_or(""),
+        )
+        .then_with(|| a.id.cmp(&b.id))
     });
     projection.expired.sort_by(|a, b| a.id.cmp(&b.id));
     projection
@@ -767,6 +767,48 @@ mod tests {
                 .iter()
                 .chain(loaded.expired.iter())
                 .any(|a| a.id == "apr-consumed")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_loader_sorts_pending_deadlines_chronologically() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestrail-tui-inbox-approval-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let approvals = root.join("approvals");
+        fs::create_dir_all(&approvals).unwrap();
+        let artifact = |id: &str, deadline: &str| {
+            format!(
+                r#"{{"schema":"orchestra/approval@1","id":"{id}","subject":"task:T-250|batch:","task":"T-250","batch":"","reason":"human-review","fingerprint":"aa","policy_hash":"bb","created_at":"2026-07-16T00:00:00Z","deadline":"{deadline}","decision":""}}"#
+            )
+        };
+        fs::write(
+            approvals.join("apr-fractional.json"),
+            artifact("apr-fractional", "2026-07-16T12:00:00.500Z"),
+        )
+        .unwrap();
+        fs::write(
+            approvals.join("apr-whole.json"),
+            artifact("apr-whole", "2026-07-16T12:00:00Z"),
+        )
+        .unwrap();
+
+        let loaded = load_approvals(&root, "2026-07-16T11:59:59Z");
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(
+            loaded
+                .pending
+                .iter()
+                .map(|approval| approval.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apr-whole", "apr-fractional"]
         );
 
         let _ = fs::remove_dir_all(root);

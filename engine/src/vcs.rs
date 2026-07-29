@@ -31,6 +31,7 @@ use crate::recovery::{
     TaskRepositoryObservation,
 };
 use crate::state::Snapshot;
+use crate::task_id::is_task_id;
 use crate::work_fs;
 
 const MAX_IGNORE_BYTES: u64 = 4 * 1024 * 1024;
@@ -3786,10 +3787,7 @@ fn managed_work_root(path: &Path) -> Result<PathBuf> {
 fn validate_task_id(task_id: &str) -> Result<()> {
     reject_flag_like("orchestrail-engine", "task id", task_id)
         .map_err(|error| VcsError::InvalidInput(error.to_string()))?;
-    let valid = task_id.strip_prefix("T-").is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    if valid {
+    if is_task_id(task_id) {
         Ok(())
     } else {
         Err(VcsError::InvalidInput(format!(

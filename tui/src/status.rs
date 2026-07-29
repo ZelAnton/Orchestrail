@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use orchestrail_engine::work_fs;
+use orchestrail_engine::task_id::is_task_id;
 
 const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -100,14 +101,6 @@ fn parse_table_row(line: &str) -> Option<(String, TaskMeta)> {
     ))
 }
 
-/// `^T-\d` — matches the id shape used across the queue/journal.
-fn is_task_id(s: &str) -> bool {
-    match s.strip_prefix("T-") {
-        Some(rest) => rest.chars().next().is_some_and(|c| c.is_ascii_digit()),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +161,12 @@ mod tests {
     fn ignores_non_task_table_rows() {
         let s = parse("| Provider | Model |\n|---|---|\n| codex | fast |\n");
         assert!(s.task_meta.is_empty());
+    }
+
+    #[test]
+    fn rejects_task_ids_with_trailing_non_digits() {
+        let s = parse("| T-1abc | Invalid task |\n| T-0012 | Valid task |\n");
+        assert_eq!(s.task_meta.len(), 1);
+        assert!(s.task_meta.contains_key("T-0012"));
     }
 }

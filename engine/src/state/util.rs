@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::snapshot::Snapshot;
+use crate::task_id::is_task_id;
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
 /// Current wall clock as seconds since the Unix epoch (0 if the clock is before the epoch).
@@ -67,7 +68,7 @@ pub fn archive_header_task_id(line: &str) -> Option<&str> {
         2 | 3 => {
             let inner = rest.trim_start().strip_prefix('[')?;
             let close = inner.find(']')?;
-            valid_task_id(inner[..close].trim())
+            is_task_id(inner[..close].trim()).then_some(inner[..close].trim())
         }
         // Legacy non-bracketed H1: `#` then whitespace, the keyword, then the id token.
         1 => {
@@ -87,15 +88,6 @@ pub fn archive_header_task_id(line: &str) -> Option<&str> {
     }
 }
 
-/// A bracketed `[T-NNN]` id (its content already trimmed) is valid iff it is `T-` followed by at
-/// least one digit and NOTHING else — the strict, whole-token check mirroring queue-tx's
-/// `\[\s*T-0*(\d+)\s*\]` (which allows only whitespace, never trailing text, before `]`). Rejects
-/// a bare `T-` or a non-numeric `T-abc`.
-fn valid_task_id(id: &str) -> Option<&str> {
-    let digits = id.strip_prefix("T-")?;
-    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then_some(id)
-}
-
 /// The id inside a legacy H1 token, mirroring queue-tx's `T-0*(\d+)\b`: `T-` then at least one
 /// digit, ending at a word boundary — end of token, or a trailing non-alphanumeric char (`.`/`,`)
 /// tolerated as queue-tx's `\b` does. `T-1abc` / `T-1_` (a word char right after the digits) is
@@ -109,7 +101,10 @@ fn legacy_id_token(token: &str) -> Option<&str> {
     match digits[n..].chars().next() {
         Some(c) if c.is_alphanumeric() || c == '_' => None,
         // "T-" is 2 ASCII bytes and the digit run is `n` ASCII bytes, so `2 + n` is a valid slice.
-        _ => Some(&token[..2 + n]),
+        _ => {
+            let id = &token[..2 + n];
+            is_task_id(id).then_some(id)
+        }
     }
 }
 
@@ -139,13 +134,6 @@ pub(crate) fn parse_task_id_list(value: &str) -> Vec<String> {
         .filter(|t| is_task_id(t))
         .map(String::from)
         .collect()
-}
-
-/// `^T-\d` — a T-id is `T-` followed by at least one digit (mirrors `events::parse`).
-pub(crate) fn is_task_id(s: &str) -> bool {
-    s.strip_prefix("T-")
-        .and_then(|r| r.chars().next())
-        .is_some_and(|c| c.is_ascii_digit())
 }
 
 /// `^B-\d` — a batch id is `B-` followed by at least one digit (a `B-<UTC-stamp>`).
@@ -357,6 +345,7 @@ mod tests {
         assert_eq!(parse_task_id_list("T-102, T-103"), vec!["T-102", "T-103"]);
         assert!(parse_task_id_list("нет").is_empty());
         assert_eq!(parse_task_id_list("T-1, —, foo"), vec!["T-1"]);
+        assert!(parse_task_id_list("T-1abc").is_empty());
     }
 
     #[test]

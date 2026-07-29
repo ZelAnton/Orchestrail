@@ -104,7 +104,7 @@ use orchestrail_engine::native::{NativeExecutor, ProcessorPort};
 use orchestrail_engine::native_loop::{
     NativeLoopConfig, NativeLoopOutcome, run_until_queue_exhausted,
 };
-use orchestrail_engine::native_port::{FileVcsPort, ReleaseNotesRequest};
+use orchestrail_engine::native_port::{FileVcsPort, ReleaseNotesRequest, ReviewCycleVerification};
 use orchestrail_engine::ownership::{
     ENGINE_ROLE, LeaseError, LeaseHeartbeat, LeaseRecord, LeaseStatus, LeaseStore, roots_equivalent,
 };
@@ -1751,6 +1751,29 @@ fn cmd_processor(args: &[String]) {
                 config.smoke_cmd.as_deref(),
                 &verification_policy.required_verification_commands,
             ))
+            // Off unless the operator opted in, and then bound to the very same call budget the
+            // Phase-4 gate uses. Configuration already proved the profile exists and is typed, so
+            // an enabled gate here can never resolve to "nothing to run".
+            .with_review_cycle_verification(
+                config
+                    .review_cycle_verification
+                    .then(|| {
+                        verification::review_cycle_profile(
+                            &config.review_cycle_verification_commands,
+                            &config.verification_commands,
+                            config.smoke_cmd.as_deref(),
+                        )
+                        .map(|profile| {
+                            ReviewCycleVerification::new(
+                                profile,
+                                Duration::from_secs(config.call_deadline_secs),
+                                config.call_output_max_bytes,
+                            )
+                            .with_cancellation_probe(Some(lease_cancellation.clone()))
+                        })
+                    })
+                    .flatten(),
+            )
             .with_docs_only_exemption(
                 verification_policy
                     .required_verification_commands
