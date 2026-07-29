@@ -509,9 +509,7 @@ mod tests {
             !Domain::parse("engine/src/state/**").intersects(&Domain::parse("engine/src/lib.rs"))
         );
         // A bare path may name a directory, so it overlaps files and globs inside that subtree.
-        assert!(
-            Domain::parse("engine/src").intersects(&Domain::parse("engine/src/lib.rs"))
-        );
+        assert!(Domain::parse("engine/src").intersects(&Domain::parse("engine/src/lib.rs")));
         assert!(Domain::parse("engine/src").intersects(&Domain::parse("engine/src/**")));
         // A superset subtree overlaps its subset subtree.
         assert!(Domain::parse("engine/**").intersects(&Domain::parse("engine/src/state/**")));
