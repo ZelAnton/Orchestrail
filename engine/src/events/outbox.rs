@@ -119,6 +119,12 @@ impl Outbox {
     /// replay path.
     pub fn append_idempotent(&self, event: &Event) -> Result<AppendOutcome> {
         let _guard = lock_outbox()?;
+        self.append_idempotent_locked(event)
+    }
+
+    /// Append while the caller holds [`lock_outbox`]. Keeping the lock boundary separate lets
+    /// tests prove cache reuse without unrelated parallel outboxes evicting the bounded index.
+    fn append_idempotent_locked(&self, event: &Event) -> Result<AppendOutcome> {
         let path = self.path();
         let desired = event.to_json_line();
         let mut file = open_plain_outbox(&path)?;
@@ -488,33 +494,34 @@ mod tests {
         }
         fs::write(work.join(OUTBOX_FILE), &journal).unwrap();
         let outbox = Outbox::new(&work);
+        let observations = (|| -> Result<_> {
+            let _outbox_guard = lock_outbox()?;
+            let first_outcome = outbox.append_idempotent_locked(&event("new-after-index"))?;
+            let key = fs::canonicalize(outbox.path())?;
+            let scanned_bytes = || -> io::Result<u64> {
+                OUTBOX_INDEXES
+                    .lock()
+                    .map_err(|_| io::Error::other("native outbox index cache is poisoned"))?
+                    .get(&key)
+                    .map(|index| index.scanned_bytes)
+                    .ok_or_else(|| io::Error::other("native outbox index cache entry is missing"))
+            };
+            let scanned_after_index = scanned_bytes()?;
+            let second_outcome =
+                Outbox::new(&work).append_idempotent_locked(&event("second-after-index"))?;
+            Ok((
+                first_outcome,
+                scanned_after_index,
+                second_outcome,
+                scanned_bytes()?,
+            ))
+        })()
+        .unwrap();
+        assert_eq!(observations.0, AppendOutcome::Appended);
+        assert_eq!(observations.1, journal.len() as u64);
+        assert_eq!(observations.2, AppendOutcome::Appended);
         assert_eq!(
-            outbox.append_idempotent(&event("new-after-index")).unwrap(),
-            AppendOutcome::Appended
-        );
-        let key = fs::canonicalize(outbox.path()).unwrap();
-        let scanned_after_index = OUTBOX_INDEXES
-            .lock()
-            .unwrap()
-            .get(&key)
-            .unwrap()
-            .scanned_bytes;
-        assert_eq!(scanned_after_index, journal.len() as u64);
-
-        assert_eq!(
-            Outbox::new(&work)
-                .append_idempotent(&event("second-after-index"))
-                .unwrap(),
-            AppendOutcome::Appended
-        );
-        assert_eq!(
-            OUTBOX_INDEXES
-                .lock()
-                .unwrap()
-                .get(&key)
-                .unwrap()
-                .scanned_bytes,
-            scanned_after_index,
+            observations.3, observations.1,
             "a fresh Outbox handle must reuse the committed index instead of rescanning history"
         );
         let _ = fs::remove_dir_all(work);
