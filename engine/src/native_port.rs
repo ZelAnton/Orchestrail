@@ -113,9 +113,40 @@ impl ReviewCycleVerification {
     }
 }
 
+/// What the cycle gate proved about one committed tip.
+///
+/// The gate runs before the reviewer of the round and its verdict outlives that call: a reviewer is
+/// an untrusted leaf that may rewrite `review.md` wholesale, so the engine keeps its own proof and
+/// re-imposes it on the outcome instead of trusting the artifact to still contain it.
+#[derive(Debug, Clone)]
+struct ReviewCycleGateRecord {
+    /// The committed tip the gate ran against. One commit is one tree, so a later round at the same
+    /// tip reuses this record and a new commit invalidates it.
+    head: String,
+    /// `None` once the profile passed on this tip; a failure keeps the evidence needed to hold the
+    /// round to it.
+    failure: Option<ReviewCycleGateFailure>,
+}
+
+/// A proven review-cycle failure, retained for as long as its tip is under review.
+#[derive(Debug, Clone)]
+struct ReviewCycleGateFailure {
+    /// Deterministic fingerprint of the failing command from [`verification::verify_review_cycle`].
+    /// It depends only on the command sequence position, the command, and the supervisor reason —
+    /// never on which `R-` id the finding happened to receive — so an unchanged breakage signs the
+    /// round identically across rounds and the stagnation detector can still see a stalled loop.
+    signature: String,
+    /// The finding body below its heading, so the finding can be restored under a free id.
+    body: String,
+}
+
 /// Stable heading of the single engine-authored review-cycle finding. It never varies with the
 /// failing command, so a reviewer or fixer can recognise the engine's own finding across rounds.
 const REVIEW_CYCLE_FINDING_TITLE: &str = "Проверка сборки/линта на цикле ревью не прошла";
+/// Subject half of the round signature the engine imposes when its gate failed. It is distinct from
+/// the per-command verification subjects so a round fingerprint and a bare command fingerprint can
+/// never collide.
+const REVIEW_CYCLE_ROUND_SUBJECT: &str = "review round with a failed review-cycle gate";
 /// Task-local artifact holding the full contained transcript of one cycle gate run.
 const REVIEW_CYCLE_TRANSCRIPT_FILE: &str = "review-cycle-verification.md";
 /// Bytes of contained command output mixed into `review.md` itself. The failure cause is at the
@@ -594,10 +625,11 @@ pub struct FileVcsPort<E> {
     /// Operator-enabled early build/lint gate for every task review/fix cycle. `None` is the
     /// default and preserves the historical behaviour of verifying only at Phase 4.
     review_cycle_verification: Option<ReviewCycleVerification>,
-    /// The committed tip whose cycle gate has already run, per task. One commit is one tree, so
-    /// the diversity pass and the authoritative reviewer of the same round share one result
-    /// instead of paying for (and reporting) the same build twice.
-    review_cycle_verified: BTreeMap<String, String>,
+    /// The committed tip whose cycle gate has already run, per task, together with what it proved.
+    /// One commit is one tree, so the diversity pass and the authoritative reviewer of the same
+    /// round share one result instead of paying for (and reporting) the same build twice — and a
+    /// recorded failure keeps binding the round after the reviewer returns.
+    review_cycle_gate: BTreeMap<String, ReviewCycleGateRecord>,
     /// Legacy-compatible exemption for a mechanically proved documentation-only integration
     /// range. It is disabled for generic test adapters and enabled only by the production CLI
     /// when the operator did not explicitly select `VERIFICATION_MODE: disabled`.
@@ -693,7 +725,7 @@ impl<E> FileVcsPort<E> {
             notifier,
             verification_profile: None,
             review_cycle_verification: None,
-            review_cycle_verified: BTreeMap::new(),
+            review_cycle_gate: BTreeMap::new(),
             docs_only_exemption_enabled: false,
             #[cfg(test)]
             auto_approve_for_test: None,
@@ -1382,16 +1414,26 @@ fn next_review_finding_id(parsed: &crate::contract::ReviewParse) -> String {
     format!("R-{:02}", highest.saturating_add(1))
 }
 
-/// Render the review-cycle failure as one ordinary open `R-` finding, so the reviewer and the
+/// Compose the review-cycle failure as one ordinary open `R-` finding, so the reviewer and the
 /// fixer of this same round read it through the contract they already speak.
-fn render_review_cycle_finding(
-    id: &str,
+///
+/// The finding is deliberately assembled from a currently free marker id and a separately rendered
+/// body, because the id is the only part that depends on what else the artifact already contains.
+/// The same proven failure may have to be re-emitted under a different free id after a reviewer
+/// rewrote the file, and re-running the build to obtain the body again would be both expensive and
+/// unsound: the tree is unchanged, so the old evidence is still the true evidence.
+fn review_cycle_finding_document(id: &str, body: &str) -> String {
+    format!("### [{id}] {REVIEW_CYCLE_FINDING_TITLE} — статус: новая\n{body}")
+}
+
+/// Render everything below the finding's heading: the round-independent evidence of one failure.
+fn render_review_cycle_finding_body(
     task_id: &str,
     profile: &verification::VerificationProfile,
     run: &verification::VerificationRun,
     reason: &str,
 ) -> String {
-    let mut finding = format!("### [{id}] {REVIEW_CYCLE_FINDING_TITLE} — статус: новая\n");
+    let mut finding = String::new();
     finding.push_str(&format!(
         "- Обнаружено движком в worktree задачи до вызова ревьюера этого цикла: профиль {} (отпечаток {}), команд {}.\n",
         one_line_finding_field(&profile.source),
@@ -1905,9 +1947,9 @@ impl<E: ExternalPort> FileVcsPort<E> {
             return Ok(());
         };
         if self
-            .review_cycle_verified
+            .review_cycle_gate
             .get(task_id)
-            .is_some_and(|verified| verified == head)
+            .is_some_and(|record| record.head == head)
         {
             return Ok(());
         }
@@ -1938,44 +1980,200 @@ impl<E: ExternalPort> FileVcsPort<E> {
         )
         .map_err(ControlError::Io)
         .map_err(NativePortError::Control)?;
-        match &run.outcome {
-            VerificationOutcome::Passed => {}
-            VerificationOutcome::Failed { reason, .. } => {
-                self.mix_review_cycle_finding(task_id, &gate.profile, &run, reason)?;
+        let failure = match &run.outcome {
+            VerificationOutcome::Passed => None,
+            VerificationOutcome::Failed { signature, reason } => {
+                let body =
+                    render_review_cycle_finding_body(task_id, &gate.profile, &run, reason.as_str());
+                self.mix_review_cycle_finding(task_id, &body)?;
+                Some(ReviewCycleGateFailure {
+                    signature: signature.clone(),
+                    body,
+                })
             }
             VerificationOutcome::Blocked { reason } | VerificationOutcome::Exempt { reason } => {
                 return Err(NativePortError::MissingState(format!(
                     "task {task_id} review-cycle verification did not execute: {reason}"
                 )));
             }
-        }
-        self.review_cycle_verified
-            .insert(task_id.to_string(), head.to_string());
+        };
+        self.review_cycle_gate.insert(
+            task_id.to_string(),
+            ReviewCycleGateRecord {
+                head: head.to_string(),
+                failure,
+            },
+        );
         Ok(())
     }
 
-    /// Append the cycle failure to `review.md` as one open `R-` finding.
+    /// Hold the round to the gate's own proof after the reviewer of that round returned.
     ///
-    /// An engine finding that is still open needs no duplicate: the fixer of the previous round
-    /// already had it in front of them. A *closed* one does get a fresh never-reused id, because a
-    /// failure observed after a claimed fix is a new occurrence, not the old finding reopened.
-    fn mix_review_cycle_finding(
+    /// A reviewer is an untrusted leaf that owns `review.md` and may legitimately rewrite the whole
+    /// file; a natural clean report simply overwrites the engine's finding. Nothing else in the
+    /// engine treats leaf text as authority over native evidence (review ranges, workspace tips and
+    /// merge reports are all re-proved), and a mechanically proved broken build must not be the one
+    /// exception. So the failure is re-imposed here rather than hoped for:
+    ///
+    /// * the round can no longer be `Clean` — a proved failure owes a fix cycle;
+    /// * `restore_finding` puts the finding back if the reviewer dropped it, so the fixer of this
+    ///   round still reads the breakage. It is off only where amending the artifact would break a
+    ///   durable binding on its exact bytes (see
+    ///   [`Self::enforce_review_cycle_gate_on_preparation`]), and
+    ///   [`Self::restore_review_cycle_finding_before_fix`] covers that case at fixer dispatch;
+    /// * the round signature is re-derived from the *stable* gate signature plus the reviewer's own
+    ///   findings, excluding the engine's finding. Its `R-` id necessarily changes whenever a fixer
+    ///   claims the previous one fixed, and signing that id would make every repetition of one
+    ///   unfixed breakage look like progress to the stagnation detector.
+    ///
+    /// `Escalated` and `Incomplete` are left alone: the first is already terminal, and the second
+    /// repeats the same round (where the gate result still applies) rather than concluding it.
+    fn enforce_review_cycle_gate(
+        &mut self,
+        task_id: &str,
+        head: &str,
+        outcome: ReviewOutcome,
+        restore_finding: bool,
+    ) -> Result<ReviewOutcome, NativePortError<E::Error>> {
+        let Some(failure) = self
+            .review_cycle_gate
+            .get(task_id)
+            .filter(|record| record.head == head)
+            .and_then(|record| record.failure.clone())
+        else {
+            return Ok(outcome);
+        };
+        let risk = match &outcome {
+            ReviewOutcome::Clean { .. } | ReviewOutcome::Findings { .. } => None,
+            ReviewOutcome::CleanRiskElevated { risk, .. }
+            | ReviewOutcome::FindingsRiskElevated { risk, .. } => Some(*risk),
+            ReviewOutcome::Escalated { .. } | ReviewOutcome::Incomplete => return Ok(outcome),
+        };
+        if restore_finding {
+            self.mix_review_cycle_finding(task_id, &failure.body)?;
+        }
+        // Computed from the artifact minus the engine's own finding, so it does not depend on
+        // whether this path restored it.
+        let signature = self.review_cycle_round_signature(task_id, &failure.signature)?;
+        Ok(match risk {
+            Some(risk) => ReviewOutcome::FindingsRiskElevated { signature, risk },
+            None => ReviewOutcome::Findings { signature },
+        })
+    }
+
+    /// Apply [`Self::enforce_review_cycle_gate`] to a Codex preparation that concluded the round
+    /// itself. A preparation that only routes (fallback, sandbox downgrade) decides nothing and is
+    /// passed through untouched.
+    ///
+    /// This path deliberately does **not** restore the finding into `review.md`: a finalized Codex
+    /// review binds the exact artifact bytes into its durable replay receipt, and amending them here
+    /// would turn a crash-replay of that same attempt into a "review artifact changed after
+    /// completion" protocol error. The outcome is still held open, and
+    /// [`Self::restore_review_cycle_finding_before_fix`] puts the evidence back in front of the
+    /// fixer, which binds no artifact.
+    fn enforce_review_cycle_gate_on_preparation(
+        &mut self,
+        task_id: &str,
+        head: &str,
+        outcome: TaskReviewPreparationOutcome,
+    ) -> Result<TaskReviewPreparationOutcome, NativePortError<E::Error>> {
+        match outcome {
+            TaskReviewPreparationOutcome::Completed(outcome) => self
+                .enforce_review_cycle_gate(task_id, head, outcome, false)
+                .map(TaskReviewPreparationOutcome::Completed),
+            other => Ok(other),
+        }
+    }
+
+    /// Re-impose a still-unfixed cycle finding on `review.md` before this round's fixer starts.
+    ///
+    /// The reviewer of the round owns that file and may have replaced it; the fixer is nevertheless
+    /// the agent that has to repair the breakage, so it must read the proof rather than a round of
+    /// findings that no longer mentions why it was called. Fixer dispatch binds no artifact bytes,
+    /// which makes it the safe place to amend for every reviewer route.
+    fn restore_review_cycle_finding_before_fix(
+        &mut self,
+        task_id: &str,
+        kind: LeafKind,
+        state: &ProcessorState,
+    ) -> Result<(), NativePortError<E::Error>> {
+        if kind != LeafKind::Fix {
+            return Ok(());
+        }
+        let Some(head) = self.task(state, task_id)?.review_sha.clone() else {
+            return Ok(());
+        };
+        let Some(failure) = self
+            .review_cycle_gate
+            .get(task_id)
+            .filter(|record| record.head == head)
+            .and_then(|record| record.failure.clone())
+        else {
+            return Ok(());
+        };
+        self.mix_review_cycle_finding(task_id, &failure.body)
+    }
+
+    /// Sign a round whose gate failed: the stable failure fingerprint folded with the reviewer's own
+    /// open findings. Identical breakage plus identical reviewer findings therefore yield an
+    /// identical signature round after round, which is precisely what the stagnation detector needs
+    /// to escalate a loop that is not converging.
+    fn review_cycle_round_signature(
         &self,
         task_id: &str,
-        profile: &verification::VerificationProfile,
-        run: &verification::VerificationRun,
-        reason: &str,
-    ) -> Result<(), NativePortError<E::Error>> {
-        let path = self
-            .control
+        gate_signature: &str,
+    ) -> Result<String, NativePortError<E::Error>> {
+        let artifact = self.read_review_artifact(task_id)?;
+        let parsed = crate::contract::parse_review(artifact.as_deref().unwrap_or_default());
+        let reviewer_signature = crate::outcome_adapter::finding_signature(
+            parsed
+                .open_review_findings()
+                .into_iter()
+                .filter(|finding| finding.title != REVIEW_CYCLE_FINDING_TITLE),
+        );
+        Ok(crate::resolvers::AttemptSignature::of_finding(
+            REVIEW_CYCLE_ROUND_SUBJECT,
+            &format!("{gate_signature}\n{reviewer_signature}"),
+        )
+        .as_str()
+        .to_string())
+    }
+
+    fn review_artifact_path(&self, task_id: &str) -> PathBuf {
+        self.control
             .work()
             .join("tasks")
             .join(task_id)
-            .join("review.md");
-        let existing =
-            work_fs::read_optional_text(self.control.work(), &path, MAX_REVIEW_ARTIFACT_BYTES)
-                .map_err(ControlError::Io)
-                .map_err(NativePortError::Control)?;
+            .join("review.md")
+    }
+
+    fn read_review_artifact(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, NativePortError<E::Error>> {
+        work_fs::read_optional_text(
+            self.control.work(),
+            &self.review_artifact_path(task_id),
+            MAX_REVIEW_ARTIFACT_BYTES,
+        )
+        .map_err(ControlError::Io)
+        .map_err(NativePortError::Control)
+    }
+
+    /// Put the cycle failure into `review.md` as one open `R-` finding, under the next free id.
+    ///
+    /// An engine finding that is still open needs no duplicate: the fixer of the previous round
+    /// already had it in front of them. A *closed* or removed one does get a fresh never-reused id,
+    /// because a failure observed after a claimed fix is a new occurrence, not the old finding
+    /// reopened — and because reusing an id a reviewer may meanwhile have taken would collide. The
+    /// id is deliberately not part of how the round is signed (see
+    /// [`Self::review_cycle_round_signature`]).
+    fn mix_review_cycle_finding(
+        &self,
+        task_id: &str,
+        body: &str,
+    ) -> Result<(), NativePortError<E::Error>> {
+        let existing = self.read_review_artifact(task_id)?;
         let parsed = crate::contract::parse_review(existing.as_deref().unwrap_or_default());
         if parsed
             .open_review_findings()
@@ -1984,17 +2182,11 @@ impl<E: ExternalPort> FileVcsPort<E> {
         {
             return Ok(());
         }
-        let finding = render_review_cycle_finding(
-            &next_review_finding_id(&parsed),
-            task_id,
-            profile,
-            run,
-            reason,
-        );
+        let finding = review_cycle_finding_document(&next_review_finding_id(&parsed), body);
         let document = merge_review_cycle_finding(existing.as_deref(), &finding);
         work_fs::replace_file(
             self.control.work(),
-            &path,
+            &self.review_artifact_path(task_id),
             document.as_bytes(),
             MAX_REVIEW_ARTIFACT_BYTES,
         )
@@ -2752,6 +2944,7 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
         state: &ProcessorState,
     ) -> Result<LeafOutcome, Self::Error> {
         let workspace = self.task_workspace(state, task_id)?;
+        self.restore_review_cycle_finding_before_fix(task_id, kind, state)?;
         let outcome = self
             .external
             .task_leaf(task_id, kind, &workspace.path, state)
@@ -2766,6 +2959,7 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
         state: &ProcessorState,
     ) -> Result<TaskLeafPreparationOutcome, Self::Error> {
         let workspace = self.task_workspace(state, task_id)?;
+        self.restore_review_cycle_finding_before_fix(task_id, kind, state)?;
         self.external
             .prepare_task_leaf(task_id, kind, &workspace.path, state)
             .map_err(NativePortError::External)
@@ -2802,6 +2996,7 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
             .external
             .prepare_task_review(task_id, &workspace.path, state)
             .map_err(NativePortError::External)?;
+        let outcome = self.enforce_review_cycle_gate_on_preparation(task_id, expected, outcome)?;
         let after = self
             .vcs
             .task_workspace_tip(&workspace)
@@ -2846,6 +3041,7 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
             .external
             .task_review(task_id, &workspace.path, state)
             .map_err(NativePortError::External)?;
+        let outcome = self.enforce_review_cycle_gate(task_id, expected, outcome, true)?;
         let reported_risk = match &outcome {
             ReviewOutcome::CleanRiskElevated { risk, .. }
             | ReviewOutcome::FindingsRiskElevated { risk, .. } => Some(*risk),
@@ -2947,7 +3143,13 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
                         self.persist_task_review_range_evidence(task_id, &workspace, state)?;
                     Some((workspace.clone(), expected, attempt, evidence))
                 }
-                TaskEffect::PrepareLeaf { .. } | TaskEffect::DispatchLeaf { .. } => None,
+                TaskEffect::PrepareLeaf { kind, .. } | TaskEffect::DispatchLeaf { kind, .. } => {
+                    // Same pre-dispatch window for the fixer half of the cycle: a fixer must read
+                    // the proved breakage even when the reviewer of the previous round replaced the
+                    // artifact that carried it.
+                    self.restore_review_cycle_finding_before_fix(task_id, *kind, state)?;
+                    None
+                }
             };
             requests.push(ExternalTaskEffect {
                 effect: effect.clone(),
@@ -2956,7 +3158,7 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
             immutable_review_tips.push(expected_tip);
         }
 
-        let results = self
+        let mut results = self
             .external
             .execute_task_batch(&requests, state)
             .map_err(NativePortError::External)?;
@@ -2968,8 +3170,8 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
             )));
         }
 
-        for ((request, expected_tip), result) in
-            requests.iter().zip(immutable_review_tips).zip(&results)
+        for (index, (request, expected_tip)) in
+            requests.iter().zip(immutable_review_tips).enumerate()
         {
             let Some((workspace, expected, attempt, evidence)) = expected_tip else {
                 continue;
@@ -2992,15 +3194,23 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
                 )));
             }
             self.verify_task_review_range_evidence(task_id, &workspace, attempt, &evidence)?;
-            let is_review_result = matches!(
-                result,
-                TaskEffectResult::ReviewPrepared { .. } | TaskEffectResult::Review { .. }
-            );
-            if !is_review_result {
-                return Err(NativePortError::MissingState(format!(
-                    "task {task_id} review batch returned a non-review result"
-                )));
-            }
+            // The concurrent path reaches the same reducer transitions as the single-effect one, so
+            // the cycle gate must bind the fanned-out results too; otherwise enabling the gate would
+            // be silently weaker whenever the driver batches reviews.
+            results[index] = match results[index].clone() {
+                TaskEffectResult::Review { outcome } => TaskEffectResult::Review {
+                    outcome: self.enforce_review_cycle_gate(task_id, &expected, outcome, true)?,
+                },
+                TaskEffectResult::ReviewPrepared { outcome } => TaskEffectResult::ReviewPrepared {
+                    outcome: self
+                        .enforce_review_cycle_gate_on_preparation(task_id, &expected, outcome)?,
+                },
+                TaskEffectResult::Leaf { .. } | TaskEffectResult::LeafPrepared { .. } => {
+                    return Err(NativePortError::MissingState(format!(
+                        "task {task_id} review batch returned a non-review result"
+                    )));
+                }
+            };
         }
         Ok(results)
     }
@@ -4143,6 +4353,11 @@ mod tests {
         static REVIEW_ARTIFACT_TO_OBSERVE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         static REVIEW_ARTIFACT_SEEN_BY_REVIEWER: RefCell<Option<Option<String>>> =
             const { RefCell::new(None) };
+        // A reviewer owns `review.md` and its prompt tells it to write that file. This hook models
+        // the resulting worst case for the engine's cycle gate: the reviewer replaces the whole
+        // artifact, including findings it did not author.
+        static REVIEW_ARTIFACT_TO_WRITE: RefCell<Option<(PathBuf, String)>> =
+            const { RefCell::new(None) };
     }
 
     #[test]
@@ -4901,6 +5116,11 @@ mod tests {
                     let seen = fs::read_to_string(path).ok();
                     REVIEW_ARTIFACT_SEEN_BY_REVIEWER
                         .with(|observed| *observed.borrow_mut() = Some(seen));
+                }
+            });
+            REVIEW_ARTIFACT_TO_WRITE.with(|slot| {
+                if let Some((path, text)) = slot.borrow_mut().take() {
+                    fs::write(path, text).expect("test reviewer rewrites its review artifact");
                 }
             });
             Ok(ReviewOutcome::Clean {
@@ -6146,6 +6366,13 @@ mod tests {
             )
             .unwrap();
         fs::create_dir_all(work.join("tasks/T-1")).unwrap();
+        // The single-effect review path patches the durable descriptor, so the fixture carries the
+        // minimal one the control plane requires to record (or refuse) that transition.
+        fs::write(
+            work.join("tasks/T-1/task.md"),
+            "# Активная задача T-1\n\nСтатус: на ревью\nЦиклов-ревью: 1\n",
+        )
+        .unwrap();
         let state = ProcessorState {
             phase: Phase::Rolling,
             batch: Some(CohortRuntime {
@@ -6347,6 +6574,239 @@ mod tests {
         assert!(transcript.contains("verdict=ok"), "{transcript}");
     }
 
+    /// Dispatch one review round and return the outcome the reducer would see. `reviewer_artifact`
+    /// is what the untrusted stub reviewer writes over `review.md` from inside its own call.
+    fn dispatch_review_returning_outcome(
+        port: &mut FileVcsPort<StubExternal>,
+        work: &Path,
+        state: &ProcessorState,
+        reviewer_artifact: Option<&str>,
+    ) -> ReviewOutcome {
+        REVIEW_ARTIFACT_TO_WRITE.with(|slot| {
+            *slot.borrow_mut() =
+                reviewer_artifact.map(|text| (work.join("tasks/T-1/review.md"), text.to_string()));
+        });
+        let results = port
+            .execute_task_batch(
+                &[TaskEffect::DispatchReview {
+                    task_id: "T-1".into(),
+                }],
+                state,
+            )
+            .expect("the fixture review dispatch succeeds");
+        match results.as_slice() {
+            [TaskEffectResult::Review { outcome }] => outcome.clone(),
+            other => panic!("one review dispatch returns exactly one review result: {other:?}"),
+        }
+    }
+
+    /// The clean report a reviewer whose own passes found nothing naturally writes: its prompt asks
+    /// it to write `review.md`, and the straightforward reading of that instruction replaces the
+    /// file, taking the engine's finding with it.
+    const REVIEWER_CLEAN_REPORT: &str = "# Ревью задачи T-1\n\n### [SUMMARY-R-2099-01-01T00:00:00Z] Итог ревью задачи — статус: готово к слиянию\n\nИТОГ: готово к слиянию · открытых=0\n";
+
+    #[test]
+    fn a_reviewer_cannot_turn_a_proved_cycle_failure_into_a_clean_round() {
+        let fixture = review_cycle_fixture();
+        let mut port = FileVcsPort::discover(
+            &fixture.work,
+            &fixture.root,
+            StubExternal { planned: false },
+        )
+        .unwrap()
+        .with_review_cycle_verification(Some(review_cycle_gate(&marker_command(false))));
+
+        let outcome = dispatch_review_returning_outcome(
+            &mut port,
+            &fixture.work,
+            &fixture.state,
+            Some(REVIEWER_CLEAN_REPORT),
+        );
+
+        // The engine proved this tip does not build. A reviewer report — however clean, and whether
+        // or not it kept the engine's finding — cannot be the authority that closes the round.
+        let ReviewOutcome::Findings { signature } = outcome else {
+            panic!("a proved cycle failure must hold the round open: {outcome:?}");
+        };
+        assert_eq!(
+            signature.len(),
+            16,
+            "the reducer validates a 16-hex signature"
+        );
+        assert!(signature.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        // The finding is restored, so the fixer of this very round still reads the breakage.
+        let artifact = fs::read_to_string(fixture.work.join("tasks/T-1/review.md")).unwrap();
+        let parsed = crate::contract::parse_review(&artifact);
+        let open = parsed.open_review_findings();
+        assert_eq!(open.len(), 1, "the engine finding is back: {artifact}");
+        assert_eq!(open[0].title, REVIEW_CYCLE_FINDING_TITLE);
+        assert!(
+            artifact.contains(REVIEW_CYCLE_TRANSCRIPT_FILE),
+            "the restored finding keeps its evidence: {artifact}"
+        );
+
+        // The same holds on the single-effect path, which additionally owns the durable descriptor:
+        // it must not record `готова к слиянию` for a tip whose build is broken.
+        let outcome = ProcessorPort::task_review(&mut port, "T-1", &fixture.state).unwrap();
+        assert!(
+            matches!(outcome, ReviewOutcome::Findings { .. }),
+            "the single-effect review path applies the same gate: {outcome:?}"
+        );
+        let descriptor = fs::read_to_string(fixture.work.join("tasks/T-1/task.md")).unwrap();
+        assert!(
+            descriptor.contains("Статус: на ревью"),
+            "a broken build must not reach the merge queue: {descriptor}"
+        );
+    }
+
+    #[test]
+    fn the_fixer_of_the_round_is_handed_the_proved_breakage_even_if_the_artifact_lost_it() {
+        let fixture = review_cycle_fixture();
+        let mut port = FileVcsPort::discover(
+            &fixture.work,
+            &fixture.root,
+            StubExternal { planned: false },
+        )
+        .unwrap()
+        .with_review_cycle_verification(Some(review_cycle_gate(&marker_command(false))));
+        let artifact_path = fixture.work.join("tasks/T-1/review.md");
+
+        dispatch_review_returning_outcome(&mut port, &fixture.work, &fixture.state, None);
+        // A reviewer route whose result is bound to the exact artifact bytes (a finalized Codex
+        // review) is not amended in place, so the engine's finding can legitimately be missing when
+        // the fixer is dispatched. Model that end state directly.
+        fs::write(&artifact_path, REVIEWER_CLEAN_REPORT).unwrap();
+
+        // A non-fix leaf is not this round's repair and must not rewrite the round's artifact.
+        ProcessorPort::prepare_task_leaf(&mut port, "T-1", LeafKind::Implement, &fixture.state)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&artifact_path).unwrap(),
+            REVIEWER_CLEAN_REPORT
+        );
+
+        ProcessorPort::prepare_task_leaf(&mut port, "T-1", LeafKind::Fix, &fixture.state).unwrap();
+
+        let artifact = fs::read_to_string(&artifact_path).unwrap();
+        let parsed = crate::contract::parse_review(&artifact);
+        let open = parsed.open_review_findings();
+        assert_eq!(open.len(), 1, "the fixer reads the breakage: {artifact}");
+        assert_eq!(open[0].title, REVIEW_CYCLE_FINDING_TITLE);
+        assert!(
+            artifact
+                .trim_end()
+                .ends_with("ИТОГ: готово к слиянию · открытых=0"),
+            "the engine adds evidence without authoring or displacing a leaf verdict: {artifact}"
+        );
+    }
+
+    #[test]
+    fn a_green_gate_leaves_the_reviewer_verdict_alone() {
+        let fixture = review_cycle_fixture();
+        let mut port = FileVcsPort::discover(
+            &fixture.work,
+            &fixture.root,
+            StubExternal { planned: false },
+        )
+        .unwrap()
+        .with_review_cycle_verification(Some(review_cycle_gate(&marker_command(true))));
+
+        let outcome =
+            dispatch_review_returning_outcome(&mut port, &fixture.work, &fixture.state, None);
+
+        assert!(
+            matches!(outcome, ReviewOutcome::Clean { .. }),
+            "the gate can only add work; it never rewrites a clean round: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn one_unfixed_breakage_signs_every_round_identically_and_reaches_stagnation() {
+        let fixture = review_cycle_fixture();
+        let mut port = FileVcsPort::discover(
+            &fixture.work,
+            &fixture.root,
+            StubExternal { planned: false },
+        )
+        .unwrap()
+        .with_review_cycle_verification(Some(review_cycle_gate(&marker_command(false))));
+        let vcs = VcsService::discover(&fixture.root).unwrap();
+        let mut state = fixture.state.clone();
+        let artifact_path = fixture.work.join("tasks/T-1/review.md");
+        // One reviewer finding that nobody fixes either, so the reviewer's own contribution to the
+        // round is genuinely present and genuinely unchanged across the three rounds.
+        fs::write(
+            &artifact_path,
+            "# Ревью задачи T-1\n\n### [R-01] Один и тот же дефект ревьюера — статус: новая\n\nИТОГ: открытые находки · открытых=1\n",
+        )
+        .unwrap();
+
+        // Three rounds of the loop this gate is most likely to enter: the fixer claims the
+        // breakage fixed and commits, and the build still fails on the new tip.
+        let mut signatures = Vec::new();
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            if round > 0 {
+                let workspace = vcs
+                    .ensure_task_workspace(&fixture.work, "T-1", "main")
+                    .unwrap();
+                fs::write(
+                    workspace.path.join("implementation.txt"),
+                    format!("fix attempt {round}\n"),
+                )
+                .unwrap();
+                let head = vcs
+                    .commit_workspace_paths(
+                        &workspace,
+                        &[PathBuf::from("implementation.txt")],
+                        "Fix T-1",
+                    )
+                    .unwrap();
+                state.tasks.get_mut("T-1").unwrap().review_sha = Some(head);
+            }
+            let outcome = dispatch_review_returning_outcome(&mut port, &fixture.work, &state, None);
+            let ReviewOutcome::Findings { signature } = outcome else {
+                panic!("round {round} must stay open: {outcome:?}");
+            };
+            signatures.push(crate::resolvers::AttemptSignature::of(&signature));
+            let artifact = fs::read_to_string(&artifact_path).unwrap();
+            let parsed = crate::contract::parse_review(&artifact);
+            let engine_finding = parsed
+                .open_review_findings()
+                .into_iter()
+                .find(|finding| finding.title == REVIEW_CYCLE_FINDING_TITLE)
+                .unwrap_or_else(|| panic!("round {round} opens the engine finding: {artifact}"))
+                .clone();
+            ids.push(engine_finding.id.clone());
+            // The fixer of this round claims the breakage handled, which is exactly what forces the
+            // next occurrence onto a fresh id.
+            fs::write(
+                &artifact_path,
+                artifact.replace(
+                    &format!("{REVIEW_CYCLE_FINDING_TITLE} — статус: новая"),
+                    &format!("{REVIEW_CYCLE_FINDING_TITLE} — статус: исправлено"),
+                ),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            ids,
+            vec!["R-02".to_string(), "R-03".into(), "R-04".into()],
+            "each round takes a fresh id, because the previous one was marked fixed"
+        );
+        assert_eq!(
+            signatures[0], signatures[1],
+            "the round signature must not follow that id"
+        );
+        assert_eq!(signatures[1], signatures[2]);
+        assert!(
+            crate::resolvers::stagnation_decision(&signatures, 3).is_stagnated(),
+            "an unfixed breakage must still reach the stagnation detector: {signatures:?}"
+        );
+    }
+
     #[test]
     fn quoted_command_output_cannot_forge_review_markers_or_displace_the_verdict() {
         // Build output legitimately echoes source text, so a repository could contain the exact
@@ -6372,12 +6832,14 @@ mod tests {
                 exit_code: Some(1),
             }],
         };
-        let finding = render_review_cycle_finding(
+        let finding = review_cycle_finding_document(
             "R-02",
-            "T-1",
-            &profile,
-            &run,
-            "verification command #1 ended error",
+            &render_review_cycle_finding_body(
+                "T-1",
+                &profile,
+                &run,
+                "verification command #1 ended error",
+            ),
         );
         let existing = "# Ревью задачи T-1\n\n### [R-01] Реальная находка — статус: исправлено\n\nИТОГ: открытые находки · открытых=0\n";
         let document = merge_review_cycle_finding(Some(existing), &finding);
@@ -6436,7 +6898,10 @@ mod tests {
         };
         let document = merge_review_cycle_finding(
             None,
-            &render_review_cycle_finding("R-01", "T-1", &profile, &run, "failed"),
+            &review_cycle_finding_document(
+                "R-01",
+                &render_review_cycle_finding_body("T-1", &profile, &run, "failed"),
+            ),
         );
         assert!(
             !document.contains("ИТОГ:"),

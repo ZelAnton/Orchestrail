@@ -120,6 +120,20 @@ pub fn task_review_outcome(
             reason: required_reason(&outcome)
                 .unwrap_or_else(|| "Codex reviewer escalation without причина field".into()),
         },
+        // A "ready" claim over an artifact that still carries an open `R-` is a disagreement about
+        // findings, not a broken protocol: the reviewer may simply have ignored a finding it did
+        // not author (the engine's own review-cycle gate writes one). The safe reading is the
+        // conservative one — the round has open findings and owes a fix cycle. It can never
+        // authorize a merge, so escalating the whole task here would only convert a recoverable
+        // round into a terminal one. A missing fresh `SUMMARY-R` remains a protocol error below:
+        // there the reviewer claims a clean gate it never proved during this invocation.
+        "готово к слиянию" if !open.is_empty() => {
+            let signature = finding_signature(open.into_iter());
+            match risk {
+                Some(risk) => ReviewOutcome::FindingsRiskElevated { signature, risk },
+                None => ReviewOutcome::Findings { signature },
+            }
+        }
         "готово к слиянию" => review_protocol_error(
             "reviewer declared ready but did not provide a fresh clean SUMMARY-R gate",
         ),
@@ -261,7 +275,12 @@ fn review_protocol_error(message: &str) -> ReviewOutcome {
     }
 }
 
-fn finding_signature<'a>(findings: impl Iterator<Item = &'a contract::Finding>) -> String {
+/// Sign a round from every open finding's marker id, heading, and status. Exposed inside the crate
+/// so a native gate that must re-derive the same round signature (after it re-reads the artifact the
+/// reviewer left behind) uses this exact definition instead of a second, drifting copy.
+pub(crate) fn finding_signature<'a>(
+    findings: impl Iterator<Item = &'a contract::Finding>,
+) -> String {
     let mut fields: Vec<_> = findings
         .map(|finding| {
             let status = match &finding.status {
@@ -462,6 +481,52 @@ mod tests {
             ),
             ReviewOutcome::Escalated { reason }
                 if reason.contains("fresh clean SUMMARY-R gate")
+        ));
+    }
+
+    #[test]
+    fn ready_claim_over_an_open_finding_owes_a_fix_cycle_rather_than_an_escalation() {
+        // The engine's review-cycle gate may put an open `R-` into the artifact before the reviewer
+        // runs. A reviewer whose own passes are clean then declares "готово к слиянию" over a file
+        // that still has an open finding. That must stay a repeatable round, not a terminal task
+        // escalation, and it must never satisfy the clean gate.
+        let ready_over_open = "### [R-04] build is broken — статус: новая\n### [SUMMARY-R-2026-07-24T12:00:01Z] complete — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n";
+        let outcome = task_review_outcome(
+            &verdict(Reason::Ok),
+            ready_over_open,
+            "2026-07-24T12:00:00Z",
+            REVIEW_UNTIL,
+            "review-head",
+        );
+        let ReviewOutcome::Findings { signature } = outcome else {
+            panic!("a ready claim over an open finding must reduce to Findings: {outcome:?}");
+        };
+        let declared_open = task_review_outcome(
+            &verdict(Reason::Ok),
+            "### [R-04] build is broken — статус: новая\nИТОГ: открытые находки · открытых=1\n",
+            "2026-07-24T12:00:00Z",
+            REVIEW_UNTIL,
+            "review-head",
+        );
+        assert_eq!(
+            declared_open,
+            ReviewOutcome::Findings { signature },
+            "the same open findings sign the round the same way whichever tail the reviewer wrote"
+        );
+
+        // A risk elevation on the same artifact still reaches the reducer.
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "Риск-повышен: high — public API is now affected\n### [R-04] build is broken — статус: новая\n### [SUMMARY-R-2026-07-24T12:00:01Z] complete — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::FindingsRiskElevated {
+                risk: Risk::High,
+                ..
+            }
         ));
     }
 

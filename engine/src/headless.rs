@@ -241,6 +241,10 @@ struct ClaudeTaskReview {
     head: String,
     attempt: u32,
     spec: Option<SpawnSpec>,
+    /// Digest of `review.md` as it existed when this call was prepared, or `None` when the file did
+    /// not exist. The engine's own review-cycle gate may have authored that content, so "a file is
+    /// present" no longer proves "the reviewer wrote a report".
+    artifact_before: Option<String>,
 }
 
 impl ClaudeTaskReview {
@@ -1019,7 +1023,24 @@ impl HeadlessExternalPort {
             head: head.into(),
             attempt,
             spec: Some(self.claude_spawn_spec(prompt, false, Some(workspace), state)?),
+            artifact_before: self.review_artifact_digest(task_id)?,
         })
+    }
+
+    /// Digest `review.md` before a reviewer runs, so an unchanged file afterwards can be recognised
+    /// as "this reviewer produced no report of its own".
+    fn review_artifact_digest(&self, task_id: &str) -> Result<Option<String>, HeadlessError> {
+        Ok(self
+            .read_work_artifact(&self.task_review_artifact_path(task_id))?
+            .map(|artifact| sha256_hex(artifact.as_bytes())))
+    }
+
+    fn task_review_artifact_path(&self, task_id: &str) -> PathBuf {
+        self.config
+            .work
+            .join("tasks")
+            .join(task_id)
+            .join("review.md")
     }
 
     fn finish_task_review(
@@ -1040,14 +1061,20 @@ impl HeadlessExternalPort {
         let coordinates =
             self.claude_task_usage_coordinates(state, task_id, "reviewer", "full", review.attempt)?;
         self.record_usage(state, coordinates, &invocation)?;
-        let artifact_path = self
-            .config
-            .work
-            .join("tasks")
-            .join(task_id)
-            .join("review.md");
-        let artifact = self.read_work_artifact(&artifact_path)?;
-        let outcome = if artifact.is_none() && invocation.verdict.reason == Reason::Ok {
+        let artifact = self.read_work_artifact(&self.task_review_artifact_path(task_id))?;
+        // "No report from this reviewer" is an absent artifact *or* one that is byte-for-byte what
+        // was already there before the call. The distinction started to matter when the engine's
+        // review-cycle gate began pre-writing `review.md`: parsing the engine's own text as if it
+        // were the reviewer's report would find no `ИТОГ:` line and turn a bounded, repeatable
+        // `Incomplete` into a terminal protocol escalation blaming the reviewer for a file it never
+        // wrote. It also stops a leftover artifact from a previous round from being re-read as a
+        // fresh report.
+        let no_new_report = match (&artifact, &review.artifact_before) {
+            (None, _) => true,
+            (Some(artifact), Some(before)) => &sha256_hex(artifact.as_bytes()) == before,
+            (Some(_), None) => false,
+        };
+        let outcome = if no_new_report && invocation.verdict.reason == Reason::Ok {
             ReviewOutcome::Incomplete
         } else {
             task_review_outcome(
@@ -2314,7 +2341,7 @@ impl HeadlessExternalPort {
         };
         let evidence = task_review_range_evidence_path(&self.config.work, task_id, range.attempt);
         format!(
-            "You are {reviewer}, an independent read-only reviewer. TASK={task_id} ROOT={} WORK={} WORKTREE={}. {review_scope} Read the task descriptor and the VCS-produced immutable review range at {} before inspecting the corresponding committed diff; do not expand the scope from mutable working-copy state. Perform at least {} independent passes unless this is a small local `coder_fast` change and the first clean pass proves it has no broader surface. Compare the descriptor's `Риск:` with the actual changed paths and contents. If and only if the actual blast radius is strictly higher, write exactly one standalone `Риск-повышен: low|medium|high — <specific reason>` line in review.md (an R-* finding remains required when the discrepancy is an open defect); never lower or repeat the marker. Write WORK/tasks/{task_id}/review.md. A clean report must contain a `SUMMARY-R-<timestamp>` strictly later than {since} and end exactly `ИТОГ: готово к слиянию · открытых=0`; a findings report must contain each open `R-*` finding and end exactly `ИТОГ: открытые находки · открытых=N`. Do not edit source, descriptor, queue, VCS, or other control-plane artifacts.",
+            "You are {reviewer}, an independent read-only reviewer. TASK={task_id} ROOT={} WORK={} WORKTREE={}. {review_scope} Read the task descriptor and the VCS-produced immutable review range at {} before inspecting the corresponding committed diff; do not expand the scope from mutable working-copy state. Perform at least {} independent passes unless this is a small local `coder_fast` change and the first clean pass proves it has no broader surface. Compare the descriptor's `Риск:` with the actual changed paths and contents. If and only if the actual blast radius is strictly higher, write exactly one standalone `Риск-повышен: low|medium|high — <specific reason>` line in review.md (an R-* finding remains required when the discrepancy is an open defect); never lower or repeat the marker. Write WORK/tasks/{task_id}/review.md. WORK/tasks/{task_id}/review.md may already contain open `R-*` findings you did not author: the engine writes its own proven build/lint failures there before you start. Keep every such finding verbatim with its `статус: новая`, count it in `открытых=N`, and never delete, rewrite, or close it — you are not its fixer, and the engine re-imposes it on the round regardless. A clean report must contain a `SUMMARY-R-<timestamp>` strictly later than {since} and end exactly `ИТОГ: готово к слиянию · открытых=0`; a findings report must contain each open `R-*` finding and end exactly `ИТОГ: открытые находки · открытых=N`. Do not edit source, descriptor, queue, VCS, or other control-plane artifacts.",
             self.config.root.display(),
             self.config.work.display(),
             workspace.display(),
@@ -3204,6 +3231,7 @@ impl ExternalPort for HeadlessExternalPort {
             return Ok(TaskReviewPreparationOutcome::SandboxDowngraded { scope });
         }
         let since = epoch_to_iso(now_epoch_secs());
+        let artifact_before = self.review_artifact_digest(task_id)?;
         let (reviewer, mut invocation) = match route {
             ReviewerRoute::Augment(_) => (
                 "reviewer_codex (augment)",
@@ -3375,13 +3403,40 @@ impl ExternalPort for HeadlessExternalPort {
             self.record_usage(state, usage_coordinates, &invocation)?;
             return Ok(prepared);
         }
-        let artifact_path = self
-            .config
-            .work
-            .join("tasks")
-            .join(task_id)
-            .join("review.md");
+        let artifact_path = self.task_review_artifact_path(task_id);
         let artifact = match self.read_work_artifact(&artifact_path) {
+            // An artifact identical to the one this call started with carries no report from this
+            // reviewer — most plausibly it is the engine's own review-cycle finding, written before
+            // the call. Treat it exactly like an absent artifact (a bounded `Incomplete` retry)
+            // instead of parsing engine text as a reviewer protocol violation. The replay binding
+            // stays the artifact's real digest, so recovery still re-proves the exact bytes.
+            Ok(Some(artifact))
+                if artifact_before
+                    .as_deref()
+                    .is_some_and(|before| sha256_hex(artifact.as_bytes()) == before) =>
+            {
+                invocation.review_artifact_binding =
+                    Some(format!("review-sha256:{}", sha256_hex(artifact.as_bytes())));
+                self.finish_codex_attempt(
+                    state,
+                    &mut invocation,
+                    CodexAttemptOutcome::Failed,
+                    Some(CodexReplayResult::TaskReview(
+                        TaskReviewPreparationOutcome::Completed(ReviewOutcome::Incomplete),
+                    )),
+                )?;
+                self.record_usage(state, usage_coordinates, &invocation)?;
+                self.record_task_operation(
+                    state,
+                    usage_coordinates,
+                    "review",
+                    &invocation,
+                    OperationOutcome::Failed,
+                );
+                return Ok(TaskReviewPreparationOutcome::Completed(
+                    ReviewOutcome::Incomplete,
+                ));
+            }
             Ok(Some(artifact)) => {
                 invocation.review_artifact_binding =
                     Some(format!("review-sha256:{}", sha256_hex(artifact.as_bytes())));
@@ -4738,6 +4793,10 @@ mod tests {
         assert!(prompt.contains("never lower or repeat the marker"));
         assert!(prompt.contains("review-range-T-1-1.json"));
         assert!(prompt.contains("immutable base is defined only by the VCS review-range evidence"));
+        assert!(
+            prompt.contains("may already contain open `R-*` findings you did not author"),
+            "the reviewer must be told the engine's own findings are not its to remove: {prompt}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5976,6 +6035,83 @@ mod tests {
             port.invoke_codex_read_only("unused".into(), &root, &state, coordinates),
             Err(HeadlessError::Protocol(message)) if message.contains("changed after completion")
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_review_artifact_the_reviewer_did_not_change_is_a_repeatable_incomplete_round() {
+        let root = std::env::temp_dir().join(format!(
+            "orchestrail-headless-review-unchanged-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let work = root.join(".work");
+        let task_dir = work.join("tasks/T-014");
+        fs::create_dir_all(work.join("native-evidence")).unwrap();
+        fs::create_dir_all(&task_dir).unwrap();
+        let port = HeadlessExternalPort::new(HeadlessConfig::new(
+            &work,
+            &root,
+            crate::config::EngineConfig::default().codex,
+        ))
+        .unwrap();
+        let mut state = telemetry_state();
+        state.tasks.insert(
+            "T-014".into(),
+            crate::processor::TaskRuntime {
+                id: "T-014".into(),
+                conflict_domain: "engine/**".into(),
+                level: Some(Level::Coder),
+                risk: None,
+                wave: 1,
+                phase: crate::processor::TaskPhase::Reviewing,
+                leaf_attempts: BTreeMap::from([(LeafKind::Review.as_str().into(), 1)]),
+                review_cycles: 0,
+                review_signatures: Vec::new(),
+                implementation_author: Some("coder".into()),
+                previous_review_sha: None,
+                review_sha: Some("head".into()),
+                reason: None,
+                imported_recovery_intent: None,
+            },
+        );
+        // What the engine's review-cycle gate writes before the reviewer is dispatched. It has no
+        // `ИТОГ:` line, because the engine contributes evidence and never a reviewer verdict.
+        let engine_authored = "### [R-01] Проверка сборки/линта на цикле ревью не прошла — статус: новая\n- Причина: verification command #1 ended error.\n";
+        fs::write(task_dir.join("review.md"), engine_authored).unwrap();
+        let prepared = |port: &HeadlessExternalPort| ClaudeTaskReview {
+            reviewer: "reviewer",
+            since: "2026-07-25T12:00:00Z".into(),
+            head: "head".into(),
+            attempt: 1,
+            spec: None,
+            artifact_before: port.review_artifact_digest("T-014").unwrap(),
+        };
+        let review = prepared(&port);
+
+        // The reviewer exits cleanly without writing anything. Parsing the engine's own text as a
+        // reviewer report would find no `ИТОГ:` and escalate the task terminally; the round is
+        // instead simply not done, which the reducer retries under `REVIEW_LOOP_MAX`.
+        let outcome = port
+            .finish_task_review("T-014", review, &state, invocation_with_usage(1))
+            .unwrap();
+        assert_eq!(outcome, ReviewOutcome::Incomplete);
+
+        // A reviewer that does write its report is read exactly as before — including one that
+        // keeps the engine's finding and still declares itself ready.
+        let review = prepared(&port);
+        fs::write(
+            task_dir.join("review.md"),
+            "### [R-01] Проверка сборки/линта на цикле ревью не прошла — статус: новая\n### [SUMMARY-R-2099-01-01T00:00:00Z] Итог ревью задачи — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+        )
+        .unwrap();
+        let outcome = port
+            .finish_task_review("T-014", review, &state, invocation_with_usage(1))
+            .unwrap();
+        assert!(
+            matches!(outcome, ReviewOutcome::Findings { .. }),
+            "an open finding owes a fix cycle rather than a terminal escalation: {outcome:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
