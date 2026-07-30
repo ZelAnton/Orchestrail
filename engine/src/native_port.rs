@@ -43,6 +43,7 @@ use crate::recovery::{
     import_reviewing_integration_cohort, import_unreported_integration_cohort, plan_recovery,
     recheck_legacy_open_admission, synthesize_missing_legacy_cohort_state,
 };
+use crate::session::LeafSessionUpdate;
 use crate::state::{DeliveryTarget, IntegrationState, Snapshot, TaskState, try_completed_ids};
 use crate::supervise::CancellationProbe;
 use crate::telemetry::{
@@ -276,6 +277,12 @@ pub trait ExternalPort {
         workspace: &Path,
         state: &ProcessorState,
     ) -> Result<ReviewOutcome, Self::Error>;
+    /// Surrender the provider conversation coordinate observed by the last task-scoped call for
+    /// `task_id`, so a later call of the same leaf lineage can continue that conversation instead
+    /// of re-seeding it. Adapters that never resume keep this default.
+    fn take_leaf_session(&mut self, _task_id: &str) -> Option<LeafSessionUpdate> {
+        None
+    }
     /// Execute independent Phase-2 leaves concurrently when the adapter can do so safely.  The
     /// default preserves compatibility for deterministic test adapters and remains ordered by
     /// `effects`; ProcessKit-backed adapters override it with one contained child per request.
@@ -2803,6 +2810,10 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
         Ok(outcome)
     }
 
+    fn take_leaf_session(&mut self, task_id: &str) -> Option<LeafSessionUpdate> {
+        self.external.take_leaf_session(task_id)
+    }
+
     fn prepare_task_leaf(
         &mut self,
         task_id: &str,
@@ -4293,6 +4304,7 @@ mod tests {
             review_sha: review_sha.map(str::to_owned),
             reason: reason.map(str::to_owned),
             imported_recovery_intent: None,
+            leaf_sessions: BTreeMap::new(),
         }
     }
 
@@ -6081,6 +6093,7 @@ mod tests {
                     review_sha: Some(head.clone()),
                     reason: None,
                     imported_recovery_intent: None,
+                    leaf_sessions: BTreeMap::new(),
                 },
             )]),
             ..ProcessorState::default()
@@ -6273,6 +6286,7 @@ mod tests {
                     review_sha: Some(head),
                     reason: None,
                     imported_recovery_intent: None,
+                    leaf_sessions: BTreeMap::new(),
                 },
             )]),
             ..ProcessorState::default()

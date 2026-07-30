@@ -32,6 +32,11 @@ pub struct ClaudeCall {
     pub append_system_prompt: Option<String>,
     pub add_dirs: Vec<String>,
     pub posture: PermissionPosture,
+    /// Continue an existing conversation instead of starting a fresh one. The caller must have
+    /// proved the transcript still exists (`crate::session`); `claude --resume` fails on an
+    /// unknown id, so an unproven guess would turn a repeat call into a lost one. The permission
+    /// posture is still stated on THIS argv: resuming a conversation never resumes consent.
+    pub resume: Option<String>,
 }
 
 impl ClaudeCall {
@@ -44,6 +49,7 @@ impl ClaudeCall {
             append_system_prompt: None,
             add_dirs: Vec::new(),
             posture: PermissionPosture::Allowlisted,
+            resume: None,
         }
     }
 
@@ -59,6 +65,10 @@ impl ClaudeCall {
             "stream-json".into(),
             "--verbose".into(),
         ];
+        if let Some(session) = &self.resume {
+            a.push("--resume".into());
+            a.push(session.clone());
+        }
         if let Some(m) = &self.model {
             a.push("--model".into());
             a.push(m.clone());
@@ -104,6 +114,10 @@ pub struct StreamResult {
     pub result_text: Option<String>,
     /// Provider-exact counters from the final `result.usage` object, when supplied.
     pub usage: Option<crate::telemetry::ProviderUsage>,
+    /// Conversation id reported by the transcript, usable with `--resume` on a later call of the
+    /// same leaf lineage. It is orthogonal runtime data: no decision here depends on it, and an
+    /// older CLI that omits the field simply leaves the next call re-seeding full context.
+    pub session_id: Option<String>,
 }
 
 /// Parse a full stream-json transcript (newline-delimited JSON objects). Only the LAST
@@ -117,6 +131,7 @@ pub fn parse_transcript(transcript: &str) -> StreamResult {
         num_turns: None,
         result_text: None,
         usage: None,
+        session_id: None,
     };
     for line in transcript.lines() {
         let line = line.trim();
@@ -126,6 +141,12 @@ pub fn parse_transcript(transcript: &str) -> StreamResult {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        // The conversation id is announced by the `system`/`init` event and repeated on the final
+        // result. Read it from any event so a transcript that was cut short still identifies the
+        // conversation it created; the last announcement wins, exactly like the result itself.
+        if let Some(session_id) = value.get("session_id").and_then(serde_json::Value::as_str) {
+            out.session_id = Some(session_id.to_owned());
+        }
         if value.get("type").and_then(serde_json::Value::as_str) != Some("result") {
             continue;
         }
@@ -184,6 +205,7 @@ mod tests {
             append_system_prompt: None,
             add_dirs: vec![],
             posture: PermissionPosture::Allowlisted,
+            resume: None,
         };
         let argv = call.to_argv();
         assert_eq!(argv[0], "-p");
@@ -219,6 +241,68 @@ mod tests {
         );
         // Bypass never also emits an allowlist (it is all-or-nothing, and auditable).
         assert!(!argv.iter().any(|s| s == "--allowedTools"));
+    }
+
+    #[test]
+    fn a_proven_conversation_is_continued_without_weakening_the_call() {
+        let mut call = ClaudeCall::new("Continue task T-1.");
+        call.model = Some("sonnet".into());
+        call.allowed_tools = vec!["Read".into(), "Edit".into()];
+        assert!(
+            !call.to_argv().iter().any(|arg| arg == "--resume"),
+            "a call with no proven conversation seeds a fresh one"
+        );
+        call.resume = Some("11111111-2222-3333-4444-555555555555".into());
+        let argv = call.to_argv();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--resume" && w[1] == "11111111-2222-3333-4444-555555555555")
+        );
+        // The prompt is still this turn's instruction, and the permission posture and allowlist
+        // are still stated on this argv: continuing a conversation continues no authority.
+        assert_eq!(argv[0], "-p");
+        assert_eq!(argv[1], "Continue task T-1.");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--allowedTools" && w[1] == "Read Edit")
+        );
+        assert!(argv.iter().any(|s| s == "stream-json"));
+    }
+
+    #[test]
+    fn transcript_reports_the_conversation_id_from_init_or_result() {
+        let init_only = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"11111111-2222-3333-4444-555555555555"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            parse_transcript(init_only).session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "a transcript cut short still identifies the conversation it created"
+        );
+        let full = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"11111111-2222-3333-4444-555555555555"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"11111111-2222-3333-4444-555555555555"}"#,
+            "\n",
+        );
+        let parsed = parse_transcript(full);
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(parsed.result_text.as_deref(), Some("ok"));
+        // An older CLI that never announces one leaves the next call re-seeding.
+        assert_eq!(
+            parse_transcript(r#"{"type":"result","subtype":"success","result":"ok"}"#).session_id,
+            None
+        );
     }
 
     #[test]

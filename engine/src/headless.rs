@@ -47,6 +47,9 @@ use crate::resolvers::{
     AttemptSignature, BaseReviewer, CoderRoute, CoderRouteInput, Domain, EnvLimitClass, ImplBy,
     Level, ReviewerRoute, base_reviewer, reelect_reviewer, route_coder,
 };
+use crate::session::{
+    LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProbe, SessionProvider,
+};
 use crate::state::{DeliveryTarget, Snapshot, TaskState, now_epoch_secs, try_completed_ids};
 use crate::supervise::{self, CancellationProbe, Reason, SpawnSpec, Verdict};
 use crate::telemetry::{
@@ -113,6 +116,10 @@ pub struct HeadlessConfig {
     /// Loss of native lease ownership must cancel a currently running contained leaf without
     /// writing the operator-owned `PAUSE` marker.
     pub cancellation_probe: Option<CancellationProbe>,
+    /// Read-only locator for the providers' conversation archives, used to prove a durable
+    /// session still exists before a repeat call tries to continue it. It resolves the real user
+    /// home by default; a fixture points it at a temporary directory instead.
+    pub session_probe: SessionProbe,
     /// Session-local, shared routing evidence for the no-model Codex sandbox probe. Cloned task
     /// workers share this cell so parallel preparation still executes each probe at most once.
     codex_preflight: Arc<Mutex<CodexPreflightSession>>,
@@ -143,6 +150,7 @@ impl HeadlessConfig {
             policy_verification_commands: Vec::new(),
             smoke_cmd: None,
             cancellation_probe: None,
+            session_probe: SessionProbe::from_env(),
             codex_preflight: Arc::new(Mutex::new(CodexPreflightSession::default())),
         }
     }
@@ -231,6 +239,9 @@ struct Invocation {
     /// mutable route selection and reviewer freshness clocks on crash replay.
     replay_result: Option<CodexReplayResult>,
     replay_attempt_number: Option<u32>,
+    /// Provider conversation id reported by this call's transcript, when it announced one. It is
+    /// orthogonal runtime data and never participates in outcome classification.
+    session_id: Option<String>,
 }
 
 /// Fully prepared authoritative Claude review.  All coordinates are captured before spawning so
@@ -240,6 +251,9 @@ struct ClaudeTaskReview {
     since: String,
     head: String,
     attempt: u32,
+    /// Whether this round continues the reviewer's previous conversation. A resumed call that
+    /// comes back unusable forgets the coordinate so the next round re-seeds.
+    resumed: bool,
     spec: Option<SpawnSpec>,
     /// Digest of `review.md` as it existed when this call was prepared, or `None` when the file did
     /// not exist. The engine's own review-cycle gate may have authored that content, so "a file is
@@ -259,11 +273,43 @@ enum ClaudeTaskBatchPlan {
     Leaf {
         task_id: String,
         kind: LeafKind,
+        /// Whether this spec continued the maker's conversation, so the same
+        /// resume-then-forget rule applies in the fan-out path as in the serial one.
+        resumed: bool,
     },
     Review {
         task_id: String,
         review: Box<ClaudeTaskReview>,
     },
+}
+
+/// Everything one fanned-out worker owes its parent, kept deliberately separate from whether that
+/// worker SUCCEEDED.
+///
+/// A worker runs in its own [`HeadlessExternalPort`], so the bookkeeping it stages — commit
+/// evidence, and the conversation coordinate a leaf asked to publish or to forget — lives in a map
+/// the parent never sees unless it is handed back. Returning that map inside the worker's `Result`
+/// made the two cases that need it most the exact two that dropped it: a worker that returned
+/// `Err`, and every sibling of a worker that returned `Err`. The coordinate lost that way is an
+/// invalidation, so the next run resumed the very conversation whose result the engine had just
+/// refused. The handover is therefore unconditional, and the parent decides afterwards which parts
+/// of it a failed turn may keep.
+struct TaskWorkerHandover {
+    result: Result<TaskEffectResult, HeadlessError>,
+    evidence: BTreeMap<String, CommitEvidence>,
+    sessions: BTreeMap<String, LeafSessionUpdate>,
+}
+
+impl TaskWorkerHandover {
+    /// A worker that failed before it owned a port, or that died together with it, has nothing
+    /// staged to hand back but the failure itself.
+    fn failed(error: HeadlessError) -> Self {
+        Self {
+            result: Err(error),
+            evidence: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+        }
+    }
 }
 
 /// The provider that supplied a model result. It is intentionally not inferred from the prose
@@ -466,6 +512,10 @@ pub struct HeadlessExternalPort {
     merge_evidence: BTreeMap<String, CommitEvidence>,
     integration_evidence: Option<CommitEvidence>,
     ci_evidence: Option<CommitEvidence>,
+    /// Provider conversation coordinate observed by the task leaf that just ran, awaiting the
+    /// driver's orthogonal durable write. It is per-task because a rolling round fans several
+    /// independent task leaves out at once.
+    leaf_sessions: BTreeMap<String, LeafSessionUpdate>,
 }
 
 impl HeadlessExternalPort {
@@ -488,6 +538,7 @@ impl HeadlessExternalPort {
             merge_evidence: BTreeMap::new(),
             integration_evidence: None,
             ci_evidence: None,
+            leaf_sessions: BTreeMap::new(),
         })
     }
 
@@ -799,6 +850,88 @@ impl HeadlessExternalPort {
         self.model_deadline_at(state, now_epoch_secs())
     }
 
+    /// Prove that a repeat call of one leaf lineage may continue its previous conversation.
+    ///
+    /// Two independent facts are required: the checkpoint remembers a coordinate for exactly this
+    /// task, provider, and lineage, AND the provider's own archive still holds that conversation.
+    /// Every negative answer — no durable coordinate, a cleaned archive, an unreadable home — is
+    /// the same safe answer, "seed a fresh conversation with full context", which is precisely
+    /// what the engine did before durable sessions existed.
+    fn resumable_session(
+        &self,
+        state: &ProcessorState,
+        task_id: &str,
+        provider: SessionProvider,
+        lineage: SessionLineage,
+        cwd: &Path,
+    ) -> Option<String> {
+        let id = self
+            .task(state, task_id)
+            .ok()?
+            .leaf_session(LeafSessionKey::new(provider, lineage))?
+            .to_owned();
+        self.config
+            .session_probe
+            .is_live(provider, cwd, &id)
+            .then_some(id)
+    }
+
+    /// Codex conversation a repeat call of `lineage` may continue.
+    ///
+    /// It carries one extra precondition beyond [`Self::resumable_session`]: `codex exec resume`
+    /// accepts no `--sandbox`, `-C`, or `--add-dir`, so a read-only route — whose contract
+    /// includes the `.work/codex-cache` writable exception — has no faithful resume argv at all.
+    /// Such a route deliberately keeps re-seeding rather than resuming under a quietly different
+    /// sandbox (T-069, T-279/K-054). [`CodexCall::resume`] enforces the same rule at the argv.
+    fn codex_resumable_session(
+        &self,
+        state: &ProcessorState,
+        task_id: &str,
+        lineage: SessionLineage,
+        workspace: &Path,
+    ) -> Option<String> {
+        if !matches!(self.config.codex.sandbox, Sandbox::WorkspaceWrite) {
+            return None;
+        }
+        self.resumable_session(state, task_id, SessionProvider::Codex, lineage, workspace)
+    }
+
+    /// Stage this call's effect on its conversation coordinate for the driver's durable write.
+    ///
+    /// A call that produced a USABLE result publishes the id it reported. A call that DID resume
+    /// and came back unusable forgets the coordinate instead, so the next attempt re-seeds with
+    /// full context. Anything else is left untouched.
+    ///
+    /// `usable` is deliberately the caller's own classified outcome and never `verdict.reason`.
+    /// Deriving it from process health would cover only the crash/timeout/non-zero class and would
+    /// leave the failure mode that resuming itself creates: a child that exits zero and returns
+    /// something the engine cannot accept — a reviewer that "remembers" writing `review.md` and so
+    /// leaves it untouched (`ReviewOutcome::Incomplete`), or a leaf whose report lacks its
+    /// machine-readable tail. Those results are stable properties of a conversation, so continuing
+    /// it reproduces them: the round would repeat until the cycle budget escalated the task, where
+    /// a stateless call had simply started over. Judging by outcome keeps the guaranteed fallback
+    /// to full context for failure of meaning, not only failure of process.
+    fn note_leaf_session(
+        &mut self,
+        task_id: &str,
+        key: LeafSessionKey,
+        invocation: &Invocation,
+        resumed: bool,
+        usable: bool,
+    ) {
+        let update = match invocation.session_id.as_deref() {
+            Some(id) if usable && crate::session::is_valid_session_id(id) => {
+                LeafSessionUpdate::Observed {
+                    key,
+                    id: id.to_owned(),
+                }
+            }
+            _ if resumed => LeafSessionUpdate::Invalidated { key },
+            _ => return,
+        };
+        self.leaf_sessions.insert(task_id.to_owned(), update);
+    }
+
     fn invoke_claude(
         &self,
         prompt: String,
@@ -806,7 +939,18 @@ impl HeadlessExternalPort {
         workspace: Option<&Path>,
         state: &ProcessorState,
     ) -> Result<Invocation, HeadlessError> {
-        let spec = self.claude_spawn_spec(prompt, writable, workspace, state)?;
+        self.invoke_claude_resuming(prompt, writable, workspace, state, None)
+    }
+
+    fn invoke_claude_resuming(
+        &self,
+        prompt: String,
+        writable: bool,
+        workspace: Option<&Path>,
+        state: &ProcessorState,
+        resume: Option<String>,
+    ) -> Result<Invocation, HeadlessError> {
+        let spec = self.claude_spawn_spec(prompt, writable, workspace, state, resume)?;
         Ok(self.claude_invocation(supervise::run(&spec)))
     }
 
@@ -816,8 +960,13 @@ impl HeadlessExternalPort {
         writable: bool,
         workspace: Option<&Path>,
         state: &ProcessorState,
+        resume: Option<String>,
     ) -> Result<SpawnSpec, HeadlessError> {
         let mut call = ClaudeCall::new(prompt);
+        // A proven conversation continues; everything else starts one. The permission posture and
+        // tool allowlist below are still stated on THIS argv either way — continuing a
+        // conversation never continues consent.
+        call.resume = resume;
         call.model = self.config.claude_model.clone();
         call.max_turns = Some(self.config.max_turns);
         call.posture = PermissionPosture::Allowlisted;
@@ -854,6 +1003,7 @@ impl HeadlessExternalPort {
             review_artifact_binding: None,
             replay_result: None,
             replay_attempt_number: None,
+            session_id: parsed.session_id,
         }
     }
 
@@ -863,6 +1013,7 @@ impl HeadlessExternalPort {
         kind: LeafKind,
         state: &ProcessorState,
         invocation: Invocation,
+        resumed: bool,
     ) -> Result<LeafOutcome, HeadlessError> {
         let task = self.task(state, task_id)?;
         let attempt = task.leaf_attempts.get(kind.as_str()).copied().unwrap_or(1);
@@ -875,11 +1026,23 @@ impl HeadlessExternalPort {
             self.claude_task_usage_coordinates(state, task_id, "coder", mode, attempt)?;
         self.record_usage(state, coordinates, &invocation)?;
         let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "coder");
-        if matches!(
-            outcome,
-            LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. }
-        ) {
-            let evidence = match Self::exact_changed_paths(&invocation.report) {
+        // Classify the whole result — verdict, outcome, and the mandatory changed-path evidence —
+        // before deciding the conversation's fate. A report that claims completion without that
+        // evidence is exactly as unusable as an escalation, and a resumed conversation that
+        // produced one would otherwise be continued into producing it again.
+        let evidence =
+            leaf_completed(&outcome).then(|| Self::exact_changed_paths(&invocation.report));
+        if let Some(lineage) = SessionLineage::for_leaf(kind) {
+            self.note_leaf_session(
+                task_id,
+                LeafSessionKey::new(SessionProvider::Claude, lineage),
+                &invocation,
+                resumed,
+                matches!(evidence, Some(Ok(_))),
+            );
+        }
+        if let Some(evidence) = evidence {
+            let evidence = match evidence {
                 Ok(evidence) => evidence,
                 Err(error) => {
                     self.record_task_operation(
@@ -943,6 +1106,19 @@ impl HeadlessExternalPort {
             BaseReviewer::ReviewerStd => "reviewer_std",
             BaseReviewer::Reviewer => "reviewer",
         };
+        // A repeat round continues THIS reviewer's own conversation — never the maker's, which is
+        // a separate lineage precisely so an independent reviewer can never inherit the author's
+        // justification. The per-round coordinates below (head, previous review, evidence path,
+        // freshness bound) change every round and are therefore always restated in full; what
+        // resuming saves is the reviewer re-deriving the descriptor, diff, and its own earlier
+        // findings from scratch.
+        let resume = self.resumable_session(
+            state,
+            task_id,
+            SessionProvider::Claude,
+            SessionLineage::Reviewer,
+            workspace,
+        );
         let prompt = self.reviewer_prompt(
             task_id,
             workspace,
@@ -953,13 +1129,15 @@ impl HeadlessExternalPort {
                 previous_review: task.previous_review_sha.as_deref(),
                 attempt,
             },
+            resume.is_some(),
         );
         Ok(ClaudeTaskReview {
             reviewer,
             since,
             head: head.into(),
             attempt,
-            spec: Some(self.claude_spawn_spec(prompt, false, Some(workspace), state)?),
+            resumed: resume.is_some(),
+            spec: Some(self.claude_spawn_spec(prompt, false, Some(workspace), state, resume)?),
             artifact_before: self.review_artifact_digest(task_id)?,
         })
     }
@@ -981,7 +1159,7 @@ impl HeadlessExternalPort {
     }
 
     fn finish_task_review(
-        &self,
+        &mut self,
         task_id: &str,
         review: ClaudeTaskReview,
         state: &ProcessorState,
@@ -1022,6 +1200,16 @@ impl HeadlessExternalPort {
                 &review.head,
             )
         };
+        // The conversation's fate is decided here rather than beside the child, because only this
+        // classification distinguishes a reviewer that reported from one that exited zero having
+        // silently reused its own previous turn's report.
+        self.note_leaf_session(
+            task_id,
+            LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer),
+            &invocation,
+            review.resumed,
+            review_completed(&outcome),
+        );
         self.record_task_operation(
             state,
             coordinates,
@@ -1039,12 +1227,31 @@ impl HeadlessExternalPort {
         state: &ProcessorState,
         coordinates: Option<CodexAttemptCoordinates<'_>>,
     ) -> Result<Invocation, HeadlessError> {
+        self.invoke_codex_resuming(prompt, workspace, state, coordinates, None)
+            .map(|(invocation, _)| invocation)
+    }
+
+    /// `resume` names a conversation the caller has already proved exists.
+    ///
+    /// Whether the argv can actually continue it is decided by [`CodexCall::resume`], which
+    /// refuses any sandbox whose contract the `exec resume` subcommand cannot express, and the
+    /// crash-replay short-circuits below never spawn a child at all. The effective answer is
+    /// therefore returned rather than assumed: the caller must not report a conversation as
+    /// resumed when no resuming child ran.
+    fn invoke_codex_resuming(
+        &self,
+        prompt: String,
+        workspace: &Path,
+        state: &ProcessorState,
+        coordinates: Option<CodexAttemptCoordinates<'_>>,
+        resume: Option<String>,
+    ) -> Result<(Invocation, bool), HeadlessError> {
         let sandbox = self.config.codex.sandbox;
         if let Some(coordinates) = coordinates
             && let Some(existing) = self.read_codex_attempt(state, coordinates)?
             && existing.final_event.is_some()
         {
-            return self.resume_codex_attempt(existing);
+            return self.resume_codex_attempt(existing).map(|it| (it, false));
         }
         // Prove every fallible pre-spawn policy input before reserving an attempt. A budget
         // rejection must not leave a durable reservation for a child that never existed.
@@ -1056,11 +1263,14 @@ impl HeadlessExternalPort {
         if let Some(reservation) = reservation.as_ref()
             && reservation.final_event.is_some()
         {
-            return self.resume_codex_attempt(reservation.clone());
+            return self
+                .resume_codex_attempt(reservation.clone())
+                .map(|it| (it, false));
         }
         let mut call = CodexCall::new(workspace.display().to_string(), sandbox);
         configure_codex_call(&mut call, reservation.as_ref(), &self.config.codex, "coder")?;
         call.emit_json = true;
+        let resumed = resume.is_some_and(|resume| call.resume(resume));
         // Keep the OS child cwd equal to Codex's `-C` target.  On Windows this is part of the
         // single-root sandbox contract, not merely a convenience for tools.
         let verdict = supervise::run(
@@ -1074,16 +1284,20 @@ impl HeadlessExternalPort {
                 .stdin(prompt),
         );
         let parsed = codex::parse_json_transcript(&verdict.stdout);
-        Ok(Invocation {
-            report: parsed.report.unwrap_or_else(|| verdict.stdout.clone()),
-            verdict,
-            source: ModelSource::Codex,
-            usage: parsed.usage,
-            codex_attempt: reservation,
-            review_artifact_binding: None,
-            replay_result: None,
-            replay_attempt_number: None,
-        })
+        Ok((
+            Invocation {
+                report: parsed.report.unwrap_or_else(|| verdict.stdout.clone()),
+                verdict,
+                source: ModelSource::Codex,
+                usage: parsed.usage,
+                codex_attempt: reservation,
+                review_artifact_binding: None,
+                replay_result: None,
+                replay_attempt_number: None,
+                session_id: parsed.session_id,
+            },
+            resumed,
+        ))
     }
 
     fn task<'a>(
@@ -1589,6 +1803,10 @@ impl HeadlessExternalPort {
             review_artifact_binding: None,
             replay_result: receipt.result,
             replay_attempt_number: Some(reservation.attempt_number),
+            // A replayed receipt proves the exact reducer-facing result, not a live conversation:
+            // the child is long gone, so the next call re-seeds rather than resuming a
+            // conversation nobody observed.
+            session_id: None,
         })
     }
 
@@ -2153,7 +2371,13 @@ impl HeadlessExternalPort {
         )
     }
 
-    fn task_prompt(&self, task_id: &str, kind: LeafKind, workspace: &Path) -> String {
+    fn task_prompt(
+        &self,
+        task_id: &str,
+        kind: LeafKind,
+        workspace: &Path,
+        resumed: bool,
+    ) -> String {
         let role = match kind {
             LeafKind::Implement => "implement the task",
             LeafKind::Fix => "fix the open R-* findings for the task",
@@ -2166,8 +2390,28 @@ impl HeadlessExternalPort {
         } else {
             ""
         };
+        // Only the framing differs between a fresh conversation and a continued one; every limit
+        // and protocol clause below is restated identically, because a resumed conversation must
+        // never be held to a weaker contract than a re-seeded one. A continued call still has to
+        // re-read the descriptor and review artifact: those files changed while it was not
+        // running, and its recollection of them is stale by construction.
+        //
+        // The working tree is named explicitly alongside them. A leaf conversation may fairly
+        // assume it authored the code it remembers writing, and that assumption is exactly what a
+        // route change breaks: the reducer forgets the peer provider's coordinate for this lineage
+        // (so no conversation resumes across a change of author), but a leaf must not silently rely
+        // on that being the only way its memory of the tree can go stale.
+        let framing = if resumed {
+            format!(
+                "You are continuing your own earlier session as this task's contained implementation leaf. Now {role}. Your recollection is not evidence: the descriptor and the applicable review artifact CHANGED since your last turn, and the working tree may have been changed by someone other than you since then. Re-read the descriptor, the applicable review artifact, and every file you are about to touch, and treat their current on-disk contents — not your memory of them — as authoritative."
+            )
+        } else {
+            format!(
+                "You are a contained implementation leaf. {role}. Read the descriptor and applicable review artifact first."
+            )
+        };
         format!(
-            "You are a contained implementation leaf. {role}. TASK={task_id} ROOT={} WORK={} WORKTREE={}. Read the descriptor and applicable review artifact first. Change only files justified by this effect. Do not commit, alter queue/cohort/integration state, or invoke another orchestrator. Your final report must include `Изменённые файлы: path1, path2` with every changed relative path and end exactly `ИТОГ: готово · режим=1|2|3`{risk_protocol}; if blocked, end exactly `ИТОГ: эскалация · причина=<specific reason>`.",
+            "{framing} TASK={task_id} ROOT={} WORK={} WORKTREE={}. Change only files justified by this effect. Do not commit, alter queue/cohort/integration state, or invoke another orchestrator. Your final report must include `Изменённые файлы: path1, path2` with every changed relative path and end exactly `ИТОГ: готово · режим=1|2|3`{risk_protocol}; if blocked, end exactly `ИТОГ: эскалация · причина=<specific reason>`.",
             self.config.root.display(),
             self.config.work.display(),
             workspace.display(),
@@ -2200,7 +2444,16 @@ impl HeadlessExternalPort {
         reviewer: &str,
         since: &str,
         range: ReviewRange<'_>,
+        resumed: bool,
     ) -> String {
+        // Every clause below is a per-round contract, so a resumed conversation still receives all
+        // of it: only the framing changes, to state that the coordinates supersede the previous
+        // round rather than describing the same one again.
+        let continuation = if resumed {
+            "You are continuing your own earlier review conversation for this task. The task changed since your last turn: the coordinates below describe a NEW round and supersede everything you were told before; re-read what they name instead of reusing your previous conclusions. "
+        } else {
+            ""
+        };
         let review_scope = match range.previous_review {
             Some(previous) => format!(
                 "Perform repeat range review from PREVIOUS_REVIEW_SHA={previous} to HEAD={}; do not treat the old clean result as evidence for the new commit.",
@@ -2215,7 +2468,7 @@ impl HeadlessExternalPort {
         };
         let evidence = task_review_range_evidence_path(&self.config.work, task_id, range.attempt);
         format!(
-            "You are {reviewer}, an independent read-only reviewer. TASK={task_id} ROOT={} WORK={} WORKTREE={}. {review_scope} Read the task descriptor and the VCS-produced immutable review range at {} before inspecting the corresponding committed diff; do not expand the scope from mutable working-copy state. Perform at least {} independent passes unless this is a small local `coder_fast` change and the first clean pass proves it has no broader surface. Compare the descriptor's `Риск:` with the actual changed paths and contents. If and only if the actual blast radius is strictly higher, write exactly one standalone `Риск-повышен: low|medium|high — <specific reason>` line in review.md (an R-* finding remains required when the discrepancy is an open defect); never lower or repeat the marker. Write WORK/tasks/{task_id}/review.md. WORK/tasks/{task_id}/review.md may already contain open `R-*` findings you did not author: the engine writes its own proven build/lint failures there before you start. Keep every such finding verbatim with its `статус: новая`, count it in `открытых=N`, and never delete, rewrite, or close it — you are not its fixer, and the engine re-imposes it on the round regardless. A clean report must contain a `SUMMARY-R-<timestamp>` strictly later than {since} and end exactly `ИТОГ: готово к слиянию · открытых=0`; a findings report must contain each open `R-*` finding and end exactly `ИТОГ: открытые находки · открытых=N`. Do not edit source, descriptor, queue, VCS, or other control-plane artifacts.",
+            "{continuation}You are {reviewer}, an independent read-only reviewer. TASK={task_id} ROOT={} WORK={} WORKTREE={}. {review_scope} Read the task descriptor and the VCS-produced immutable review range at {} before inspecting the corresponding committed diff; do not expand the scope from mutable working-copy state. Perform at least {} independent passes unless this is a small local `coder_fast` change and the first clean pass proves it has no broader surface. Compare the descriptor's `Риск:` with the actual changed paths and contents. If and only if the actual blast radius is strictly higher, write exactly one standalone `Риск-повышен: low|medium|high — <specific reason>` line in review.md (an R-* finding remains required when the discrepancy is an open defect); never lower or repeat the marker. Write WORK/tasks/{task_id}/review.md. WORK/tasks/{task_id}/review.md may already contain open `R-*` findings you did not author: the engine writes its own proven build/lint failures there before you start. Keep every such finding verbatim with its `статус: новая`, count it in `открытых=N`, and never delete, rewrite, or close it — you are not its fixer, and the engine re-imposes it on the round regardless. A clean report must contain a `SUMMARY-R-<timestamp>` strictly later than {since} and end exactly `ИТОГ: готово к слиянию · открытых=0`; a findings report must contain each open `R-*` finding and end exactly `ИТОГ: открытые находки · открытых=N`. Do not edit source, descriptor, queue, VCS, or other control-plane artifacts.",
             self.config.root.display(),
             self.config.work.display(),
             workspace.display(),
@@ -2667,13 +2920,28 @@ impl ExternalPort for HeadlessExternalPort {
         workspace: &Path,
         state: &ProcessorState,
     ) -> Result<LeafOutcome, Self::Error> {
-        let invocation = self.invoke_claude(
-            self.task_prompt(task_id, kind, workspace),
+        // Implementation and fix are one lineage: the fix call inside a review/fix cycle IS the
+        // repeat call this coordinate exists for.
+        let key = SessionLineage::for_leaf(kind)
+            .map(|lineage| LeafSessionKey::new(SessionProvider::Claude, lineage));
+        let resume = key.and_then(|key| {
+            self.resumable_session(state, task_id, key.provider, key.lineage, workspace)
+        });
+        let resumed = resume.is_some();
+        let invocation = self.invoke_claude_resuming(
+            self.task_prompt(task_id, kind, workspace, resumed),
             true,
             Some(workspace),
             state,
+            resume,
         )?;
-        self.finish_task_leaf(task_id, kind, state, invocation)
+        // `finish_task_leaf` owns the coordinate: it is the only place that knows whether this
+        // call's result was usable.
+        self.finish_task_leaf(task_id, kind, state, invocation, resumed)
+    }
+
+    fn take_leaf_session(&mut self, task_id: &str) -> Option<LeafSessionUpdate> {
+        self.leaf_sessions.remove(task_id)
     }
 
     fn resolve_merge_conflict(
@@ -2814,11 +3082,13 @@ impl ExternalPort for HeadlessExternalPort {
             }
             canary
         };
-        let mut invocation = match self.invoke_codex(
-            self.task_prompt(task_id, kind, workspace),
+        let resume = self.codex_resumable_session(state, task_id, SessionLineage::Coder, workspace);
+        let (mut invocation, resumed) = match self.invoke_codex_resuming(
+            self.task_prompt(task_id, kind, workspace, resume.is_some()),
             workspace,
             state,
             Some(coordinates),
+            resume,
         ) {
             Ok(invocation) => invocation,
             Err(error) => {
@@ -2828,6 +3098,9 @@ impl ExternalPort for HeadlessExternalPort {
                 return Err(error);
             }
         };
+        let codex_coder = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Coder);
+        // A crash replay reconstructs a finalized attempt from its receipt: no child ran in this
+        // process, so it observed no conversation and must not disturb the durable coordinate.
         if let Some(replay_result) = invocation.replay_result.take() {
             let CodexReplayResult::TaskLeaf(prepared) = replay_result else {
                 return Err(HeadlessError::Protocol(
@@ -2915,6 +3188,10 @@ impl ExternalPort for HeadlessExternalPort {
             attempt: telemetry_attempt,
         };
         if codex_needs_claude_fallback(&invocation) {
+            // Codex declined this round; the task passes to Claude. Nothing about this call is
+            // worth continuing, and the reducer additionally drops the Claude peer's coordinate
+            // when Claude records the round it actually performed.
+            self.note_leaf_session(task_id, codex_coder, &invocation, resumed, false);
             let live_sandbox_limit = self.observe_live_codex_sandbox_limit(&invocation);
             if live_sandbox_limit.is_none() && canary {
                 self.finish_codex_canary(task_id, CodexCanaryState::Pending);
@@ -2933,11 +3210,19 @@ impl ExternalPort for HeadlessExternalPort {
             return Ok(prepared);
         }
         let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "coder_codex");
-        let changed_paths = if matches!(
-            &outcome,
-            LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. }
-        ) {
-            match Self::exact_changed_paths(&invocation.report) {
+        // Same rule as the Claude leaf: only a result the engine can actually accept — completion
+        // plus its mandatory changed-path evidence — makes this conversation worth continuing.
+        let parsed_paths =
+            leaf_completed(&outcome).then(|| Self::exact_changed_paths(&invocation.report));
+        self.note_leaf_session(
+            task_id,
+            codex_coder,
+            &invocation,
+            resumed,
+            matches!(parsed_paths, Some(Ok(_))),
+        );
+        let changed_paths = if let Some(parsed_paths) = parsed_paths {
+            match parsed_paths {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
                     if canary {
@@ -3120,6 +3405,7 @@ impl ExternalPort for HeadlessExternalPort {
                             previous_review: task.previous_review_sha.as_deref(),
                             attempt,
                         },
+                        false,
                     ),
                     workspace,
                     state,
@@ -3144,6 +3430,7 @@ impl ExternalPort for HeadlessExternalPort {
                             previous_review: task.previous_review_sha.as_deref(),
                             attempt,
                         },
+                        false,
                     ),
                     workspace,
                     state,
@@ -3416,15 +3703,26 @@ impl ExternalPort for HeadlessExternalPort {
             for request in effects {
                 match &request.effect {
                     TaskEffect::DispatchLeaf { task_id, kind } => {
+                        let resume = SessionLineage::for_leaf(*kind).and_then(|lineage| {
+                            self.resumable_session(
+                                state,
+                                task_id,
+                                SessionProvider::Claude,
+                                lineage,
+                                &request.workspace,
+                            )
+                        });
                         specs.push(self.claude_spawn_spec(
-                            self.task_prompt(task_id, *kind, &request.workspace),
+                            self.task_prompt(task_id, *kind, &request.workspace, resume.is_some()),
                             true,
                             Some(&request.workspace),
                             state,
+                            resume.clone(),
                         )?);
                         plans.push(ClaudeTaskBatchPlan::Leaf {
                             task_id: task_id.clone(),
                             kind: *kind,
+                            resumed: resume.is_some(),
                         });
                     }
                     TaskEffect::DispatchReview { task_id } => {
@@ -3443,17 +3741,20 @@ impl ExternalPort for HeadlessExternalPort {
                 .into_iter()
                 .zip(plans)
                 .map(|(verdict, plan)| match plan {
-                    ClaudeTaskBatchPlan::Leaf { task_id, kind } => self
-                        .finish_task_leaf(&task_id, kind, state, self.claude_invocation(verdict))
-                        .map(|outcome| TaskEffectResult::Leaf { outcome }),
-                    ClaudeTaskBatchPlan::Review { task_id, review } => self
-                        .finish_task_review(
-                            &task_id,
-                            *review,
-                            state,
-                            self.claude_invocation(verdict),
-                        )
-                        .map(|outcome| TaskEffectResult::Review { outcome }),
+                    ClaudeTaskBatchPlan::Leaf {
+                        task_id,
+                        kind,
+                        resumed,
+                    } => {
+                        let invocation = self.claude_invocation(verdict);
+                        self.finish_task_leaf(&task_id, kind, state, invocation, resumed)
+                            .map(|outcome| TaskEffectResult::Leaf { outcome })
+                    }
+                    ClaudeTaskBatchPlan::Review { task_id, review } => {
+                        let invocation = self.claude_invocation(verdict);
+                        self.finish_task_review(&task_id, *review, state, invocation)
+                            .map(|outcome| TaskEffectResult::Review { outcome })
+                    }
                 })
                 .collect();
         }
@@ -3466,15 +3767,18 @@ impl ExternalPort for HeadlessExternalPort {
         self.arm_codex_canary(effects, state)?;
         let config = self.config.clone();
         let frozen_state = state.clone();
-        let completed = thread::scope(|scope| {
+        let handovers = thread::scope(|scope| {
             let workers = effects
                 .iter()
                 .cloned()
                 .map(|request| {
                     let config = config.clone();
                     let state = frozen_state.clone();
-                    scope.spawn(move || -> Result<_, HeadlessError> {
-                        let mut worker = HeadlessExternalPort::new(config)?;
+                    scope.spawn(move || -> TaskWorkerHandover {
+                        let mut worker = match HeadlessExternalPort::new(config) {
+                            Ok(worker) => worker,
+                            Err(error) => return TaskWorkerHandover::failed(error),
+                        };
                         let result = match &request.effect {
                             TaskEffect::PrepareLeaf { task_id, kind } => worker
                                 .prepare_task_leaf(task_id, *kind, &request.workspace, &state)
@@ -3488,35 +3792,33 @@ impl ExternalPort for HeadlessExternalPort {
                             TaskEffect::DispatchReview { task_id } => worker
                                 .task_review(task_id, &request.workspace, &state)
                                 .map(|outcome| TaskEffectResult::Review { outcome }),
-                        }?;
-                        Ok((result, worker.task_evidence))
+                        };
+                        // Taken BESIDE the result rather than after proving it `Ok`: the staged
+                        // forget of a resumed conversation exists precisely for the calls that end
+                        // in `Err`, so a `?` here would discard exactly what it was added for.
+                        TaskWorkerHandover {
+                            result,
+                            evidence: std::mem::take(&mut worker.task_evidence),
+                            sessions: std::mem::take(&mut worker.leaf_sessions),
+                        }
                     })
                 })
                 .collect::<Vec<_>>();
+            // Join every worker before judging any of them, in the deterministic request order.
+            // Short-circuiting here would throw away the handovers of workers that had already
+            // finished honestly, which is the same loss by a different route.
             workers
                 .into_iter()
                 .map(|worker| {
-                    worker.join().map_err(|_| {
-                        HeadlessError::InvalidState(
+                    worker.join().unwrap_or_else(|_| {
+                        TaskWorkerHandover::failed(HeadlessError::InvalidState(
                             "ProcessKit task worker panicked before collection".into(),
-                        )
-                    })?
+                        ))
+                    })
                 })
-                .collect::<Result<Vec<_>, HeadlessError>>()
-        })?;
-
-        let mut results = Vec::with_capacity(completed.len());
-        for (result, evidence) in completed {
-            for (task_id, paths) in evidence {
-                if self.task_evidence.insert(task_id.clone(), paths).is_some() {
-                    return Err(HeadlessError::InvalidState(format!(
-                        "concurrent task batch produced duplicate commit evidence for {task_id}"
-                    )));
-                }
-            }
-            results.push(result);
-        }
-        Ok(results)
+                .collect::<Vec<_>>()
+        });
+        self.merge_task_workers(handovers)
     }
 
     fn task_commit_evidence(
@@ -3630,7 +3932,7 @@ impl ExternalPort for HeadlessExternalPort {
         state: &ProcessorState,
     ) -> Result<LeafOutcome, Self::Error> {
         let invocation = self.invoke_claude(
-            self.task_prompt("integration", LeafKind::IntegrationFix, workspace),
+            self.task_prompt("integration", LeafKind::IntegrationFix, workspace, false),
             true,
             Some(workspace),
             state,
@@ -3687,7 +3989,7 @@ impl ExternalPort for HeadlessExternalPort {
             return Ok(CiFixPreparationOutcome::SandboxDowngraded { scope });
         }
         let invocation = self.invoke_codex(
-            self.task_prompt("integration", LeafKind::CiFix, workspace),
+            self.task_prompt("integration", LeafKind::CiFix, workspace, false),
             workspace,
             state,
             None,
@@ -3735,7 +4037,7 @@ impl ExternalPort for HeadlessExternalPort {
         state: &ProcessorState,
     ) -> Result<LeafOutcome, Self::Error> {
         let invocation = self.invoke_claude(
-            self.task_prompt("integration", LeafKind::CiFix, workspace),
+            self.task_prompt("integration", LeafKind::CiFix, workspace, false),
             true,
             Some(workspace),
             state,
@@ -3790,6 +4092,71 @@ impl ExternalPort for HeadlessExternalPort {
 }
 
 impl HeadlessExternalPort {
+    /// Fold every joined worker's handover into this port, then surface the first failure.
+    ///
+    /// What is merged unconditionally and what is not is the whole contract here.
+    ///
+    /// Conversation coordinates are merged for EVERY worker — the one that failed, and every
+    /// sibling of the one that failed — because a failing turn's staged coordinate is an
+    /// invalidation, and the driver persists exactly those before letting the adapter's error
+    /// stand ([`crate::execution`]'s `forget_staged_leaf_sessions`). Dropping them would leave the
+    /// durable coordinate of a conversation the engine has just refused, and the retry of the
+    /// still-pending effect would resume it into the same refusal: a hard loop where a stateless
+    /// call used to start over. The asymmetry that keeps an unconfirmed observation out of the
+    /// checkpoint is not duplicated here — this only refills the staging map that the driver
+    /// drains for every effect of the batch, and that driver publishes nothing but invalidations
+    /// from a turn that failed.
+    ///
+    /// Commit evidence is the opposite case and stays conditional: it is a claim about a mutation
+    /// whose effect the failed turn never acknowledged, so it must not outlive the turn that would
+    /// have consumed it, and its duplicate check must not fire on a retry that legitimately
+    /// re-runs the leaf.
+    fn merge_task_workers(
+        &mut self,
+        handovers: Vec<TaskWorkerHandover>,
+    ) -> Result<Vec<TaskEffectResult>, HeadlessError> {
+        let mut results = Vec::with_capacity(handovers.len());
+        let mut completed_evidence = Vec::with_capacity(handovers.len());
+        let mut failure: Option<HeadlessError> = None;
+        for handover in handovers {
+            // Each worker observed its own task's conversation; without this merge the driver
+            // would never see it and every fanned-out cycle would silently re-seed. Unlike commit
+            // evidence, an already-present entry is overwritten rather than rejected: this map is
+            // a latest-observation cache, so a coordinate left behind by a held round is simply
+            // superseded by the newer call's, and the worst case of getting it wrong is one
+            // re-seeded call.
+            for (task_id, update) in handover.sessions {
+                self.leaf_sessions.insert(task_id, update);
+            }
+            match handover.result {
+                Ok(result) => {
+                    completed_evidence.push(handover.evidence);
+                    results.push(result);
+                }
+                // Keep the first failure in request order, so which error a batch reports never
+                // depends on which worker happened to finish first.
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        for evidence in completed_evidence {
+            for (task_id, paths) in evidence {
+                if self.task_evidence.insert(task_id.clone(), paths).is_some() {
+                    return Err(HeadlessError::InvalidState(format!(
+                        "concurrent task batch produced duplicate commit evidence for {task_id}"
+                    )));
+                }
+            }
+        }
+        Ok(results)
+    }
+
     fn invoke_codex_read_only(
         &self,
         prompt: String,
@@ -3837,6 +4204,7 @@ impl HeadlessExternalPort {
             review_artifact_binding: None,
             replay_result: None,
             replay_attempt_number: None,
+            session_id: parsed.session_id,
         })
     }
 }
@@ -4605,11 +4973,559 @@ mod tests {
             crate::config::EngineConfig::default().codex,
         ))
         .unwrap();
-        let task = port.task_prompt("T-1", LeafKind::Implement, &root);
+        let task = port.task_prompt("T-1", LeafKind::Implement, &root, false);
         assert!(task.contains("strictly higher risk"));
         assert!(task.contains("риск=low|medium|high"));
-        let integration = port.task_prompt("integration", LeafKind::IntegrationFix, &root);
+        let integration = port.task_prompt("integration", LeafKind::IntegrationFix, &root, false);
         assert!(!integration.contains("strictly higher risk"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Root + `.work` + a provider home, wired into a port whose probe reads that home.
+    fn session_fixture(label: &str) -> (PathBuf, PathBuf, HeadlessExternalPort) {
+        let root = std::env::temp_dir().join(format!(
+            "orchestrail-headless-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let work = root.join(".work");
+        let home = root.join("home");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let mut config =
+            HeadlessConfig::new(&work, &root, crate::config::EngineConfig::default().codex);
+        config.session_probe = SessionProbe::from_home(&home);
+        let port = HeadlessExternalPort::new(config).unwrap();
+        (root, home, port)
+    }
+
+    fn write_claude_transcript(home: &Path, cwd: &Path, id: &str) {
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::claude_project_slug(cwd));
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join(format!("{id}.jsonl")), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn a_repeat_leaf_call_continues_its_own_proven_conversation() {
+        let (root, home, port) = session_fixture("session-resume");
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(coder, id)]));
+        write_claude_transcript(&home, &root, id);
+
+        let resume = port
+            .resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Claude,
+                SessionLineage::Coder,
+                &root,
+            )
+            .expect("a durable coordinate with a live transcript resumes");
+        assert_eq!(resume, id);
+        let spec = port
+            .claude_spawn_spec(
+                port.task_prompt("T-1", LeafKind::Fix, &root, true),
+                true,
+                Some(&root),
+                &state,
+                Some(resume),
+            )
+            .unwrap();
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|w| w[0] == "--resume" && w[1] == id),
+            "the proven conversation is continued: {:?}",
+            spec.args
+        );
+        // The continuation still carries every limit and the exact machine-readable tail contract,
+        // and still orders a re-read of the artifacts that changed while it was not running.
+        let prompt = port.task_prompt("T-1", LeafKind::Fix, &root, true);
+        assert!(prompt.contains("continuing your own earlier session"));
+        assert!(prompt.contains("CHANGED since your last turn"));
+        assert!(prompt.contains("ИТОГ: готово · режим=1|2|3"));
+        assert!(prompt.contains("Изменённые файлы:"));
+        assert!(prompt.contains("Do not commit, alter queue/cohort/integration state"));
+        assert!(prompt.contains("риск=low|medium|high"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_missing_or_expired_conversation_falls_back_to_a_full_seed() {
+        let (root, home, port) = session_fixture("session-fallback");
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+
+        // 1. No durable coordinate at all (the very first call, or an old checkpoint).
+        state.tasks.insert("T-1".into(), task_with_sessions(&[]));
+        assert_eq!(
+            port.resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Claude,
+                SessionLineage::Coder,
+                &root
+            ),
+            None
+        );
+
+        // 2. A durable coordinate whose transcript is gone: an expired session must not be
+        //    resumed on faith, because `claude --resume` fails on an unknown id.
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(coder, id)]));
+        assert_eq!(
+            port.resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Claude,
+                SessionLineage::Coder,
+                &root
+            ),
+            None
+        );
+
+        // 3. The transcript exists, but for a DIFFERENT working directory: Claude files a
+        //    conversation per cwd, so this one cannot be continued from here either.
+        write_claude_transcript(&home, Path::new("/elsewhere"), id);
+        assert_eq!(
+            port.resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Claude,
+                SessionLineage::Coder,
+                &root
+            ),
+            None
+        );
+
+        let spec = port
+            .claude_spawn_spec(
+                port.task_prompt("T-1", LeafKind::Fix, &root, false),
+                true,
+                Some(&root),
+                &state,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !spec.args.iter().any(|arg| arg == "--resume"),
+            "the fallback is exactly the previous full-context call: {:?}",
+            spec.args
+        );
+        let prompt = port.task_prompt("T-1", LeafKind::Fix, &root, false);
+        assert!(prompt.contains("You are a contained implementation leaf."));
+        assert!(prompt.contains("Read the descriptor and applicable review artifact first."));
+        assert!(prompt.contains("ИТОГ: готово · режим=1|2|3"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reviewer_never_inherits_the_makers_conversation() {
+        let (root, home, port) = session_fixture("session-lineage");
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(coder, id)]));
+        write_claude_transcript(&home, &root, id);
+        // The maker's conversation is live and would resume, but the reviewer lineage has none of
+        // its own — an independent reviewer must never be handed the author's context.
+        assert!(
+            port.resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Claude,
+                SessionLineage::Coder,
+                &root
+            )
+            .is_some()
+        );
+        assert_eq!(
+            port.resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Claude,
+                SessionLineage::Reviewer,
+                &root
+            ),
+            None
+        );
+        // Providers do not share an id space either.
+        assert_eq!(
+            port.resumable_session(
+                &state,
+                "T-1",
+                SessionProvider::Codex,
+                SessionLineage::Coder,
+                &root
+            ),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_resumed_call_forgets_its_coordinate_so_the_next_attempt_reseeds() {
+        let (root, _home, mut port) = session_fixture("session-invalidate");
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+
+        // A call whose result was usable publishes the conversation it reported.
+        let mut healthy = invocation_with_usage(10);
+        healthy.session_id = Some("11111111-2222-3333-4444-555555555555".into());
+        port.note_leaf_session("T-1", coder, &healthy, false, true);
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: coder,
+                id: "11111111-2222-3333-4444-555555555555".into()
+            })
+        );
+        assert_eq!(port.take_leaf_session("T-1"), None, "the drain is one-shot");
+
+        // A RESUMED call that came back unusable forgets the coordinate, so a provider that
+        // cannot resume costs one call per lineage rather than a repeating failure.
+        let mut crashed = invocation_with_usage(10);
+        crashed.verdict.reason = Reason::Crash;
+        crashed.session_id = Some("11111111-2222-3333-4444-555555555555".into());
+        port.note_leaf_session("T-1", coder, &crashed, true, false);
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder })
+        );
+
+        // The decisive case for a resumed conversation: the child exited zero and reported its
+        // id, but the engine could not accept the result. Process health would call this healthy
+        // and keep continuing the same conversation into the same answer; usability forgets it.
+        port.note_leaf_session("T-1", coder, &healthy, true, false);
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder }),
+            "an exit-zero call whose result is unusable must not be continued"
+        );
+
+        // The same failure on a call that did NOT resume changes nothing: there is no coordinate
+        // of its own to forget, and a half-written conversation is not published.
+        port.note_leaf_session("T-1", coder, &crashed, false, false);
+        assert_eq!(port.take_leaf_session("T-1"), None);
+        port.note_leaf_session("T-1", coder, &healthy, false, false);
+        assert_eq!(port.take_leaf_session("T-1"), None);
+
+        // A provider id that could escape its transcript directory is never published.
+        let mut hostile = invocation_with_usage(10);
+        hostile.session_id = Some("../../escape".into());
+        port.note_leaf_session("T-1", coder, &hostile, false, true);
+        assert_eq!(port.take_leaf_session("T-1"), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A port whose work tree can carry evidence, telemetry, and one task's review artifact.
+    fn outcome_fixture(label: &str) -> (PathBuf, PathBuf, HeadlessExternalPort) {
+        let (root, _home, port) = session_fixture(label);
+        let work = root.join(".work");
+        let task_dir = work.join("tasks").join("T-1");
+        fs::create_dir_all(work.join("native-evidence")).unwrap();
+        fs::create_dir_all(&task_dir).unwrap();
+        (root, task_dir, port)
+    }
+
+    /// The exact `review.md` an engine review-cycle gate writes before a reviewer is dispatched:
+    /// an open finding, and deliberately no reviewer verdict line.
+    const ENGINE_AUTHORED_REVIEW: &str =
+        "### [R-01] Проверка сборки/линта на цикле ревью не прошла — статус: новая\n";
+
+    #[test]
+    fn a_resumed_reviewer_that_reported_nothing_new_forgets_its_conversation() {
+        let (root, task_dir, mut port) = outcome_fixture("session-review-unusable");
+        let reviewer_key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(reviewer_key, id)]));
+        let prepared = |port: &HeadlessExternalPort, resumed: bool| ClaudeTaskReview {
+            reviewer: "reviewer",
+            since: "2026-07-25T12:00:00Z".into(),
+            head: "head".into(),
+            attempt: 1,
+            resumed,
+            spec: None,
+            artifact_before: port.review_artifact_digest("T-1").unwrap(),
+        };
+        let reported = |id: &str| {
+            let mut invocation = invocation_with_usage(1);
+            invocation.session_id = Some(id.to_owned());
+            invocation
+        };
+
+        // The failure mode resuming itself creates: the reviewer exits zero (`Reason::Ok`) and
+        // reports its conversation id, but leaves `review.md` byte-for-byte as it found it —
+        // most plausibly because the continued conversation remembers writing it last round.
+        fs::write(task_dir.join("review.md"), ENGINE_AUTHORED_REVIEW).unwrap();
+        let review = prepared(&port, true);
+        assert_eq!(
+            port.finish_task_review("T-1", review, &state, reported(id))
+                .unwrap(),
+            ReviewOutcome::Incomplete
+        );
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: reviewer_key }),
+            "an exit-zero round that produced no report must not be continued into repeating it"
+        );
+
+        // A round that did produce a report is unaffected: its conversation is published exactly
+        // as before, which is what makes the invalidation above a bounded fallback rather than a
+        // disabling of resume.
+        let review = prepared(&port, true);
+        fs::write(
+            task_dir.join("review.md"),
+            "### [R-01] Проверка сборки/линта на цикле ревью не прошла — статус: новая\n### [SUMMARY-R-2099-01-01T00:00:00Z] Итог ревью задачи — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            port.finish_task_review("T-1", review, &state, reported(id))
+                .unwrap(),
+            ReviewOutcome::Findings { .. }
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: reviewer_key,
+                id: id.into()
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resumed_leaf_whose_report_is_unusable_forgets_its_conversation() {
+        let (root, _task_dir, mut port) = outcome_fixture("session-leaf-unusable");
+        let coder_key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(coder_key, id)]));
+        let reported = |report: &str| {
+            let mut invocation = invocation_with_usage(1);
+            invocation.session_id = Some(id.to_owned());
+            invocation.report = report.to_owned();
+            invocation
+        };
+
+        // An escalating leaf exits zero and keeps its conversation id, so process health calls it
+        // healthy. Its answer is a stable property of that conversation: continuing it spends the
+        // remaining fix attempts re-deriving the same escalation.
+        let escalated =
+            reported("blocked by a missing contract\nИТОГ: эскалация · причина=blocked");
+        assert!(matches!(
+            port.finish_task_leaf("T-1", LeafKind::Fix, &state, escalated, true)
+                .unwrap(),
+            LeafOutcome::Escalated { .. }
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder_key })
+        );
+
+        // A report that claims completion without its mandatory changed-path evidence is a
+        // protocol failure that aborts the turn. The coordinate is still forgotten here, and the
+        // driver persists that forget before surfacing the error, so the pending effect's retry
+        // re-seeds rather than resuming the conversation that produced the omission.
+        let no_evidence = reported("all done\nИТОГ: готово · режим=2");
+        assert!(matches!(
+            port.finish_task_leaf("T-1", LeafKind::Fix, &state, no_evidence, true),
+            Err(HeadlessError::Protocol(_))
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder_key })
+        );
+
+        // The usable round still publishes its conversation.
+        let completed = reported("Изменённые файлы: engine/src/lib.rs\nИТОГ: готово · режим=2");
+        assert!(matches!(
+            port.finish_task_leaf("T-1", LeafKind::Fix, &state, completed, true)
+                .unwrap(),
+            LeafOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: coder_key,
+                id: id.into()
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_fanned_out_batch_hands_back_every_forget_even_when_a_worker_fails() {
+        let (root, _home, mut port) = session_fixture("session-fanout-handover");
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let reviewer = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Reviewer);
+        let evidence = |path: &str| CommitEvidence {
+            paths: vec![PathBuf::from(path)],
+        };
+
+        // The mixed round that used to lose its bookkeeping. Worker T-1 resumed a leaf whose
+        // report claimed completion without its mandatory changed-path evidence: it staged the
+        // forget and then returned the protocol error that aborts the whole turn. Worker T-2 ran
+        // to completion and staged a forget of its own (a resumed reviewer that reported nothing
+        // new). Handing both back is what lets the driver persist them.
+        let handovers = vec![
+            TaskWorkerHandover {
+                result: Err(HeadlessError::Protocol(
+                    "leaf report omitted its changed files".into(),
+                )),
+                evidence: BTreeMap::from([("T-1".to_string(), evidence("engine/src/a.rs"))]),
+                sessions: BTreeMap::from([(
+                    "T-1".to_string(),
+                    LeafSessionUpdate::Invalidated { key: coder },
+                )]),
+            },
+            TaskWorkerHandover {
+                result: Ok(TaskEffectResult::Review {
+                    outcome: ReviewOutcome::Incomplete,
+                }),
+                evidence: BTreeMap::from([("T-2".to_string(), evidence("engine/src/b.rs"))]),
+                sessions: BTreeMap::from([(
+                    "T-2".to_string(),
+                    LeafSessionUpdate::Invalidated { key: reviewer },
+                )]),
+            },
+        ];
+        assert!(matches!(
+            port.merge_task_workers(handovers),
+            Err(HeadlessError::Protocol(_)),
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder }),
+            "the failing worker's own forget is what keeps its retry from resuming that conversation"
+        );
+        assert_eq!(
+            port.take_leaf_session("T-2"),
+            Some(LeafSessionUpdate::Invalidated { key: reviewer }),
+            "a sibling's failure must not discard a healthy worker's forget"
+        );
+        // Evidence is the deliberate exception: it describes a mutation this turn never
+        // acknowledged, and the retry that re-runs the leaf produces it again.
+        assert!(port.task_evidence.is_empty());
+
+        // A round where every worker succeeded is unchanged: results keep request order, evidence
+        // is merged, and an observed conversation is published for the driver as before.
+        let id = "11111111-2222-3333-4444-555555555555";
+        let completed = vec![
+            TaskWorkerHandover {
+                result: Ok(TaskEffectResult::Leaf {
+                    outcome: LeafOutcome::Completed { author: None },
+                }),
+                evidence: BTreeMap::from([("T-1".to_string(), evidence("engine/src/a.rs"))]),
+                sessions: BTreeMap::from([(
+                    "T-1".to_string(),
+                    LeafSessionUpdate::Observed {
+                        key: coder,
+                        id: id.into(),
+                    },
+                )]),
+            },
+            TaskWorkerHandover {
+                result: Ok(TaskEffectResult::Review {
+                    outcome: ReviewOutcome::Incomplete,
+                }),
+                evidence: BTreeMap::from([("T-2".to_string(), evidence("engine/src/b.rs"))]),
+                sessions: BTreeMap::new(),
+            },
+        ];
+        let results = port.merge_task_workers(completed).unwrap();
+        assert!(matches!(
+            results.as_slice(),
+            [
+                TaskEffectResult::Leaf { .. },
+                TaskEffectResult::Review { .. }
+            ]
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: coder,
+                id: id.into()
+            })
+        );
+        assert_eq!(port.task_evidence["T-1"], evidence("engine/src/a.rs"));
+        assert_eq!(port.task_evidence["T-2"], evidence("engine/src/b.rs"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_continued_leaf_is_told_the_working_tree_may_have_moved_under_it() {
+        let (root, _home, port) = session_fixture("session-continuation-framing");
+        let resumed = port.task_prompt("T-1", LeafKind::Fix, &root, true);
+        // A route change hands the same lineage to the other provider, so "the code is as I left
+        // it" is not a safe default for a continued conversation.
+        assert!(resumed.contains("working tree may have been changed by someone other than you"));
+        assert!(resumed.contains("every file you are about to touch"));
+        assert!(resumed.contains("current on-disk contents"));
+        // The fresh seed is unchanged: it has no recollection to distrust.
+        let fresh = port.task_prompt("T-1", LeafKind::Fix, &root, false);
+        assert!(!fresh.contains("working tree may have been changed"));
+        assert!(fresh.contains("You are a contained implementation leaf."));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_a_codex_route_whose_sandbox_resume_can_express_continues_a_conversation() {
+        let (root, home, mut port) = session_fixture("session-codex-sandbox");
+        let key = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Coder);
+        let id = "019f054f-5e70-7d42-8586-ee66e3ac1d1e";
+        let day = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("30");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join(format!("rollout-2026-07-30T10-00-00-{id}.jsonl")),
+            "{}\n",
+        )
+        .unwrap();
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(key, id)]));
+
+        // The conversation is provably live for the probe.
+        assert!(
+            port.config
+                .session_probe
+                .is_live(SessionProvider::Codex, &root, id)
+        );
+        port.config.codex.sandbox = Sandbox::WorkspaceWrite;
+        assert_eq!(
+            port.codex_resumable_session(&state, "T-1", SessionLineage::Coder, &root)
+                .as_deref(),
+            Some(id)
+        );
+        // A read-only route keeps its exact previous full-seed behaviour: `codex exec resume`
+        // cannot express that route's writable-cache exception, and resuming under a quietly
+        // different sandbox is not an acceptable trade for a saved re-seed.
+        port.config.codex.sandbox = Sandbox::ReadOnly;
+        assert_eq!(
+            port.codex_resumable_session(&state, "T-1", SessionLineage::Coder, &root),
+            None
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4638,6 +5554,7 @@ mod tests {
                 previous_review: None,
                 attempt: 1,
             },
+            false,
         );
         assert!(prompt.contains("Риск-повышен: low|medium|high — <specific reason>"));
         assert!(prompt.contains("never lower or repeat the marker"));
@@ -4669,6 +5586,33 @@ mod tests {
         }
     }
 
+    /// A task that already carries the durable coordinates a repeat leaf call needs.
+    fn task_with_sessions(sessions: &[(LeafSessionKey, &str)]) -> crate::processor::TaskRuntime {
+        crate::processor::TaskRuntime {
+            id: "T-1".into(),
+            conflict_domain: "engine/**".into(),
+            level: Some(Level::Coder),
+            risk: None,
+            wave: 1,
+            phase: crate::processor::TaskPhase::Fixing,
+            leaf_attempts: BTreeMap::from([
+                (LeafKind::Fix.as_str().into(), 1),
+                (LeafKind::Review.as_str().into(), 1),
+            ]),
+            review_cycles: 1,
+            review_signatures: Vec::new(),
+            implementation_author: Some("coder".into()),
+            previous_review_sha: None,
+            review_sha: Some("head".into()),
+            reason: None,
+            imported_recovery_intent: None,
+            leaf_sessions: sessions
+                .iter()
+                .map(|(key, id)| (key.as_durable_key(), (*id).to_owned()))
+                .collect(),
+        }
+    }
+
     fn invocation_with_usage(total_tokens: u64) -> Invocation {
         Invocation {
             verdict: Verdict {
@@ -4690,6 +5634,7 @@ mod tests {
             review_artifact_binding: None,
             replay_result: None,
             replay_attempt_number: None,
+            session_id: None,
         }
     }
 
@@ -4957,6 +5902,7 @@ mod tests {
                 review_sha: None,
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
         let effects = vec![ExternalTaskEffect {
@@ -5353,6 +6299,7 @@ mod tests {
                 review_sha: Some("head".into()),
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
         let coordinates = CodexAttemptCoordinates {
@@ -5397,6 +6344,7 @@ mod tests {
             review_artifact_binding: None,
             replay_result: None,
             replay_attempt_number: None,
+            session_id: None,
         };
         fs::create_dir_all(work.join("native-evidence")).unwrap();
         fs::write(
@@ -5635,6 +6583,7 @@ mod tests {
             review_artifact_binding: None,
             replay_result: None,
             replay_attempt_number: None,
+            session_id: None,
         };
         port.finish_codex_attempt(
             &state,
@@ -5713,6 +6662,7 @@ mod tests {
             review_artifact_binding: None,
             replay_result: None,
             replay_attempt_number: None,
+            session_id: None,
         };
         assert!(
             port.finish_codex_attempt(
@@ -5842,6 +6792,7 @@ mod tests {
                 review_sha: Some("head".into()),
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
         let coordinates = CodexAttemptCoordinates {
@@ -5879,6 +6830,7 @@ mod tests {
             )),
             replay_result: None,
             replay_attempt_number: None,
+            session_id: None,
         };
         port.finish_codex_attempt(
             &state,
@@ -5922,7 +6874,7 @@ mod tests {
         let task_dir = work.join("tasks/T-014");
         fs::create_dir_all(work.join("native-evidence")).unwrap();
         fs::create_dir_all(&task_dir).unwrap();
-        let port = HeadlessExternalPort::new(HeadlessConfig::new(
+        let mut port = HeadlessExternalPort::new(HeadlessConfig::new(
             &work,
             &root,
             crate::config::EngineConfig::default().codex,
@@ -5946,6 +6898,7 @@ mod tests {
                 review_sha: Some("head".into()),
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
         // What the engine's review-cycle gate writes before the reviewer is dispatched. It has no
@@ -5957,6 +6910,7 @@ mod tests {
             since: "2026-07-25T12:00:00Z".into(),
             head: "head".into(),
             attempt: 1,
+            resumed: false,
             spec: None,
             artifact_before: port.review_artifact_digest("T-014").unwrap(),
         };
