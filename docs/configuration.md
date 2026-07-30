@@ -318,3 +318,27 @@ passed to the watcher and must be green before cleanup can archive the cohort.
 With no required names, `CI_WATCH` uses best-effort repository CI discovery.
 `CI_WATCH: false` or a local-only publication disables the watcher even when
 policy names are present.
+
+### Size change thresholds
+
+The constraints template includes a `## Пороги размера изменений` section for
+describing change-size thresholds.
+
+**Current implementation divergence:** the engine does not recognize this
+heading, so it does not parse or enforce any bullets in the section. The
+thresholds remain guidelines for planning and review roles only; they do not
+create an engine gate or automatically change task handling.
+
+### Mandatory human-review categories
+
+The constraints template includes a
+`## Категории обязательного human review` section for identifying changes that
+should receive human review.
+
+**Current implementation divergence:** the engine does not recognize this
+heading, so the listed categories are informational human guidelines rather
+than enforced policy. They do not generate approval requests. The only
+implemented human publication gate from `.work/constraints.md` is the active
+`Публикация (push): требует ручного подтверждения` rule under
+`## Push/merge policy`; as described above, that gate applies only to an actual
+remote push.
