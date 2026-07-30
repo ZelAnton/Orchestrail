@@ -592,6 +592,7 @@ pub fn import_closed_ready_cohort(
                 review_sha,
                 reason,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
     }
@@ -982,6 +983,7 @@ pub fn import_active_cohort(
                 review_sha,
                 reason: None,
                 imported_recovery_intent,
+                leaf_sessions: BTreeMap::new(),
             },
         );
     }

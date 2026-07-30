@@ -7,6 +7,7 @@
 //! treating an I/O failure as idle. Nothing here writes, locks, or emits. Presentation is a compact
 //! JSON line (`--json`, hand-built like `events::Event::to_json_line`) or a human-readable summary.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,98 @@ pub struct Snapshot {
     pub cohort: Option<CohortState>,
     pub integration: IntegrationSnapshot,
     pub batch: Option<BatchState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotInputStamp {
+    work: PathBuf,
+    queue: Option<work_fs::PlainFileStamp>,
+    cohort: Option<work_fs::PlainFileStamp>,
+    integration: Option<work_fs::PlainFileStamp>,
+    batch: Option<work_fs::PlainFileStamp>,
+    descriptors: Vec<(OsString, Option<work_fs::PlainFileStamp>)>,
+}
+
+/// Metadata-invalidated cache for passive observers that poll the same control-plane snapshot.
+///
+/// Every probe and reload uses [`crate::work_fs`], so cache hits do not weaken confinement or
+/// size limits. Only successfully loaded snapshots are cached; any error (metadata or read) clears
+/// the cache while preserving [`Snapshot::load`]'s existing best-effort return behavior.
+#[derive(Debug, Default)]
+pub struct SnapshotCache {
+    cached: Option<(SnapshotInputStamp, Snapshot)>,
+}
+
+impl SnapshotCache {
+    /// Load the current snapshot, reusing the parsed value while all source metadata is unchanged.
+    pub fn load(&mut self, work_dir: impl AsRef<Path>) -> Snapshot {
+        let work = work_dir.as_ref();
+        let before = match snapshot_input_stamp(work) {
+            Ok(stamp) => stamp,
+            Err(_) => {
+                self.cached = None;
+                return Snapshot::load(work);
+            }
+        };
+        if let Some((cached_stamp, snapshot)) = &self.cached
+            && cached_stamp == &before
+        {
+            return snapshot.clone();
+        }
+
+        let snapshot = match Snapshot::try_load(work) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                self.cached = None;
+                return Snapshot::empty(work);
+            }
+        };
+        match snapshot_input_stamp(work) {
+            Ok(after) if after == before => {
+                self.cached = Some((after, snapshot.clone()));
+            }
+            _ => self.cached = None,
+        }
+        snapshot
+    }
+
+    /// Force the next [`load`](Self::load) to re-read and parse all snapshot sources.
+    pub fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}
+
+fn snapshot_input_stamp(work: &Path) -> io::Result<SnapshotInputStamp> {
+    let stamp =
+        |name: &str| work_fs::optional_plain_file_stamp(work, &work.join(name), MAX_CONTROL_BYTES);
+    let tasks = work.join("tasks");
+    let mut descriptors = Vec::new();
+    if let Some(entries) = work_fs::plain_directory_entries(work, &tasks)? {
+        for entry in entries {
+            let path = entry.path();
+            match work_fs::require_plain_directory(&path) {
+                Ok(()) => {}
+                Err(_) if entry.file_type().is_ok_and(|kind| !kind.is_dir()) => continue,
+                Err(error) => return Err(error),
+            }
+            let name = entry.file_name();
+            let task_md = path.join("task.md");
+            descriptors.push((
+                name,
+                work_fs::optional_plain_file_stamp(work, &task_md, MAX_CONTROL_BYTES)?,
+            ));
+        }
+        descriptors.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+
+    Ok(SnapshotInputStamp {
+        work: work.to_path_buf(),
+        queue: stamp("Tasks_Queue.md")?,
+        cohort: stamp("cohort_state.md")?,
+        integration: stamp("integration_state.md")?,
+        batch: stamp("batch.md")?,
+        descriptors,
+    })
 }
 
 impl Snapshot {
@@ -375,5 +468,71 @@ mod tests {
         assert!(human.contains("Integration: in-progress"));
         assert!(human.contains("admission=open"));
         assert!(human.contains("T-102"));
+    }
+
+    #[test]
+    fn snapshot_cache_reuses_unchanged_inputs_and_observes_metadata_changes() {
+        let w = TmpWork::new();
+        w.write(
+            "Tasks_Queue.md",
+            "### [T-102] First title — статус: в работе\n",
+        );
+        w.write("tasks/T-102/task.md", "# T-102\nСтатус: в работе\n");
+        let mut cache = SnapshotCache::default();
+
+        let first = cache.load(&w.dir);
+        let first_stamp = cache
+            .cached
+            .as_ref()
+            .expect("stable initial load is cached")
+            .0
+            .clone();
+        let unchanged = cache.load(&w.dir);
+        assert_eq!(unchanged, first);
+        assert_eq!(
+            cache.cached.as_ref().expect("cache remains populated").0,
+            first_stamp,
+            "unchanged metadata must retain the same cache key"
+        );
+
+        w.write(
+            "Tasks_Queue.md",
+            "### [T-102] A longer changed title — статус: на ревью\n",
+        );
+        let changed = cache.load(&w.dir);
+        assert_ne!(changed.queue, first.queue);
+        assert_eq!(changed.queue[0].title, "A longer changed title");
+        assert_ne!(
+            cache.cached.as_ref().expect("changed load is recached").0,
+            first_stamp,
+            "changed length/mtime must invalidate the snapshot parse"
+        );
+    }
+
+    #[test]
+    fn snapshot_cache_retries_after_a_read_error() {
+        let w = TmpWork::new();
+        fs::write(w.dir.join("Tasks_Queue.md"), [0xff])
+            .expect("write invalid UTF-8 queue artifact");
+        let mut cache = SnapshotCache::default();
+
+        let degraded = cache.load(&w.dir);
+        assert!(degraded.queue.is_empty());
+        assert!(
+            cache.cached.is_none(),
+            "a degraded snapshot must not be cached"
+        );
+
+        w.write(
+            "Tasks_Queue.md",
+            "### [T-102] Recovered title — статус: в работе\n",
+        );
+        let recovered = cache.load(&w.dir);
+        assert_eq!(recovered.queue.len(), 1);
+        assert_eq!(recovered.queue[0].title, "Recovered title");
+        assert!(
+            cache.cached.is_some(),
+            "the successful retry should be cached"
+        );
     }
 }

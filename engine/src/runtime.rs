@@ -21,6 +21,7 @@ use crate::processor::{
     VerificationOutcome,
 };
 use crate::recovery::bind_legacy_safety_snapshot;
+use crate::session::LeafSessionUpdate;
 use crate::telemetry::{
     OperationCompleted, OperationExecutorKind, OperationOutcome, OperationScope,
 };
@@ -422,6 +423,23 @@ impl ProcessorRuntime {
             ))
         })?;
         self.complete_effect(&key)
+    }
+
+    /// Persist one task's orthogonal provider conversation coordinate.
+    ///
+    /// It intentionally leaves the pending-effect ledger untouched, so it may be written while the
+    /// leaf effect that observed it is still outstanding: the coordinate acknowledges nothing and
+    /// no reducer decision reads it. Recording it *before* the acknowledging command also keeps it
+    /// out of that command's projected transition, which compares the state around one exact
+    /// decision. A crash between the two writes costs at most one re-seeded call.
+    pub fn record_leaf_session(&mut self, task_id: &str, update: &LeafSessionUpdate) -> Result<()> {
+        // Mutate a copy and adopt it only after the checkpoint is durable, exactly like the
+        // command path: an in-memory coordinate must never outlive a failed write.
+        let mut processor = self.processor.clone();
+        processor.record_leaf_session(task_id, update)?;
+        self.persist(&processor, &self.pending, &self.ci_fix_provider_span)?;
+        self.processor = processor;
+        Ok(())
     }
 
     /// Replace the temporary Phase-0 workspace reconciliation for one task with the exact
@@ -1290,6 +1308,7 @@ mod tests {
                     review_sha: Some("reviewed".into()),
                     reason: None,
                     imported_recovery_intent: None,
+                    leaf_sessions: BTreeMap::new(),
                 },
             )]),
             integration: IntegrationRuntime::default(),
@@ -1321,6 +1340,7 @@ mod tests {
                 review_sha: Some("reviewed".into()),
                 reason: Some("merge conflict".into()),
                 imported_recovery_intent: Some(ImportedRecoveryIntent::ReturnConflictToQueue),
+                leaf_sessions: BTreeMap::new(),
             },
         );
         state

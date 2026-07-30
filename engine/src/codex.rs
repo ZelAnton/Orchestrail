@@ -62,6 +62,8 @@ pub struct CodexCall {
     pub network: bool,
     /// Emit Codex's JSONL event stream, including `turn.completed.usage`.
     pub emit_json: bool,
+    /// Continue an existing conversation through `codex exec resume <id>` (see [`Self::resume`]).
+    resume: Option<String>,
 }
 
 impl CodexCall {
@@ -74,12 +76,41 @@ impl CodexCall {
             skip_git_repo_check: false,
             network: false,
             emit_json: false,
+            resume: None,
         }
+    }
+
+    /// Request continuation of an existing Codex conversation, reporting whether the call will
+    /// actually resume.
+    ///
+    /// The `exec resume` SUBCOMMAND accepts neither `--sandbox`, nor `-C/--cd`, nor `--add-dir`
+    /// (only `-c key=value` overrides), so the fail-closed shape has to be re-expressed:
+    /// `sandbox_mode` and `approval_policy` become pinned config overrides and the workspace root
+    /// stays the child's own working directory, which the caller already sets to the worktree.
+    /// The read-only writable-cache exception (`--add-dir <worktree>/.work/codex-cache`) has NO
+    /// config equivalent that is valid outside workspace-write, so a read-only call deliberately
+    /// REFUSES to resume rather than silently dropping part of its sandbox contract (T-069,
+    /// T-279/K-054). The caller must honour the returned flag when it decides whether to send a
+    /// short continuation or a full seed prompt.
+    pub fn resume(&mut self, session_id: impl Into<String>) -> bool {
+        if !matches!(self.sandbox, Sandbox::WorkspaceWrite) {
+            return false;
+        }
+        self.resume = Some(session_id.into());
+        true
+    }
+
+    /// The conversation this call continues, if any.
+    pub fn resumed_session(&self) -> Option<&str> {
+        self.resume.as_deref()
     }
 
     /// Build the argv for `codex` (program name prepended by the caller). The prompt is
     /// delivered on stdin (trailing `-`), matching tools/codex-runtime.ps1.
     pub fn to_argv(&self) -> Vec<String> {
+        if let Some(session) = &self.resume {
+            return self.to_resume_argv(session);
+        }
         let mut a: Vec<String> = vec![
             "exec".into(),
             "-C".into(),
@@ -146,6 +177,54 @@ impl CodexCall {
         a.push("-".into());
         a
     }
+
+    /// `codex exec resume <id> ... -`: the same fail-closed posture expressed with the option set
+    /// the resume subcommand actually has.
+    ///
+    /// Divergence from [`Self::to_argv`]'s fresh-call shape is deliberate and forced by the CLI,
+    /// not a relaxation: `--sandbox <mode>` becomes the pinned `-c sandbox_mode=<mode>` override
+    /// (the same key the no-model sandbox probe already uses), `-C <worktree>` becomes the child's
+    /// working directory, which the spawn spec sets to that exact worktree, and
+    /// `-c approval_policy=never` stays a pinned literal. [`Self::resume`] refuses read-only, so
+    /// the missing `--add-dir` cache exception can never be silently dropped here.
+    fn to_resume_argv(&self, session: &str) -> Vec<String> {
+        let mut a: Vec<String> = vec!["exec".into(), "resume".into(), session.into()];
+        a.push("-c".into());
+        a.push(format!("sandbox_mode={}", self.sandbox.as_flag()));
+        if cfg!(target_os = "windows") && matches!(self.sandbox, Sandbox::WorkspaceWrite) {
+            // Same ENV_LIMIT/sandbox-init-worktree collapse to a single `[workdir]` writable root
+            // as the fresh call (T-279/K-054).
+            a.push("-c".into());
+            a.push("sandbox_workspace_write.exclude_slash_tmp=true".into());
+            a.push("-c".into());
+            a.push("sandbox_workspace_write.exclude_tmpdir_env_var=true".into());
+        }
+        a.push("-c".into());
+        a.push("approval_policy=never".into());
+        if self.skip_git_repo_check {
+            a.push("--skip-git-repo-check".into());
+        }
+        if let Some(m) = &self.model {
+            a.push("-m".into());
+            a.push(m.clone());
+        }
+        if self.network {
+            a.push("-c".into());
+            a.push("sandbox_workspace_write.network_access=true".into());
+            a.push("-c".into());
+            a.push(
+                r#"shell_environment_policy.set={GIT_CONFIG_COUNT="1",GIT_CONFIG_KEY_0="http.sslBackend",GIT_CONFIG_VALUE_0="openssl"}"#
+                    .into(),
+            );
+        }
+        a.push("-c".into());
+        a.push(format!("model_reasoning_effort={}", self.reasoning));
+        if self.emit_json {
+            a.push("--json".into());
+        }
+        a.push("-".into());
+        a
+    }
 }
 
 /// Build the no-model `codex sandbox` probe used before the first live Codex route in a native
@@ -177,6 +256,10 @@ pub struct JsonTranscript {
     pub report: Option<String>,
     /// Sum of provider-exact usage blocks. This parser never manufactures an estimate.
     pub usage: Option<crate::telemetry::ProviderUsage>,
+    /// Conversation id announced by `thread.started`, usable with `codex exec resume` on a later
+    /// call of the same leaf lineage. Orthogonal runtime data: a transcript without it simply
+    /// leaves the next call re-seeding full context.
+    pub session_id: Option<String>,
 }
 
 /// Parse Codex JSONL. Unknown additive events are ignored, while only machine-readable provider
@@ -189,11 +272,22 @@ pub fn parse_json_transcript(transcript: &str) -> JsonTranscript {
     let mut cache_creation = 0_u64;
     let mut total = 0_u64;
     let mut saw_usage = false;
+    let mut session_id = None;
 
     for line in transcript.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
+        // `thread.started` names the conversation this call created or continued. Reading the id
+        // from any event carrying one keeps a resumed run correct even if codex renames the
+        // announcing event, and an absent id just means the next call re-seeds.
+        if let Some(thread_id) = value
+            .get("thread_id")
+            .or_else(|| value.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            session_id = Some(thread_id.to_owned());
+        }
         if value.get("type").and_then(serde_json::Value::as_str) == Some("item.completed")
             && value
                 .get("item")
@@ -236,12 +330,14 @@ pub fn parse_json_transcript(transcript: &str) -> JsonTranscript {
             return JsonTranscript {
                 report,
                 usage: None,
+                session_id,
             };
         };
         let Some(next_output) = output.checked_add(parsed.output_tokens.unwrap_or(0)) else {
             return JsonTranscript {
                 report,
                 usage: None,
+                session_id,
             };
         };
         let Some(next_cache_read) =
@@ -250,6 +346,7 @@ pub fn parse_json_transcript(transcript: &str) -> JsonTranscript {
             return JsonTranscript {
                 report,
                 usage: None,
+                session_id,
             };
         };
         let Some(next_cache_creation) =
@@ -258,12 +355,14 @@ pub fn parse_json_transcript(transcript: &str) -> JsonTranscript {
             return JsonTranscript {
                 report,
                 usage: None,
+                session_id,
             };
         };
         let Some(next_total) = total.checked_add(parsed.total_tokens.unwrap_or(0)) else {
             return JsonTranscript {
                 report,
                 usage: None,
+                session_id,
             };
         };
         input = next_input;
@@ -283,6 +382,7 @@ pub fn parse_json_transcript(transcript: &str) -> JsonTranscript {
             cache_creation_input_tokens: Some(cache_creation),
             total_tokens: Some(total),
         }),
+        session_id,
     }
 }
 
@@ -330,6 +430,7 @@ mod tests {
             skip_git_repo_check: true,
             network: false,
             emit_json: false,
+            resume: None,
         };
         let argv = call.to_argv();
         assert_eq!(argv[0], "exec");
@@ -369,6 +470,104 @@ mod tests {
                 .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=medium")
         );
         assert!(!argv.iter().any(|s| s == "--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn resume_keeps_the_fail_closed_posture_with_the_subcommand_option_set() {
+        let mut call = CodexCall::new("/abs/wt", Sandbox::WorkspaceWrite);
+        call.model = Some("gpt-5-codex".into());
+        call.reasoning = "high".into();
+        call.skip_git_repo_check = true;
+        call.emit_json = true;
+        assert!(call.resume("019f054f-5e70-7d42-8586-ee66e3ac1d1e"));
+        assert_eq!(
+            call.resumed_session(),
+            Some("019f054f-5e70-7d42-8586-ee66e3ac1d1e")
+        );
+        let argv = call.to_argv();
+        assert_eq!(
+            &argv[..3],
+            &["exec", "resume", "019f054f-5e70-7d42-8586-ee66e3ac1d1e"]
+        );
+        // `exec resume` has no `--sandbox`/`-C`/`--add-dir`, so the sandbox is pinned through the
+        // config override instead and the workspace root stays the child's working directory.
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--sandbox" || arg == "-C" || arg == "--add-dir"),
+            "the resume subcommand accepts none of these flags: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "sandbox_mode=workspace-write")
+        );
+        // Everything the fail-closed contract pins is still pinned (T-069).
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "approval_policy=never")
+        );
+        assert!(argv.iter().any(|s| s == "--skip-git-repo-check"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-m" && w[1] == "gpt-5-codex")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high")
+        );
+        assert!(argv.iter().any(|s| s == "--json"));
+        assert_eq!(argv.last().map(String::as_str), Some("-"));
+        if cfg!(target_os = "windows") {
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "-c"
+                        && w[1] == "sandbox_workspace_write.exclude_slash_tmp=true")
+            );
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-c"
+                    && w[1] == "sandbox_workspace_write.exclude_tmpdir_env_var=true")
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_call_refuses_to_resume_rather_than_lose_its_cache_exception() {
+        let mut call = CodexCall::new("/abs/wt", Sandbox::ReadOnly);
+        // `exec resume` cannot express `--add-dir <worktree>/.work/codex-cache`, so the call keeps
+        // its exact fresh-seed shape instead of resuming under a quietly different sandbox.
+        assert!(!call.resume("019f054f-5e70-7d42-8586-ee66e3ac1d1e"));
+        assert_eq!(call.resumed_session(), None);
+        let argv = call.to_argv();
+        assert_eq!(argv[0], "exec");
+        assert!(argv.iter().all(|arg| arg != "resume"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--sandbox" && w[1] == "read-only")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1].ends_with(".work/codex-cache"))
+        );
+    }
+
+    #[test]
+    fn json_transcript_reports_the_thread_it_started() {
+        let transcript = concat!(
+            r#"{"type":"thread.started","thread_id":"019f054f-5e70-7d42-8586-ee66e3ac1d1e"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            parse_json_transcript(transcript).session_id.as_deref(),
+            Some("019f054f-5e70-7d42-8586-ee66e3ac1d1e")
+        );
+        // A transcript that never names a thread simply leaves the next call re-seeding.
+        assert_eq!(
+            parse_json_transcript(r#"{"type":"turn.completed","usage":{"input_tokens":1}}"#)
+                .session_id,
+            None
+        );
     }
 
     #[test]

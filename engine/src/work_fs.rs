@@ -10,10 +10,44 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-pub(crate) const MAX_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default ceiling for one authority-bearing control-plane artifact.
+///
+/// The operator TUI reuses this exact ceiling for the same `.work` files instead of maintaining
+/// an independent, weaker read policy.
+pub const MAX_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONTROL_DIRECTORY_ENTRIES: usize = 100_000;
+
+/// Metadata used to invalidate a parsed control-plane artifact without reading it again.
+///
+/// Values are produced only after the work root, parent chain, and final entry have passed the
+/// same anti-symlink/reparse checks as [`read_optional_text`]. The byte ceiling is also enforced
+/// before a stamp is returned, so a cache probe cannot turn an oversized artifact into success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlainFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl PlainFileStamp {
+    /// Current file length in bytes.
+    pub fn len(self) -> u64 {
+        self.len
+    }
+
+    /// Whether the file was empty when stamped.
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Last-modified time when the filesystem exposes it.
+    pub fn modified(self) -> Option<SystemTime> {
+        self.modified
+    }
+}
 
 /// Recognize only the unique same-directory temporary name emitted by [`replace_file`] for one
 /// exact target. Recovery code may ignore such a crash residue without treating arbitrary hidden
@@ -330,6 +364,42 @@ pub fn read_optional_text(work: &Path, path: &Path, max_bytes: u64) -> io::Resul
         .transpose()
 }
 
+/// Return confined metadata for an optional plain file without reading its contents.
+///
+/// This is the cache-invalidation companion to [`read_optional_text`]: absence is `Ok(None)`,
+/// while an oversized artifact, redirected parent/final entry, or metadata error fails loudly.
+pub fn optional_plain_file_stamp(
+    work: &Path,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<Option<PlainFileStamp>> {
+    if !plain_parent_exists(work, path)? {
+        return Ok(None);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    require_plain_file(path, &metadata)?;
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "control-plane artifact exceeds {max_bytes} bytes: {}",
+                path.display()
+            ),
+        ));
+    }
+    let stamp = PlainFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    };
+    assert_plain_parent(work, path)?;
+    require_plain_file(path, &fs::symlink_metadata(path)?)?;
+    Ok(Some(stamp))
+}
+
 pub(crate) fn read_required_bytes(work: &Path, path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     read_optional_bytes(work, path, max_bytes)?.ok_or_else(|| {
         io::Error::new(
@@ -522,7 +592,13 @@ mod tests {
             read_optional_text(&work, &path, 32).unwrap().as_deref(),
             Some("state\n")
         );
+        let stamp = optional_plain_file_stamp(&work, &path, 32)
+            .unwrap()
+            .expect("plain file has a cache stamp");
+        assert_eq!(stamp.len(), 6);
+        assert!(!stamp.is_empty());
         assert!(read_optional_text(&work, &path, 4).is_err());
+        assert!(optional_plain_file_stamp(&work, &path, 4).is_err());
         assert!(replace_file(&work, &path, b"too large", 4).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "state\n");
         let _ = fs::remove_dir_all(work);
@@ -619,6 +695,7 @@ mod tests {
         let file_linked = std::os::unix::fs::symlink(&external_file, &linked_file).is_ok();
         if file_linked {
             assert!(read_optional_text(&work, &linked_file, 32).is_err());
+            assert!(optional_plain_file_stamp(&work, &linked_file, 32).is_err());
             assert!(replace_file(&work, &linked_file, b"changed", 32).is_err());
             assert_eq!(fs::read_to_string(&external_file).unwrap(), "outside\n");
             fs::remove_file(&linked_file).unwrap();
@@ -645,6 +722,7 @@ mod tests {
         if directory_linked {
             let nested = linked_dir.join("outside.md");
             assert!(read_optional_text(&work, &nested, 32).is_err());
+            assert!(optional_plain_file_stamp(&work, &nested, 32).is_err());
             assert!(replace_file(&work, &nested, b"changed", 32).is_err());
             assert_eq!(fs::read_to_string(&external_file).unwrap(), "outside\n");
             #[cfg(windows)]
