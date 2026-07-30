@@ -143,13 +143,19 @@ fn is_documentation_path(path: &Path) -> bool {
         return false;
     };
     let file_name = file_name.to_ascii_lowercase();
-    let stem = file_name
-        .split_once('.')
-        .map_or(file_name.as_str(), |(before, _)| before);
+    if file_name.ends_with(".md") {
+        return true;
+    }
+
+    let (stem, extension) = file_name
+        .rsplit_once('.')
+        .map_or((file_name.as_str(), None), |(stem, extension)| {
+            (stem, Some(extension))
+        });
     matches!(
         stem,
         "readme" | "changelog" | "contributing" | "license" | "agents" | "claude"
-    ) || file_name.ends_with(".md")
+    ) && matches!(extension, None | Some("md" | "txt" | "rst"))
 }
 
 /// JSON shape intentionally shared with legacy `verification.ps1`. The Rust engine does not use
@@ -821,16 +827,25 @@ mod tests {
     #[test]
     fn docs_only_classification_requires_a_nonempty_fully_documentary_typed_range() {
         assert!(is_docs_only(&[
-            PathBuf::from("docs/guide.rs"),
+            PathBuf::from("docs/code.rs"),
             PathBuf::from("README.md"),
             PathBuf::from("Docs/README.MD"),
             PathBuf::from("nested/CHANGELOG"),
+            PathBuf::from("LICENSE"),
+            PathBuf::from("AGENTS"),
+            PathBuf::from("readme.md"),
+            PathBuf::from("changelog.txt"),
+            PathBuf::from("contributing.rst"),
+            PathBuf::from("engine/design-notes.md"),
         ]));
         assert!(!is_docs_only(&[]));
         assert!(!is_docs_only(&[
             PathBuf::from("docs/guide.md"),
             PathBuf::from("engine/src/lib.rs"),
         ]));
+        assert!(!is_docs_only(&[PathBuf::from("claude.rs")]));
+        assert!(!is_docs_only(&[PathBuf::from("agents.rs")]));
+        assert!(!is_docs_only(&[PathBuf::from("license.py")]));
     }
 
     #[test]
