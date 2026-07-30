@@ -20,8 +20,8 @@
 
 use std::cmp::Ordering;
 
-use crate::time::iso_chrono_cmp;
 use crate::task_id::is_task_id;
+use crate::time::iso_chrono_cmp;
 
 /// A finding's lifecycle status (the four words the contract uses, plus a catch-all).
 #[derive(Debug, Clone, PartialEq, Eq)]

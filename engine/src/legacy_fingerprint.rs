@@ -13,8 +13,8 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use crate::task_id::is_task_id;
+use sha2::{Digest, Sha256};
 
 /// A committed tree entry supplied by a typed VCS inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]

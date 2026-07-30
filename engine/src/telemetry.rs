@@ -18,8 +18,8 @@ use crate::events::outbox::lock_outbox;
 use crate::events::{
     ActorKind, Event, EventType, OUTBOX_FILE, SCHEMA_VERSION, TailReader, deterministic_event_id,
 };
-use crate::time::iso_to_epoch_millis;
 use crate::task_id::is_task_id;
+use crate::time::iso_to_epoch_millis;
 
 /// Provider-exact token counters captured for one completed model invocation.
 ///

@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use orchestrail_engine::work_fs;
 use orchestrail_engine::task_id::is_task_id;
+use orchestrail_engine::work_fs;
 
 const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
 
