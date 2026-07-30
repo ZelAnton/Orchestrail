@@ -69,6 +69,7 @@ fn task_reviewer_reads_the_immutable_range_before_emitting_a_clean_gate() {
                 review_sha: Some("review-head".into()),
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: std::collections::BTreeMap::new(),
             },
         )]),
         ..ProcessorState::default()
@@ -136,6 +137,7 @@ fn concurrent_reviewers_consume_their_own_immutable_ranges_in_request_order() {
         review_sha: Some(head.into()),
         reason: None,
         imported_recovery_intent: None,
+        leaf_sessions: std::collections::BTreeMap::new(),
     };
     let state = ProcessorState {
         batch: Some(CohortRuntime {
@@ -258,6 +260,7 @@ fn reviewer_deadline_during_parallel_collection_never_becomes_a_clean_result() {
         review_sha: Some(head.into()),
         reason: None,
         imported_recovery_intent: None,
+        leaf_sessions: std::collections::BTreeMap::new(),
     };
     let state = ProcessorState {
         batch: Some(CohortRuntime {
@@ -380,6 +383,7 @@ fn mixed_claude_and_codex_reviewers_consume_their_own_ranges_in_request_order() 
         review_sha: Some(head.into()),
         reason: None,
         imported_recovery_intent: None,
+        leaf_sessions: std::collections::BTreeMap::new(),
     };
     let state = ProcessorState {
         batch: Some(CohortRuntime {

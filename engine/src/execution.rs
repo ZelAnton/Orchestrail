@@ -15,6 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::processor::{Effect, ProcessorCommand, ProcessorState};
 use crate::runtime::{OperationTiming, ProcessorRuntime, RuntimeError};
+use crate::session::LeafSessionUpdate;
 
 /// The outcome of executing one reducer effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,14 @@ pub trait EffectExecutor {
         effect: &Effect,
         state: &ProcessorState,
     ) -> Result<EffectResolution, Self::Error>;
+
+    /// Hand over the provider conversation coordinate the just-executed leaf observed for
+    /// `task_id`, if any. This is explicitly NOT a result: it acknowledges no effect and carries
+    /// no decision, so the driver records it beside — never instead of — the typed command. An
+    /// adapter that does not resume conversations keeps the default and is unaffected.
+    fn take_leaf_session(&mut self, _task_id: &str) -> Option<LeafSessionUpdate> {
+        None
+    }
 
     /// Resolve independent task leaves from one rolling round.  The default deliberately keeps
     /// the old serial behaviour so lightweight adapters do not need a worker implementation;
@@ -204,6 +213,7 @@ pub fn drive<E: EffectExecutor>(
                     .event_occurred_at(occurred_at)
                     .map_err(DriveError::Executor)?;
                 for (effect, resolution) in effects.into_iter().zip(resolutions) {
+                    record_leaf_session(runtime, &effect, executor)?;
                     let held = apply_resolution(
                         runtime,
                         &mut queue,
@@ -247,6 +257,7 @@ pub fn drive<E: EffectExecutor>(
                 let event_occurred_at = executor
                     .event_occurred_at(occurred_at)
                     .map_err(DriveError::Executor)?;
+                record_leaf_session(runtime, &effect, executor)?;
                 match apply_resolution(
                     runtime,
                     &mut queue,
@@ -269,6 +280,31 @@ pub fn drive<E: EffectExecutor>(
         }
     }
     Ok(report)
+}
+
+/// Persist the conversation coordinate a task leaf observed, before its typed result is applied.
+///
+/// Only task-scoped leaf effects have a lineage to remember. The write is orthogonal: it does not
+/// touch the pending ledger, so it can never mask, satisfy, or reorder the acknowledgement that
+/// follows it. A reducer rejection (unknown task, malformed provider id) is a real adapter
+/// protocol violation and is surfaced rather than silently dropped.
+fn record_leaf_session<E: EffectExecutor>(
+    runtime: &mut ProcessorRuntime,
+    effect: &Effect,
+    executor: &mut E,
+) -> Result<(), DriveError<E::Error>> {
+    let task_id = match effect {
+        Effect::PrepareTaskLeaf { task_id, .. }
+        | Effect::PrepareTaskReview { task_id }
+        | Effect::DispatchTask { task_id, .. } => task_id.clone(),
+        _ => return Ok(()),
+    };
+    let Some(update) = executor.take_leaf_session(&task_id) else {
+        return Ok(());
+    };
+    runtime
+        .record_leaf_session(&task_id, &update)
+        .map_err(DriveError::Runtime)
 }
 
 /// Apply a single result only after its originating effect is known.  A batch reuses the exact
@@ -467,12 +503,15 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::processor::{
         AdmissionCandidate, CiOutcome, LeafKind, LeafOutcome, MergeOutcome, Phase, ProcessorConfig,
         ReviewOutcome, TaskPhase,
     };
     use crate::resolvers::Level;
+    use crate::session::{LeafSessionKey, SessionLineage, SessionProvider};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -480,6 +519,9 @@ mod tests {
     struct ScriptedExecutor {
         task_batches: Vec<Vec<String>>,
         event_time: Option<String>,
+        /// Conversation coordinates this fake adapter claims to have observed, drained per task
+        /// exactly as a real provider adapter does.
+        sessions: BTreeMap<String, LeafSessionUpdate>,
     }
 
     impl EffectExecutor for ScriptedExecutor {
@@ -490,6 +532,10 @@ mod tests {
                 .event_time
                 .clone()
                 .unwrap_or_else(|| fallback.to_owned()))
+        }
+
+        fn take_leaf_session(&mut self, task_id: &str) -> Option<LeafSessionUpdate> {
+            self.sessions.remove(task_id)
         }
 
         fn execute(
@@ -802,6 +848,82 @@ mod tests {
         assert_eq!(runtime.state().phase, Phase::Idle);
         assert_eq!(runtime.state().tasks["T-1"].phase, TaskPhase::Done);
         assert!(runtime.pending_effects().is_empty());
+
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn an_observed_conversation_becomes_durable_without_entering_the_effect_ledger() {
+        let work = work();
+        let mut runtime = ProcessorRuntime::new(
+            ProcessorConfig {
+                max_parallel: 1,
+                cohort_size: 1,
+                ..ProcessorConfig::default()
+            },
+            &work,
+        )
+        .unwrap();
+        let key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let mut executor = ScriptedExecutor {
+            sessions: BTreeMap::from([(
+                "T-1".to_owned(),
+                LeafSessionUpdate::Observed {
+                    key,
+                    id: "11111111-2222-3333-4444-555555555555".into(),
+                },
+            )]),
+            ..ScriptedExecutor::default()
+        };
+        let at = "2026-07-24T12:00:00Z";
+
+        let recovered = runtime
+            .apply_at(
+                ProcessorCommand::Recover {
+                    workspaces_present: Default::default(),
+                },
+                at,
+            )
+            .unwrap();
+        drive(&mut runtime, recovered, at, &mut executor, 100).unwrap();
+        let opened = runtime
+            .apply_at(
+                ProcessorCommand::Open {
+                    batch_id: "B-test".into(),
+                    base: "base".into(),
+                    now_secs: 1,
+                },
+                at,
+            )
+            .unwrap();
+        drive(&mut runtime, opened, at, &mut executor, 100).unwrap();
+
+        // The coordinate is durable in the checkpoint...
+        assert_eq!(
+            runtime.state().tasks["T-1"].leaf_session(key),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        // ...it was drained exactly once, so it cannot be replayed onto a later effect...
+        assert!(executor.sessions.is_empty());
+        // ...and it neither acknowledged nor left anything in the effect ledger: the run reached
+        // the very same phase as the identical run without any session at all.
+        assert!(runtime.pending_effects().is_empty());
+        assert_eq!(runtime.state().tasks["T-1"].phase, TaskPhase::Ready);
+
+        // It also survives a restart from the persisted checkpoint.
+        let reloaded = ProcessorRuntime::resume(
+            ProcessorConfig {
+                max_parallel: 1,
+                cohort_size: 1,
+                ..ProcessorConfig::default()
+            },
+            &work,
+        )
+        .unwrap();
+        assert_eq!(
+            reloaded.state().tasks["T-1"].leaf_session(key),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
 
         let _ = fs::remove_dir_all(work);
     }

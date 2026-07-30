@@ -23,6 +23,7 @@ use crate::resolvers::{
     CohortCounters, CohortThresholds, Domain, EmptyReason, Level, Risk, StagnationDecision,
     admission_gate, plan_admission, review_cycle_decision, stagnation_decision,
 };
+use crate::session::{LeafSessionKey, LeafSessionUpdate, is_valid_session_id};
 use crate::state::DeliveryTarget;
 use crate::task_id::is_task_id;
 
@@ -285,6 +286,15 @@ pub struct TaskRuntime {
     /// marker: their durable effect ledger already records the exact outstanding action.
     #[serde(default)]
     pub imported_recovery_intent: Option<ImportedRecoveryIntent>,
+    /// Provider conversation ids for repeated calls of the same leaf lineage, keyed by
+    /// [`LeafSessionKey::as_durable_key`] (`claude:coder`, `codex:reviewer`). It is durable for
+    /// the same reason `review_sha` is — a resumed cycle must not lose the coordinate — but it is
+    /// deliberately ORTHOGONAL: nothing in this reducer reads it, so no phase, transition, or
+    /// escalation can depend on whether a conversation happens to still exist. A checkpoint
+    /// written before durable sessions simply has no map and re-seeds full context, exactly as
+    /// the engine behaved before.
+    #[serde(default)]
+    pub leaf_sessions: BTreeMap<String, String>,
 }
 
 impl TaskRuntime {
@@ -304,6 +314,7 @@ impl TaskRuntime {
             review_sha: None,
             reason: None,
             imported_recovery_intent: None,
+            leaf_sessions: BTreeMap::new(),
         }
     }
 
@@ -311,6 +322,14 @@ impl TaskRuntime {
         let attempts = self.leaf_attempts.entry(kind.as_str().into()).or_default();
         *attempts = attempts.saturating_add(1);
         *attempts
+    }
+
+    /// Durable conversation id for one leaf lineage, when a previous call recorded one. The
+    /// caller must still prove the conversation exists before resuming it.
+    pub fn leaf_session(&self, key: LeafSessionKey) -> Option<&str> {
+        self.leaf_sessions
+            .get(&key.as_durable_key())
+            .map(String::as_str)
     }
 }
 
@@ -2212,6 +2231,44 @@ impl Processor {
     /// not change reducer state at acknowledgement time; a legacy conflict return is the narrow
     /// exception because retaining its import marker would schedule another counter increment on
     /// the next Phase-0 pass.
+    /// Record or forget one task's provider conversation coordinate.
+    ///
+    /// This deliberately is NOT a [`ProcessorCommand`]. A session id is not a decision: it
+    /// produces no [`Effect`], acknowledges no pending ledger key, and — as the sibling assertions
+    /// in this module's tests pin down — cannot move `TaskPhase`, change a transition, or affect
+    /// an escalation. Threading it through the command surface would enlarge the deterministic
+    /// contract with a value the reducer never reads and would make every acknowledgement carry
+    /// an irrelevant field. It joins [`Self::acknowledge_non_command_effect`] as the narrow,
+    /// typed, effect-free mutation path instead.
+    ///
+    /// It is also safe outside the effect ledger precisely because it is orthogonal: a write lost
+    /// to a crash, or one durable for a call that was never acknowledged, can at worst cost one
+    /// re-seeded leaf call — never a replayed model call or a skipped review.
+    pub(crate) fn record_leaf_session(
+        &mut self,
+        task_id: &str,
+        update: &LeafSessionUpdate,
+    ) -> Result<(), ProcessorError> {
+        let key = update.key().as_durable_key();
+        let task = self.task_mut(task_id)?;
+        match update {
+            LeafSessionUpdate::Observed { id, .. } => {
+                // Defence in depth: the adapter already refuses a malformed provider id, and the
+                // durable checkpoint must never become a carrier for one either.
+                if !is_valid_session_id(id) {
+                    return Err(ProcessorError::InvalidCommand(format!(
+                        "task {task_id} reported a malformed provider session id for {key}"
+                    )));
+                }
+                task.leaf_sessions.insert(key, id.clone());
+            }
+            LeafSessionUpdate::Invalidated { .. } => {
+                task.leaf_sessions.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn acknowledge_non_command_effect(
         &mut self,
         effect: &Effect,
@@ -6702,6 +6759,183 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_written_before_durable_sessions_still_loads() {
+        // Exactly the shape an older engine persisted: every field it knew, and no
+        // `leaf_sessions`. It must deserialize into "no known conversation", which is the
+        // full-context re-seed the engine did before durable sessions existed.
+        let mut current = TaskRuntime::new(&candidate("T-1", "engine/**"), 1);
+        current.review_cycles = 2;
+        current.review_sha = Some("head-1".into());
+        current.leaf_sessions.insert(
+            LeafSessionKey::new(
+                crate::session::SessionProvider::Claude,
+                crate::session::SessionLineage::Coder,
+            )
+            .as_durable_key(),
+            "11111111-2222-3333-4444-555555555555".into(),
+        );
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("leaf_sessions")
+            .expect("the field is serialized for a current task");
+        let task: TaskRuntime = serde_json::from_value(legacy).unwrap();
+        assert!(task.leaf_sessions.is_empty());
+        assert_eq!(task.review_sha.as_deref(), Some("head-1"));
+        assert_eq!(task.review_cycles, 2);
+        assert_eq!(
+            task.leaf_session(LeafSessionKey::new(
+                crate::session::SessionProvider::Claude,
+                crate::session::SessionLineage::Coder
+            )),
+            None
+        );
+
+        // A whole checkpoint without the field is equally readable, and re-serializing it keeps
+        // the new map additive rather than migrating anything.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        let mut document = serde_json::to_value(p.state()).unwrap();
+        document["tasks"]["T-1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("leaf_sessions")
+            .expect("the field is serialized for a current checkpoint");
+        let loaded: ProcessorState = serde_json::from_value(document).unwrap();
+        assert!(loaded.tasks["T-1"].leaf_sessions.is_empty());
+        assert_eq!(loaded.schema_version, PROCESSOR_STATE_VERSION);
+        Processor::from_checkpoint(p.config.clone(), loaded).expect("legacy checkpoint resumes");
+    }
+
+    #[test]
+    fn a_recorded_session_is_orthogonal_to_every_reducer_decision() {
+        use crate::session::{LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProvider};
+
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let reviewer = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Reviewer);
+
+        // Drive one identical implement/review round twice: once with sessions recorded at every
+        // step, once without. The phases and the emitted effects must be indistinguishable.
+        let run = |with_sessions: bool| {
+            let mut p = processor();
+            open(&mut p);
+            p.apply(ProcessorCommand::Admit {
+                candidates: vec![candidate("T-1", "engine/**")],
+                now_secs: 101,
+            })
+            .unwrap();
+            p.apply(ProcessorCommand::WorkspaceReady {
+                task_id: "T-1".into(),
+            })
+            .unwrap();
+            if with_sessions {
+                p.record_leaf_session(
+                    "T-1",
+                    &LeafSessionUpdate::Observed {
+                        key: coder,
+                        id: "11111111-2222-3333-4444-555555555555".into(),
+                    },
+                )
+                .unwrap();
+            }
+            let mut effects = p
+                .apply(ProcessorCommand::TaskLeaf {
+                    task_id: "T-1".into(),
+                    outcome: LeafOutcome::Completed {
+                        author: Some("coder".into()),
+                    },
+                })
+                .unwrap();
+            if with_sessions {
+                p.record_leaf_session(
+                    "T-1",
+                    &LeafSessionUpdate::Observed {
+                        key: reviewer,
+                        id: "019f054f-5e70-7d42-8586-ee66e3ac1d1e".into(),
+                    },
+                )
+                .unwrap();
+                p.record_leaf_session("T-1", &LeafSessionUpdate::Invalidated { key: coder })
+                    .unwrap();
+            }
+            effects.extend(
+                p.apply(ProcessorCommand::TaskCommitted {
+                    task_id: "T-1".into(),
+                    commit: "head-1".into(),
+                })
+                .unwrap(),
+            );
+            (p.state().clone(), effects)
+        };
+
+        let (with_state, with_effects) = run(true);
+        let (without_state, without_effects) = run(false);
+        assert_eq!(with_effects, without_effects);
+        assert_eq!(
+            with_state.tasks["T-1"].phase,
+            without_state.tasks["T-1"].phase
+        );
+        // The ONLY difference between the two runs is the orthogonal map.
+        let mut normalized = with_state.clone();
+        normalized.tasks.get_mut("T-1").unwrap().leaf_sessions = BTreeMap::new();
+        assert_eq!(normalized, without_state);
+        // An invalidated coordinate is forgotten; a live one is retained verbatim.
+        assert_eq!(with_state.tasks["T-1"].leaf_session(coder), None);
+        assert_eq!(
+            with_state.tasks["T-1"].leaf_session(reviewer),
+            Some("019f054f-5e70-7d42-8586-ee66e3ac1d1e")
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_unknown_session_coordinate_is_refused() {
+        use crate::session::{LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProvider};
+
+        let key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        assert!(matches!(
+            p.record_leaf_session(
+                "T-2",
+                &LeafSessionUpdate::Observed {
+                    key,
+                    id: "abc".into()
+                }
+            ),
+            Err(ProcessorError::MissingTask(_))
+        ));
+        // The id becomes a path component in the probe and an argv element in the call, so a
+        // traversal attempt must never reach the checkpoint.
+        assert!(matches!(
+            p.record_leaf_session(
+                "T-1",
+                &LeafSessionUpdate::Observed {
+                    key,
+                    id: "../../escape".into()
+                }
+            ),
+            Err(ProcessorError::InvalidCommand(_))
+        ));
+        assert!(p.state().tasks["T-1"].leaf_sessions.is_empty());
+        // Forgetting an unrecorded coordinate is a no-op, not an error: the fix path may run
+        // before any session was ever observed.
+        p.record_leaf_session("T-1", &LeafSessionUpdate::Invalidated { key })
+            .unwrap();
+        assert!(p.state().tasks["T-1"].leaf_sessions.is_empty());
+    }
+
+    #[test]
     fn checkpoint_rejects_invalid_or_cross_wired_durable_coordinates() {
         let p = processor();
         let mut invalid_batch = p.state().clone();
@@ -6741,6 +6975,7 @@ mod tests {
                 review_sha: None,
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
         assert!(matches!(

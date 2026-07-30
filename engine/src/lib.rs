@@ -88,6 +88,7 @@ pub mod resolvers;
 pub mod roadmap;
 pub mod run;
 pub mod runtime;
+pub mod session;
 pub mod state;
 pub mod supervise;
 pub mod task_id;

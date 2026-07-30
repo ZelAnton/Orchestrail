@@ -174,6 +174,7 @@ fn pending_merger_state() -> ProcessorState {
         review_sha: Some("reviewed".into()),
         reason: None,
         imported_recovery_intent: None,
+        leaf_sessions: std::collections::BTreeMap::new(),
     };
     let mut integration = IntegrationRuntime {
         workspace_prepared: true,
@@ -227,6 +228,7 @@ fn pending_reviewer_state() -> ProcessorState {
         review_sha: Some("reviewed".into()),
         reason: None,
         imported_recovery_intent: Some(ImportedRecoveryIntent::DispatchReview),
+        leaf_sessions: std::collections::BTreeMap::new(),
     };
     ProcessorState {
         schema_version: PROCESSOR_STATE_VERSION,
