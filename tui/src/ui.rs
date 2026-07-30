@@ -48,7 +48,7 @@ pub fn render(f: &mut Frame, app: &AppState) {
 
 fn render_overview(f: &mut Frame, app: &AppState) {
     let root = Layout::vertical([
-        Constraint::Length(5), // header (3 content lines inside the border)
+        Constraint::Length(6), // header (4 content lines inside the border)
         Constraint::Min(3),    // body
         Constraint::Length(1), // footer
     ])
@@ -149,6 +149,11 @@ fn render_header(f: &mut Frame, area: Rect, app: &AppState) {
             Style::default().fg(DIM),
         ),
     ]));
+    lines.push(Line::from(vec![
+        Span::raw(token_budget_label(app)),
+        Span::raw("  ·  "),
+        Span::styled(cost_label(app), Style::default().fg(CYAN)),
+    ]));
 
     let para =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(Span::styled(
@@ -156,6 +161,62 @@ fn render_header(f: &mut Frame, area: Rect, app: &AppState) {
             Style::default().add_modifier(Modifier::BOLD),
         )));
     f.render_widget(para, area);
+}
+
+fn token_budget_label(app: &AppState) -> String {
+    let used = match &app.batch_telemetry {
+        Some(summary) => format_tokens(summary.usage.actual_tokens),
+        None if app.batch.is_some() => "?".into(),
+        None => "0".into(),
+    };
+    let incomplete = app
+        .batch_telemetry
+        .as_ref()
+        .is_some_and(|summary| summary.usage.unmetered_events > 0);
+    let suffix = if incomplete { "+" } else { "" };
+    match app.cohort_token_budget {
+        Some(limit) => format!("токены {used}{suffix} / {}", format_tokens(limit)),
+        None => format!("токены {used}{suffix} / ∞"),
+    }
+}
+
+fn cost_label(app: &AppState) -> String {
+    app.batch_telemetry.as_ref().map_or_else(
+        || "стоимость —".into(),
+        |summary| {
+            let usage_events = summary
+                .usage
+                .actual_events
+                .saturating_add(summary.usage.estimated_events)
+                .saturating_add(summary.usage.unmetered_events);
+            if usage_events == 0 {
+                return "стоимость —".into();
+            }
+            let model_note = if summary
+                .cost_by_model
+                .get("default")
+                .is_some_and(|cost| cost.unknown)
+            {
+                " (модель не настроена)"
+            } else {
+                ""
+            };
+            format!(
+                "стоимость {}{model_note}",
+                summary.estimated_cost.format_usd()
+            )
+        },
+    )
+}
+
+fn format_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 fn render_attention(f: &mut Frame, area: Rect, app: &AppState) {
@@ -982,14 +1043,102 @@ fn short_time(iso: &str) -> String {
 mod tests {
     use super::*;
     use orchestrail_engine::events::parse_line;
+    use orchestrail_engine::telemetry::{BatchTelemetrySummary, CostEstimate, TokenUsage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::BTreeMap;
 
     #[test]
     fn short_time_extracts_clock() {
         assert_eq!(short_time("2026-07-11T11:39:48Z"), "11:39:48");
         assert_eq!(short_time("2026-07-11T11:39:48.783Z"), "11:39:48");
         assert_eq!(short_time("garbage"), "garbage");
+    }
+
+    #[test]
+    fn budget_and_estimated_cost_share_the_compact_header_surface() {
+        let mut app = AppState::new();
+        app.cohort_token_budget = Some(100_000);
+        app.batch_telemetry = Some(BatchTelemetrySummary {
+            codex_successes: 0,
+            codex_fallbacks: 0,
+            codex_failures: 0,
+            codex_fallback_reasons: BTreeMap::new(),
+            usage: TokenUsage {
+                actual_tokens: 12_345,
+                estimated_tokens: 0,
+                actual_events: 1,
+                estimated_events: 0,
+                unmetered_events: 1,
+            },
+            actual_by_source: BTreeMap::new(),
+            estimated_cost: CostEstimate {
+                nano_usd: 420_000_000,
+                estimated: true,
+                unknown: true,
+            },
+            cost_by_model: BTreeMap::new(),
+            cost_by_role: BTreeMap::new(),
+        });
+        assert_eq!(token_budget_label(&app), "токены 12.3k+ / 100.0k");
+        assert_eq!(cost_label(&app), "стоимость ≈$0.4200+?");
+    }
+
+    #[test]
+    fn cost_label_distinguishes_missing_usage_from_a_measured_zero_cost() {
+        let mut app = AppState::new();
+        app.batch_telemetry = Some(BatchTelemetrySummary {
+            codex_successes: 0,
+            codex_fallbacks: 0,
+            codex_failures: 0,
+            codex_fallback_reasons: BTreeMap::new(),
+            usage: TokenUsage {
+                actual_tokens: 0,
+                estimated_tokens: 0,
+                actual_events: 0,
+                estimated_events: 0,
+                unmetered_events: 0,
+            },
+            actual_by_source: BTreeMap::new(),
+            estimated_cost: CostEstimate::default(),
+            cost_by_model: BTreeMap::new(),
+            cost_by_role: BTreeMap::new(),
+        });
+        assert_eq!(cost_label(&app), "стоимость —");
+
+        let summary = app.batch_telemetry.as_mut().unwrap();
+        summary.usage.actual_events = 1;
+        summary.estimated_cost = CostEstimate {
+            nano_usd: 0,
+            estimated: true,
+            unknown: false,
+        };
+        assert_eq!(cost_label(&app), "стоимость ≈$0.0000");
+    }
+
+    #[test]
+    fn cost_label_explains_an_unconfigured_default_model() {
+        let mut app = AppState::new();
+        let mut cost_by_model = BTreeMap::new();
+        cost_by_model.insert("default".into(), CostEstimate::unknown());
+        app.batch_telemetry = Some(BatchTelemetrySummary {
+            codex_successes: 0,
+            codex_fallbacks: 0,
+            codex_failures: 0,
+            codex_fallback_reasons: BTreeMap::new(),
+            usage: TokenUsage {
+                actual_tokens: 1,
+                estimated_tokens: 0,
+                actual_events: 1,
+                estimated_events: 0,
+                unmetered_events: 0,
+            },
+            actual_by_source: BTreeMap::new(),
+            estimated_cost: CostEstimate::unknown(),
+            cost_by_model,
+            cost_by_role: BTreeMap::new(),
+        });
+        assert_eq!(cost_label(&app), "стоимость ≈$? (модель не настроена)");
     }
 
     /// Render the whole §6.1 screen to an in-memory backend (no real terminal) and assert the

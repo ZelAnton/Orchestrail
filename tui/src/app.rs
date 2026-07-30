@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 
 use orchestrail_engine::events::{Event, EventType};
+use orchestrail_engine::telemetry::BatchTelemetrySummary;
 use serde_json::{Map, Value};
 
 use crate::commands::{ApprovalDecision, LeaseStatus};
@@ -203,6 +204,10 @@ pub struct AppState {
     pub status: Option<crate::status::StatusSnapshot>,
     /// Total events consumed (for the header).
     pub events_seen: u64,
+    /// Operator-configured post-charge token ceiling and the current batch's read-only usage/cost
+    /// projection. Both are refreshed beside status.md and never influence engine decisions.
+    pub cohort_token_budget: Option<u64>,
+    pub batch_telemetry: Option<BatchTelemetrySummary>,
     /// `occurred_at` of the most recent event (fallback "updated" when status.md is absent).
     pub last_event_at: Option<String>,
     /// Which screen is currently drawn (§6.1 overview vs §6.2 Decision Inbox).
