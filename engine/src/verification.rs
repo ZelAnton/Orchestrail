@@ -124,9 +124,14 @@ pub fn exemption_evidence(
     }
 }
 
-/// Legacy-compatible docs-only classifier over a typed VCS range. A range with no changed files
-/// is never a documentation change. Callers must supply both sides of a rename/copy so moving
-/// source into a Markdown-looking path remains executable rather than gaining an exemption.
+/// Fail-closed docs-only classifier over a typed VCS range. Documentation-like stems (`readme`,
+/// `changelog`, `contributing`, `license`, `agents`, and `claude`) count as documentation only
+/// without an extension or with `.md`, `.txt`, or `.rst`. This intentionally diverges from legacy
+/// `verification.ps1`, which accepts those stems with any extension: the stricter rule prevents
+/// code files such as `agents.rs`, `claude.rs`, or `license.py` from becoming docs-exempt solely
+/// because of their stem. A range with no changed files is never a documentation change. Callers
+/// must supply both sides of a rename/copy so moving source into a Markdown-looking path remains
+/// executable rather than gaining an exemption.
 pub fn is_docs_only(paths: &[PathBuf]) -> bool {
     !paths.is_empty() && paths.iter().all(|path| is_documentation_path(path))
 }
