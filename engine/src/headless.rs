@@ -5,7 +5,7 @@
 //! these calls only produce durable evidence for one requested effect. There is no PowerShell
 //! wrapper, shell command string, or inherited in-process agent permission in this path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -66,6 +66,48 @@ const MAX_MODEL_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
 fn review_window_end() -> String {
     let second = epoch_to_iso(now_epoch_secs());
     format!("{}.999Z", second.trim_end_matches('Z'))
+}
+
+/// Build verified candidate facts without changing the queue file's authoritative priority order.
+fn admission_candidates_in_queue_order(
+    snapshot: Snapshot,
+    completed: &BTreeSet<String>,
+) -> Vec<AdmissionCandidate> {
+    let descriptors: BTreeMap<_, _> = snapshot
+        .descriptors
+        .into_iter()
+        .map(|descriptor| (descriptor.id.clone(), descriptor))
+        .collect();
+    let mut candidates = Vec::new();
+    for queued in snapshot.queue {
+        if queued.state != Some(TaskState::NotStarted)
+            || queued.delivery_target != DeliveryTarget::Current
+        {
+            continue;
+        }
+        let Some(descriptor) = descriptors.get(&queued.id) else {
+            continue;
+        };
+        let (Some(domain), Some(level), Some(risk)) = (
+            &descriptor.conflict_domain,
+            descriptor.level,
+            descriptor.risk,
+        ) else {
+            continue;
+        };
+        candidates.push(AdmissionCandidate {
+            id: queued.id,
+            conflict_domain: domain.join(","),
+            level,
+            risk,
+            // Queue prerequisites are the authoritative admission graph. A planner-created
+            // descriptor may summarize them for a human, but it must never make a queued
+            // dependency disappear at the native capture gate.
+            ready: queued.prerequisites.iter().all(|id| completed.contains(id)),
+            current_delivery_lane: true,
+        });
+    }
+    candidates
 }
 
 /// Runtime settings that are safe to pass to the leaf adapter. `work` and `root` are absolute
@@ -2619,41 +2661,7 @@ impl ExternalPort for HeadlessExternalPort {
         }
         let snapshot = Snapshot::try_load(work)?;
         let completed = try_completed_ids(work, &snapshot)?;
-        let descriptors: BTreeMap<_, _> = snapshot
-            .descriptors
-            .into_iter()
-            .map(|descriptor| (descriptor.id.clone(), descriptor))
-            .collect();
-        let mut candidates = Vec::new();
-        for queued in snapshot.queue {
-            if queued.state != Some(TaskState::NotStarted)
-                || queued.delivery_target != DeliveryTarget::Current
-            {
-                continue;
-            }
-            let Some(descriptor) = descriptors.get(&queued.id) else {
-                continue;
-            };
-            let (Some(domain), Some(level), Some(risk)) = (
-                &descriptor.conflict_domain,
-                descriptor.level,
-                descriptor.risk,
-            ) else {
-                continue;
-            };
-            candidates.push(AdmissionCandidate {
-                id: queued.id,
-                conflict_domain: domain.join(","),
-                level,
-                risk,
-                // Queue prerequisites are the authoritative admission graph. A planner-created
-                // descriptor may summarize them for a human, but it must never make a queued
-                // dependency disappear at the native capture gate.
-                ready: queued.prerequisites.iter().all(|id| completed.contains(id)),
-                current_delivery_lane: true,
-            });
-        }
-        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+        let candidates = admission_candidates_in_queue_order(snapshot, &completed);
         // The descriptor set may deliberately include more fully planned queue entries than the
         // current wave can admit. The reducer's `plan_admission` is the sole capacity authority;
         // treating those durable plans as a protocol error would deadlock rolling top-up.
@@ -4449,6 +4457,61 @@ mod tests {
     use super::*;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn returned_lower_id_at_queue_end_does_not_jump_admission_order() {
+        let snapshot = Snapshot {
+            work_dir: PathBuf::new(),
+            queue: crate::state::parse_queue(
+                "### [T-200] Earlier operator priority — статус: не начата\n\
+                 \n\
+                 ### [T-3] Returned after quarantine — статус: не начата · попытка=2 · карантин=merge-conflict\n",
+            ),
+            descriptors: vec![
+                crate::state::parse_descriptor(
+                    "T-200",
+                    "Статус: не начата\n\
+                     Конфликт-домен: engine/priority/**\n\
+                     Рекомендуемый исполнитель: coder\n\
+                     Риск: medium — test fixture\n",
+                ),
+                crate::state::parse_descriptor(
+                    "T-3",
+                    "Статус: не начата\n\
+                     Конфликт-домен: engine/returned/**\n\
+                     Рекомендуемый исполнитель: coder\n\
+                     Риск: medium — test fixture\n",
+                ),
+            ],
+            cohort: None,
+            integration: crate::state::parse_integration(""),
+            batch: None,
+        };
+        let candidates = admission_candidates_in_queue_order(snapshot, &BTreeSet::new());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            ["T-200", "T-3"],
+            "candidate collection must retain queue file order"
+        );
+
+        let resolver_candidates = candidates
+            .iter()
+            .map(|candidate| crate::resolvers::Candidate {
+                id: candidate.id.clone(),
+                ready: candidate.ready,
+                domain: Domain::parse(&candidate.conflict_domain),
+                delivery: DeliveryTarget::Current,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::resolvers::plan_admission(&resolver_candidates, &[], 1),
+            crate::resolvers::AdmissionOutcome::Admitted(vec!["T-200".into()]),
+            "capacity fill must admit the earlier queue entry, not the returned lower T-ID"
+        );
+    }
 
     #[test]
     fn codex_probe_classifies_only_the_two_sandbox_init_signatures() {
