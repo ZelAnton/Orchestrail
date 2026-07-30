@@ -7,13 +7,13 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::execution::{DriveError, DriveReport, drive};
 use crate::native::{NativeError, NativeExecutor, ProcessorPort, QueueReadiness};
 use crate::processor::{Effect, Phase, ProcessorCommand};
 use crate::runtime::{ProcessorRuntime, RecoveryRequirement, RuntimeError};
-use crate::supervise::CancellationProbe;
 
 #[derive(Debug, Clone)]
 pub struct NativeLoopConfig {
@@ -27,6 +27,40 @@ pub struct NativeLoopConfig {
 /// Floor for one `--watch` poll interval. A misconfigured zero interval must degrade into a slow
 /// poll, never into a busy loop that reads the control plane as fast as the CPU allows.
 const MIN_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The operator's clean-stop fact for `--watch`, observed at poll boundaries only.
+///
+/// Deliberately *not* a [`crate::supervise::CancellationProbe`]: this probe is fallible, and the
+/// distinction is load-bearing. An embedder backs the fact with an observation that can fail (the
+/// CLI reads a control-plane marker), and a failed observation is not evidence that an operator
+/// asked for a stop. Collapsing the two would let a long-lived service exit successfully on a
+/// transient `.work` I/O failure while naming a marker file nobody created. `Err` therefore still
+/// ends waiting fail-closed — a control plane this process cannot read is no basis for opening
+/// another cohort — but as [`NativeLoopError::WatchStopUnobservable`], with the cause preserved.
+#[derive(Clone)]
+pub struct WatchStopProbe {
+    check: Arc<dyn Fn() -> Result<bool, String> + Send + Sync + 'static>,
+}
+
+impl WatchStopProbe {
+    pub fn new(check: impl Fn() -> Result<bool, String> + Send + Sync + 'static) -> Self {
+        Self {
+            check: Arc::new(check),
+        }
+    }
+
+    /// Observe the stop fact. `Ok(false)` means "keep watching"; `Err` means the fact could not be
+    /// established at all and must never be reported as an operator-requested stop.
+    pub fn stop_requested(&self) -> Result<bool, String> {
+        (self.check)()
+    }
+}
+
+impl fmt::Debug for WatchStopProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WatchStopProbe(..)")
+    }
+}
 
 /// Bounded waiting policy for the continuous `--watch` scheduler.
 ///
@@ -43,7 +77,7 @@ const MIN_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct WatchConfig {
     pub initial_poll_interval: Duration,
     pub max_poll_interval: Duration,
-    pub stop: Option<CancellationProbe>,
+    pub stop: Option<WatchStopProbe>,
 }
 
 impl WatchConfig {
@@ -56,7 +90,7 @@ impl WatchConfig {
     }
 
     /// Bind the operator-owned clean-stop fact observed at every poll boundary.
-    pub fn with_stop_probe(mut self, stop: CancellationProbe) -> Self {
+    pub fn with_stop_probe(mut self, stop: WatchStopProbe) -> Self {
         self.stop = Some(stop);
         self
     }
@@ -93,7 +127,14 @@ pub enum NativeLoopError<E> {
     Runtime(RuntimeError),
     Port(NativeError<E>),
     Drive(DriveError<NativeError<E>>),
-    TurnLimit { limit: usize },
+    TurnLimit {
+        limit: usize,
+    },
+    /// A [`WatchStopProbe`] could not observe the operator's stop fact at a poll boundary. Waiting
+    /// ends fail-closed, but as a failure: an unobservable control plane must never be reported as
+    /// [`NativeLoopOutcome::WatchStopped`], which would tell a service supervisor that an operator
+    /// ended this process on purpose.
+    WatchStopUnobservable(String),
 }
 
 impl<E: fmt::Display> fmt::Display for NativeLoopError<E> {
@@ -103,6 +144,9 @@ impl<E: fmt::Display> fmt::Display for NativeLoopError<E> {
             Self::Port(error) => write!(f, "native processor port failure: {error}"),
             Self::Drive(error) => write!(f, "native effect drive failed: {error}"),
             Self::TurnLimit { limit } => write!(f, "native loop exceeded turn limit {limit}"),
+            Self::WatchStopUnobservable(message) => {
+                write!(f, "--watch stop request could not be observed: {message}")
+            }
         }
     }
 }
@@ -113,7 +157,7 @@ impl<E: std::error::Error + 'static> std::error::Error for NativeLoopError<E> {
             Self::Runtime(error) => Some(error),
             Self::Port(error) => Some(error),
             Self::Drive(error) => Some(error),
-            Self::TurnLimit { .. } => None,
+            Self::TurnLimit { .. } | Self::WatchStopUnobservable(_) => None,
         }
     }
 }
@@ -336,7 +380,9 @@ pub fn run_until_queue_exhausted<P: ProcessorPort>(
 /// 1. the owner lease must still be held (a renewal worker that lost ownership ends the loop with
 ///    an error instead of letting a former owner open another cohort);
 /// 2. an operator stop request ([`WatchConfig::stop`]) ends waiting cleanly with
-///    [`NativeLoopOutcome::WatchStopped`];
+///    [`NativeLoopOutcome::WatchStopped`], while a stop fact that could not be *observed* ends it
+///    with [`NativeLoopError::WatchStopUnobservable`] — both stop before the next wave, but only
+///    the first one is a successful, operator-attributed exit;
 /// 3. `.work/PAUSE` ends waiting as a hold, exactly like the per-turn boundary of
 ///    [`run_until_idle`] — the durable ledger is already settled here, so no in-flight mutation
 ///    can be interrupted;
@@ -403,7 +449,7 @@ pub fn run_watching<P: ProcessorPort>(
 fn wait_for_current_lane_work<P: ProcessorPort>(
     runtime: &ProcessorRuntime,
     executor: &mut NativeExecutor<P>,
-    stop: Option<&CancellationProbe>,
+    stop: Option<&WatchStopProbe>,
     initial_interval: Duration,
     max_interval: Duration,
 ) -> Result<WatchWakeup, NativeLoopError<P::Error>> {
@@ -414,7 +460,13 @@ fn wait_for_current_lane_work<P: ProcessorPort>(
         executor
             .ensure_lease_active()
             .map_err(NativeLoopError::Port)?;
-        if stop.is_some_and(CancellationProbe::is_cancelled) {
+        // A stop fact that cannot be observed stops waiting too, but as an error: only a *proven*
+        // request may be reported as the operator's clean stop.
+        if let Some(stop) = stop
+            && stop
+                .stop_requested()
+                .map_err(NativeLoopError::WatchStopUnobservable)?
+        {
             return Ok(WatchWakeup::Stopped);
         }
         if executor.pause_requested().map_err(NativeLoopError::Port)? {
@@ -640,7 +692,7 @@ mod tests {
     use std::collections::{BTreeSet, VecDeque};
     use std::fs;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::native::test_support::Port;
@@ -655,7 +707,7 @@ mod tests {
     use crate::supervise::CancellationProbe;
 
     use super::{
-        NativeLoopConfig, NativeLoopError, NativeLoopOutcome, WatchConfig,
+        NativeLoopConfig, NativeLoopError, NativeLoopOutcome, WatchConfig, WatchStopProbe,
         activate_recovery_effects, inspection_recovery_hold, replayable_recovery_effects_for,
         run_watching,
     };
@@ -680,6 +732,13 @@ mod tests {
     fn flag_probe(flag: &Arc<AtomicBool>) -> CancellationProbe {
         let flag = Arc::clone(flag);
         CancellationProbe::new(move || flag.load(Ordering::SeqCst))
+    }
+
+    /// A stop fact that is always *observable*: the flag itself is the operator's answer, so every
+    /// read succeeds. Fixtures for an unobservable fact return `Err` instead.
+    fn flag_stop_probe(flag: &Arc<AtomicBool>) -> WatchStopProbe {
+        let flag = Arc::clone(flag);
+        WatchStopProbe::new(move || Ok(flag.load(Ordering::SeqCst)))
     }
 
     fn fresh_runtime(work: &std::path::Path) -> ProcessorRuntime {
@@ -712,7 +771,7 @@ mod tests {
             &mut executor,
             &watch_config("B-watch"),
             &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(100))
-                .with_stop_probe(flag_probe(&stop)),
+                .with_stop_probe(flag_stop_probe(&stop)),
         )
         .expect("watch scheduler");
 
@@ -789,7 +848,7 @@ mod tests {
             &mut executor,
             &watch_config("B-watch-stop"),
             &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50))
-                .with_stop_probe(flag_probe(&stop)),
+                .with_stop_probe(flag_stop_probe(&stop)),
         )
         .expect("watch scheduler");
 
@@ -816,7 +875,7 @@ mod tests {
             &mut executor,
             &watch_config("B-watch-cold-stop"),
             &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50))
-                .with_stop_probe(flag_probe(&stop)),
+                .with_stop_probe(flag_stop_probe(&stop)),
         )
         .expect("watch scheduler");
 
@@ -895,6 +954,72 @@ mod tests {
         let _ = fs::remove_dir_all(work);
     }
 
+    /// A stop fact that could not be read is not evidence of an operator decision. The difference
+    /// is what a service supervisor sees: a clean stop is a successful exit attributed to the
+    /// operator's marker, an unobservable fact must be an error that names its own cause.
+    #[test]
+    fn an_unobservable_stop_request_fails_watch_instead_of_reporting_a_clean_stop() {
+        let work = temp_work("watch-stop-unobservable");
+        let mut runtime = fresh_runtime(&work);
+        let stop_reads = Arc::new(AtomicUsize::new(0));
+        let mut executor = NativeExecutor::new(Port {
+            // The lane is drained twice, and every later answer offers new work: an unobservable
+            // stop fact must win over that work rather than opening another wave.
+            readiness: VecDeque::from([
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Pending,
+                QueueReadiness::Pending,
+            ]),
+            ..Default::default()
+        });
+        let reads = Arc::clone(&stop_reads);
+        let stop = WatchStopProbe::new(move || {
+            // The first boundary reads a readable, unset marker; the next one fails the way a real
+            // `.work` read fails (denied access, a replaced path component, a failing disk).
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(false)
+            } else {
+                Err("control-plane path is not a plain directory".to_string())
+            }
+        });
+
+        let error = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-unobservable"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50))
+                .with_stop_probe(stop),
+        )
+        .expect_err("an unobservable stop fact must not be reported as a clean operator stop");
+
+        assert!(
+            matches!(&error, NativeLoopError::WatchStopUnobservable(message)
+                if message.contains("not a plain directory")),
+            "the failure must carry the observation's own cause: {error}"
+        );
+        assert_eq!(
+            stop_reads.load(Ordering::SeqCst),
+            2,
+            "an observable, unset stop fact keeps watching; the failing read ends it"
+        );
+        assert_eq!(
+            executor.port().waits.len(),
+            1,
+            "the loop stops at the boundary whose stop fact could not be observed"
+        );
+        assert_eq!(
+            executor.port().pause_status_writes,
+            0,
+            "an unreadable stop fact is not an operator pause and must not rewrite pause status"
+        );
+        assert!(
+            executor.port().planned_batches.is_empty(),
+            "no wave may be opened once the stop fact cannot be observed"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
     /// The renewal worker is a background thread owned by the CLI, so the guarantee under test is
     /// that `--watch` waiting does not starve it: a wait longer than the whole lease TTL must leave
     /// the durable `lease.json` record renewed and live rather than stale.
@@ -920,7 +1045,7 @@ mod tests {
             &mut executor,
             &watch_config("B-watch-heartbeat"),
             &WatchConfig::new(Duration::from_millis(2_500), Duration::from_millis(2_500))
-                .with_stop_probe(flag_probe(&stop)),
+                .with_stop_probe(flag_stop_probe(&stop)),
         )
         .expect("watch scheduler");
 

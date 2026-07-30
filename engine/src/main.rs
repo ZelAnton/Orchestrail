@@ -108,7 +108,8 @@ use orchestrail_engine::inbox;
 use orchestrail_engine::lease::{LeaseOp, exit as lease_exit};
 use orchestrail_engine::native::{NativeExecutor, ProcessorPort};
 use orchestrail_engine::native_loop::{
-    NativeLoopConfig, NativeLoopOutcome, WatchConfig, run_until_queue_exhausted, run_watching,
+    NativeLoopConfig, NativeLoopOutcome, WatchConfig, WatchStopProbe, run_until_queue_exhausted,
+    run_watching,
 };
 use orchestrail_engine::native_port::{FileVcsPort, ReleaseNotesRequest, ReviewCycleVerification};
 use orchestrail_engine::ownership::{
@@ -128,7 +129,7 @@ use orchestrail_engine::runtime::{ProcessorRuntime, RUNTIME_CHECKPOINT_FILE};
 use orchestrail_engine::state::{
     DeliveryTarget, IntegrationState, Snapshot, TaskState, completed_ids, now_epoch_secs,
 };
-use orchestrail_engine::supervise::{self, CancellationProbe, SpawnSpec};
+use orchestrail_engine::supervise::{self, SpawnSpec};
 use orchestrail_engine::time::{days_from_civil, epoch_to_iso};
 use orchestrail_engine::toolscript;
 use orchestrail_engine::vcs::VcsService;
@@ -1569,8 +1570,10 @@ fn release_sync_usage() -> ! {
 ///   number of delivery waves it completed. Nothing removes the marker automatically, so it must be
 ///   deleted before the next watching invocation; a marker that already exists at startup simply
 ///   makes this invocation behave like a plain `--once` run (the lane is drained, then the process
-///   exits without waiting). An unreadable control plane is treated as a stop request: a long-lived
-///   mutating service must not keep opening cohorts over state it can no longer observe.
+///   exits without waiting). A control plane that cannot be read stops waiting as well — a
+///   long-lived mutating service must not keep opening cohorts over state it can no longer observe
+///   — but it exits non-zero with the read failure on stderr, never as a clean stop credited to a
+///   marker that was never proven to exist.
 /// * **`.work/PAUSE`** — the ordinary pipeline kill switch, honoured here exactly as at every other
 ///   phase/round boundary: waiting stops as a hold, the derived pause status is written, and the
 ///   lease is released. Use it to pause the pipeline; use `WATCH_STOP` to end only this process.
@@ -2001,13 +2004,18 @@ const WATCH_STOP_FILE: &str = "WATCH_STOP";
 /// Observe the operator's clean-stop marker for `--watch` waiting.
 ///
 /// The probe is evaluated at poll boundaries only, so it never interrupts a cohort. An I/O failure
-/// while testing the marker resolves to "stop requested": a control plane this process can no
+/// while testing the marker still ends waiting fail-closed — a control plane this process can no
 /// longer read is not a safe basis for opening another cohort, and the ordinary single-run path
-/// remains available to an operator once the cause is repaired.
-fn watch_stop_probe(work: &Path) -> CancellationProbe {
+/// remains available once the cause is repaired — but it is reported as a failure rather than as a
+/// stop the operator requested: the outcome is a non-zero exit naming the unreadable marker, not a
+/// successful exit crediting a `.work/WATCH_STOP` file that may not exist.
+fn watch_stop_probe(work: &Path) -> WatchStopProbe {
     let work = work.to_path_buf();
     let marker = work.join(WATCH_STOP_FILE);
-    CancellationProbe::new(move || control_entry_exists(&work, &marker).unwrap_or(true))
+    WatchStopProbe::new(move || {
+        control_entry_exists(&work, &marker)
+            .map_err(|error| format!(".work/{WATCH_STOP_FILE} could not be tested: {error}"))
+    })
 }
 
 /// Validate the complete native processor argv before acquiring its owner lease. Unknown,
@@ -2966,20 +2974,61 @@ mod native_processor_argument_tests {
         let probe = watch_stop_probe(&work);
 
         assert!(
-            !probe.is_cancelled(),
+            !probe
+                .stop_requested()
+                .expect("read the readable control plane"),
             "a watching processor keeps waiting while the operator has not asked it to stop"
         );
         fs::write(&marker, "operator stop\n").expect("write the stop marker");
         assert!(
-            probe.is_cancelled(),
+            probe
+                .stop_requested()
+                .expect("read the readable control plane"),
             "creating .work/{WATCH_STOP_FILE} must end watch waiting at the next poll boundary"
         );
         fs::remove_file(&marker).expect("remove the stop marker");
         assert!(
-            !probe.is_cancelled(),
+            !probe
+                .stop_requested()
+                .expect("read the readable control plane"),
             "the engine never consumes the marker, so removing it lets a later invocation watch again"
         );
         let _ = fs::remove_dir_all(work);
+    }
+
+    /// An unreadable `.work` must not be laundered into the operator's stop decision: the probe
+    /// reports the read failure, so the watch loop ends through the error path (non-zero exit,
+    /// cause on stderr) instead of claiming a `.work/WATCH_STOP` that was never observed.
+    #[test]
+    fn an_unreadable_control_plane_reports_a_failure_rather_than_an_operator_stop() {
+        let work = std::env::temp_dir().join(format!(
+            "orchestrail-watch-stop-unreadable-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&work);
+        let _ = fs::remove_file(&work);
+        fs::create_dir_all(&work).expect("create the fixture control plane");
+        let probe = watch_stop_probe(&work);
+        assert!(
+            !probe
+                .stop_requested()
+                .expect("read the readable control plane"),
+            "the fixture starts with a readable control plane and no stop marker"
+        );
+
+        // Replace the control-plane directory with a plain file: every later marker test fails the
+        // way a denied, replaced, or damaged `.work` fails in production.
+        fs::remove_dir_all(&work).expect("remove the fixture control plane");
+        fs::write(&work, "not a control-plane directory\n").expect("replace .work with a file");
+
+        let error = probe
+            .stop_requested()
+            .expect_err("an unreadable control plane is not a proven operator stop");
+        assert!(
+            error.contains(WATCH_STOP_FILE),
+            "the failure must name the marker it could not test: {error}"
+        );
+        let _ = fs::remove_file(&work);
     }
 
     #[test]
