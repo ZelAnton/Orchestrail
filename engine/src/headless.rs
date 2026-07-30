@@ -869,20 +869,29 @@ impl HeadlessExternalPort {
 
     /// Stage this call's effect on its conversation coordinate for the driver's durable write.
     ///
-    /// A healthy call publishes the id it reported. A call that DID resume and came back unusable
-    /// forgets the coordinate instead, so the next attempt re-seeds with full context: that keeps
-    /// a provider whose CLI cannot resume — or a conversation the provider rejected — to a cost of
-    /// one call per lineage rather than a repeating failure. Anything else is left untouched.
+    /// A call that produced a USABLE result publishes the id it reported. A call that DID resume
+    /// and came back unusable forgets the coordinate instead, so the next attempt re-seeds with
+    /// full context. Anything else is left untouched.
+    ///
+    /// `usable` is deliberately the caller's own classified outcome and never `verdict.reason`.
+    /// Deriving it from process health would cover only the crash/timeout/non-zero class and would
+    /// leave the failure mode that resuming itself creates: a child that exits zero and returns
+    /// something the engine cannot accept — a reviewer that "remembers" writing `review.md` and so
+    /// leaves it untouched (`ReviewOutcome::Incomplete`), or a leaf whose report lacks its
+    /// machine-readable tail. Those results are stable properties of a conversation, so continuing
+    /// it reproduces them: the round would repeat until the cycle budget escalated the task, where
+    /// a stateless call had simply started over. Judging by outcome keeps the guaranteed fallback
+    /// to full context for failure of meaning, not only failure of process.
     fn note_leaf_session(
         &mut self,
         task_id: &str,
         key: LeafSessionKey,
         invocation: &Invocation,
         resumed: bool,
+        usable: bool,
     ) {
-        let healthy = invocation.verdict.reason == Reason::Ok;
         let update = match invocation.session_id.as_deref() {
-            Some(id) if healthy && crate::session::is_valid_session_id(id) => {
+            Some(id) if usable && crate::session::is_valid_session_id(id) => {
                 LeafSessionUpdate::Observed {
                     key,
                     id: id.to_owned(),
@@ -975,6 +984,7 @@ impl HeadlessExternalPort {
         kind: LeafKind,
         state: &ProcessorState,
         invocation: Invocation,
+        resumed: bool,
     ) -> Result<LeafOutcome, HeadlessError> {
         let task = self.task(state, task_id)?;
         let attempt = task.leaf_attempts.get(kind.as_str()).copied().unwrap_or(1);
@@ -987,11 +997,23 @@ impl HeadlessExternalPort {
             self.claude_task_usage_coordinates(state, task_id, "coder", mode, attempt)?;
         self.record_usage(state, coordinates, &invocation)?;
         let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "coder");
-        if matches!(
-            outcome,
-            LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. }
-        ) {
-            let evidence = match Self::exact_changed_paths(&invocation.report) {
+        // Classify the whole result — verdict, outcome, and the mandatory changed-path evidence —
+        // before deciding the conversation's fate. A report that claims completion without that
+        // evidence is exactly as unusable as an escalation, and a resumed conversation that
+        // produced one would otherwise be continued into producing it again.
+        let evidence =
+            leaf_completed(&outcome).then(|| Self::exact_changed_paths(&invocation.report));
+        if let Some(lineage) = SessionLineage::for_leaf(kind) {
+            self.note_leaf_session(
+                task_id,
+                LeafSessionKey::new(SessionProvider::Claude, lineage),
+                &invocation,
+                resumed,
+                matches!(evidence, Some(Ok(_))),
+            );
+        }
+        if let Some(evidence) = evidence {
+            let evidence = match evidence {
                 Ok(evidence) => evidence,
                 Err(error) => {
                     self.record_task_operation(
@@ -1118,12 +1140,6 @@ impl HeadlessExternalPort {
         // transcripts or telemetry, so post-processing time cannot make a later file mutation
         // look as though it belonged to the contained reviewer invocation.
         let until = review_window_end();
-        self.note_leaf_session(
-            task_id,
-            LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer),
-            &invocation,
-            review.resumed,
-        );
         self.persist_evidence(
             &format!("{task_id}-{}.md", review.reviewer),
             &invocation.report,
@@ -1155,6 +1171,16 @@ impl HeadlessExternalPort {
                 &review.head,
             )
         };
+        // The conversation's fate is decided here rather than beside the child, because only this
+        // classification distinguishes a reviewer that reported from one that exited zero having
+        // silently reused its own previous turn's report.
+        self.note_leaf_session(
+            task_id,
+            LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer),
+            &invocation,
+            review.resumed,
+            review_completed(&outcome),
+        );
         self.record_task_operation(
             state,
             coordinates,
@@ -2340,9 +2366,15 @@ impl HeadlessExternalPort {
         // never be held to a weaker contract than a re-seeded one. A continued call still has to
         // re-read the descriptor and review artifact: those files changed while it was not
         // running, and its recollection of them is stale by construction.
+        //
+        // The working tree is named explicitly alongside them. A leaf conversation may fairly
+        // assume it authored the code it remembers writing, and that assumption is exactly what a
+        // route change breaks: the reducer forgets the peer provider's coordinate for this lineage
+        // (so no conversation resumes across a change of author), but a leaf must not silently rely
+        // on that being the only way its memory of the tree can go stale.
         let framing = if resumed {
             format!(
-                "You are continuing your own earlier session as this task's contained implementation leaf. Now {role}. The descriptor and the applicable review artifact CHANGED since your last turn: re-read them and treat them, not your recollection, as authoritative."
+                "You are continuing your own earlier session as this task's contained implementation leaf. Now {role}. Your recollection is not evidence: the descriptor and the applicable review artifact CHANGED since your last turn, and the working tree may have been changed by someone other than you since then. Re-read the descriptor, the applicable review artifact, and every file you are about to touch, and treat their current on-disk contents — not your memory of them — as authoritative."
             )
         } else {
             format!(
@@ -2866,17 +2898,17 @@ impl ExternalPort for HeadlessExternalPort {
         let resume = key.and_then(|key| {
             self.resumable_session(state, task_id, key.provider, key.lineage, workspace)
         });
+        let resumed = resume.is_some();
         let invocation = self.invoke_claude_resuming(
-            self.task_prompt(task_id, kind, workspace, resume.is_some()),
+            self.task_prompt(task_id, kind, workspace, resumed),
             true,
             Some(workspace),
             state,
-            resume.clone(),
+            resume,
         )?;
-        if let Some(key) = key {
-            self.note_leaf_session(task_id, key, &invocation, resume.is_some());
-        }
-        self.finish_task_leaf(task_id, kind, state, invocation)
+        // `finish_task_leaf` owns the coordinate: it is the only place that knows whether this
+        // call's result was usable.
+        self.finish_task_leaf(task_id, kind, state, invocation, resumed)
     }
 
     fn take_leaf_session(&mut self, task_id: &str) -> Option<LeafSessionUpdate> {
@@ -3037,12 +3069,9 @@ impl ExternalPort for HeadlessExternalPort {
                 return Err(error);
             }
         };
-        self.note_leaf_session(
-            task_id,
-            LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Coder),
-            &invocation,
-            resumed,
-        );
+        let codex_coder = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Coder);
+        // A crash replay reconstructs a finalized attempt from its receipt: no child ran in this
+        // process, so it observed no conversation and must not disturb the durable coordinate.
         if let Some(replay_result) = invocation.replay_result.take() {
             let CodexReplayResult::TaskLeaf(prepared) = replay_result else {
                 return Err(HeadlessError::Protocol(
@@ -3130,6 +3159,10 @@ impl ExternalPort for HeadlessExternalPort {
             attempt: telemetry_attempt,
         };
         if codex_needs_claude_fallback(&invocation) {
+            // Codex declined this round; the task passes to Claude. Nothing about this call is
+            // worth continuing, and the reducer additionally drops the Claude peer's coordinate
+            // when Claude records the round it actually performed.
+            self.note_leaf_session(task_id, codex_coder, &invocation, resumed, false);
             let live_sandbox_limit = self.observe_live_codex_sandbox_limit(&invocation);
             if live_sandbox_limit.is_none() && canary {
                 self.finish_codex_canary(task_id, CodexCanaryState::Pending);
@@ -3148,11 +3181,19 @@ impl ExternalPort for HeadlessExternalPort {
             return Ok(prepared);
         }
         let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "coder_codex");
-        let changed_paths = if matches!(
-            &outcome,
-            LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. }
-        ) {
-            match Self::exact_changed_paths(&invocation.report) {
+        // Same rule as the Claude leaf: only a result the engine can actually accept — completion
+        // plus its mandatory changed-path evidence — makes this conversation worth continuing.
+        let parsed_paths =
+            leaf_completed(&outcome).then(|| Self::exact_changed_paths(&invocation.report));
+        self.note_leaf_session(
+            task_id,
+            codex_coder,
+            &invocation,
+            resumed,
+            matches!(parsed_paths, Some(Ok(_))),
+        );
+        let changed_paths = if let Some(parsed_paths) = parsed_paths {
+            match parsed_paths {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
                     if canary {
@@ -3677,15 +3718,7 @@ impl ExternalPort for HeadlessExternalPort {
                         resumed,
                     } => {
                         let invocation = self.claude_invocation(verdict);
-                        if let Some(lineage) = SessionLineage::for_leaf(kind) {
-                            self.note_leaf_session(
-                                &task_id,
-                                LeafSessionKey::new(SessionProvider::Claude, lineage),
-                                &invocation,
-                                resumed,
-                            );
-                        }
-                        self.finish_task_leaf(&task_id, kind, state, invocation)
+                        self.finish_task_leaf(&task_id, kind, state, invocation, resumed)
                             .map(|outcome| TaskEffectResult::Leaf { outcome })
                     }
                     ClaudeTaskBatchPlan::Review { task_id, review } => {
@@ -5060,10 +5093,10 @@ mod tests {
         let (root, _home, mut port) = session_fixture("session-invalidate");
         let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
 
-        // A healthy call publishes the conversation it reported.
+        // A call whose result was usable publishes the conversation it reported.
         let mut healthy = invocation_with_usage(10);
         healthy.session_id = Some("11111111-2222-3333-4444-555555555555".into());
-        port.note_leaf_session("T-1", coder, &healthy, false);
+        port.note_leaf_session("T-1", coder, &healthy, false, true);
         assert_eq!(
             port.take_leaf_session("T-1"),
             Some(LeafSessionUpdate::Observed {
@@ -5078,22 +5111,191 @@ mod tests {
         let mut crashed = invocation_with_usage(10);
         crashed.verdict.reason = Reason::Crash;
         crashed.session_id = Some("11111111-2222-3333-4444-555555555555".into());
-        port.note_leaf_session("T-1", coder, &crashed, true);
+        port.note_leaf_session("T-1", coder, &crashed, true, false);
         assert_eq!(
             port.take_leaf_session("T-1"),
             Some(LeafSessionUpdate::Invalidated { key: coder })
         );
 
+        // The decisive case for a resumed conversation: the child exited zero and reported its
+        // id, but the engine could not accept the result. Process health would call this healthy
+        // and keep continuing the same conversation into the same answer; usability forgets it.
+        port.note_leaf_session("T-1", coder, &healthy, true, false);
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder }),
+            "an exit-zero call whose result is unusable must not be continued"
+        );
+
         // The same failure on a call that did NOT resume changes nothing: there is no coordinate
         // of its own to forget, and a half-written conversation is not published.
-        port.note_leaf_session("T-1", coder, &crashed, false);
+        port.note_leaf_session("T-1", coder, &crashed, false, false);
+        assert_eq!(port.take_leaf_session("T-1"), None);
+        port.note_leaf_session("T-1", coder, &healthy, false, false);
         assert_eq!(port.take_leaf_session("T-1"), None);
 
         // A provider id that could escape its transcript directory is never published.
         let mut hostile = invocation_with_usage(10);
         hostile.session_id = Some("../../escape".into());
-        port.note_leaf_session("T-1", coder, &hostile, false);
+        port.note_leaf_session("T-1", coder, &hostile, false, true);
         assert_eq!(port.take_leaf_session("T-1"), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A port whose work tree can carry evidence, telemetry, and one task's review artifact.
+    fn outcome_fixture(label: &str) -> (PathBuf, PathBuf, HeadlessExternalPort) {
+        let (root, _home, port) = session_fixture(label);
+        let work = root.join(".work");
+        let task_dir = work.join("tasks").join("T-1");
+        fs::create_dir_all(work.join("native-evidence")).unwrap();
+        fs::create_dir_all(&task_dir).unwrap();
+        (root, task_dir, port)
+    }
+
+    /// The exact `review.md` an engine review-cycle gate writes before a reviewer is dispatched:
+    /// an open finding, and deliberately no reviewer verdict line.
+    const ENGINE_AUTHORED_REVIEW: &str =
+        "### [R-01] Проверка сборки/линта на цикле ревью не прошла — статус: новая\n";
+
+    #[test]
+    fn a_resumed_reviewer_that_reported_nothing_new_forgets_its_conversation() {
+        let (root, task_dir, mut port) = outcome_fixture("session-review-unusable");
+        let reviewer_key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(reviewer_key, id)]));
+        let prepared = |port: &HeadlessExternalPort, resumed: bool| ClaudeTaskReview {
+            reviewer: "reviewer",
+            since: "2026-07-25T12:00:00Z".into(),
+            head: "head".into(),
+            attempt: 1,
+            resumed,
+            spec: None,
+            artifact_before: port.review_artifact_digest("T-1").unwrap(),
+        };
+        let reported = |id: &str| {
+            let mut invocation = invocation_with_usage(1);
+            invocation.session_id = Some(id.to_owned());
+            invocation
+        };
+
+        // The failure mode resuming itself creates: the reviewer exits zero (`Reason::Ok`) and
+        // reports its conversation id, but leaves `review.md` byte-for-byte as it found it —
+        // most plausibly because the continued conversation remembers writing it last round.
+        fs::write(task_dir.join("review.md"), ENGINE_AUTHORED_REVIEW).unwrap();
+        let review = prepared(&port, true);
+        assert_eq!(
+            port.finish_task_review("T-1", review, &state, reported(id))
+                .unwrap(),
+            ReviewOutcome::Incomplete
+        );
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: reviewer_key }),
+            "an exit-zero round that produced no report must not be continued into repeating it"
+        );
+
+        // A round that did produce a report is unaffected: its conversation is published exactly
+        // as before, which is what makes the invalidation above a bounded fallback rather than a
+        // disabling of resume.
+        let review = prepared(&port, true);
+        fs::write(
+            task_dir.join("review.md"),
+            "### [R-01] Проверка сборки/линта на цикле ревью не прошла — статус: новая\n### [SUMMARY-R-2099-01-01T00:00:00Z] Итог ревью задачи — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            port.finish_task_review("T-1", review, &state, reported(id))
+                .unwrap(),
+            ReviewOutcome::Findings { .. }
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: reviewer_key,
+                id: id.into()
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resumed_leaf_whose_report_is_unusable_forgets_its_conversation() {
+        let (root, _task_dir, mut port) = outcome_fixture("session-leaf-unusable");
+        let coder_key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let mut state = telemetry_state();
+        state
+            .tasks
+            .insert("T-1".into(), task_with_sessions(&[(coder_key, id)]));
+        let reported = |report: &str| {
+            let mut invocation = invocation_with_usage(1);
+            invocation.session_id = Some(id.to_owned());
+            invocation.report = report.to_owned();
+            invocation
+        };
+
+        // An escalating leaf exits zero and keeps its conversation id, so process health calls it
+        // healthy. Its answer is a stable property of that conversation: continuing it spends the
+        // remaining fix attempts re-deriving the same escalation.
+        let escalated =
+            reported("blocked by a missing contract\nИТОГ: эскалация · причина=blocked");
+        assert!(matches!(
+            port.finish_task_leaf("T-1", LeafKind::Fix, &state, escalated, true)
+                .unwrap(),
+            LeafOutcome::Escalated { .. }
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder_key })
+        );
+
+        // A report that claims completion without its mandatory changed-path evidence is a
+        // protocol failure that aborts the turn. The coordinate is still forgotten here, and the
+        // driver persists that forget before surfacing the error, so the pending effect's retry
+        // re-seeds rather than resuming the conversation that produced the omission.
+        let no_evidence = reported("all done\nИТОГ: готово · режим=2");
+        assert!(matches!(
+            port.finish_task_leaf("T-1", LeafKind::Fix, &state, no_evidence, true),
+            Err(HeadlessError::Protocol(_))
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder_key })
+        );
+
+        // The usable round still publishes its conversation.
+        let completed = reported("Изменённые файлы: engine/src/lib.rs\nИТОГ: готово · режим=2");
+        assert!(matches!(
+            port.finish_task_leaf("T-1", LeafKind::Fix, &state, completed, true)
+                .unwrap(),
+            LeafOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: coder_key,
+                id: id.into()
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_continued_leaf_is_told_the_working_tree_may_have_moved_under_it() {
+        let (root, _home, port) = session_fixture("session-continuation-framing");
+        let resumed = port.task_prompt("T-1", LeafKind::Fix, &root, true);
+        // A route change hands the same lineage to the other provider, so "the code is as I left
+        // it" is not a safe default for a continued conversation.
+        assert!(resumed.contains("working tree may have been changed by someone other than you"));
+        assert!(resumed.contains("every file you are about to touch"));
+        assert!(resumed.contains("current on-disk contents"));
+        // The fresh seed is unchanged: it has no recollection to distrust.
+        let fresh = port.task_prompt("T-1", LeafKind::Fix, &root, false);
+        assert!(!fresh.contains("working tree may have been changed"));
+        assert!(fresh.contains("You are a contained implementation leaf."));
         let _ = fs::remove_dir_all(root);
     }
 

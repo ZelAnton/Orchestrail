@@ -293,6 +293,10 @@ pub struct TaskRuntime {
     /// escalation can depend on whether a conversation happens to still exist. A checkpoint
     /// written before durable sessions simply has no map and re-seeds full context, exactly as
     /// the engine behaved before.
+    ///
+    /// [`Processor::record_leaf_session`] keeps at most one entry per lineage: the two providers'
+    /// keys for one lineage are mutually exclusive, because only the provider that last ran can
+    /// know what the working tree now contains.
     #[serde(default)]
     pub leaf_sessions: BTreeMap<String, String>,
 }
@@ -2227,10 +2231,6 @@ impl Processor {
         Ok(effects)
     }
 
-    /// Retire recovery-only metadata after a non-command effect has completed.  Most effects do
-    /// not change reducer state at acknowledgement time; a legacy conflict return is the narrow
-    /// exception because retaining its import marker would schedule another counter increment on
-    /// the next Phase-0 pass.
     /// Record or forget one task's provider conversation coordinate.
     ///
     /// This deliberately is NOT a [`ProcessorCommand`]. A session id is not a decision: it
@@ -2244,31 +2244,50 @@ impl Processor {
     /// It is also safe outside the effect ledger precisely because it is orthogonal: a write lost
     /// to a crash, or one durable for a call that was never acknowledged, can at worst cost one
     /// re-seeded leaf call — never a replayed model call or a skipped review.
+    ///
+    /// One lineage keeps at most ONE resumable conversation, and it belongs to the provider whose
+    /// call last ran. Routing may hand the same task's coder lineage to Claude in one round and to
+    /// Codex in the next (`route_coder` reacts to durable descriptor metadata, and a Codex fallback
+    /// hands the round to Claude outright), and the provider that did not run has no way to learn
+    /// that the working tree moved underneath its conversation. Continuing such a peer would let it
+    /// re-apply a change that is already in the tree or "fix" code that no longer exists — a silent
+    /// corruption inside the fix cycle rather than a failed call. Forgetting it instead costs one
+    /// re-seeded call, which is exactly the behaviour that predates durable sessions.
     pub(crate) fn record_leaf_session(
         &mut self,
         task_id: &str,
         update: &LeafSessionUpdate,
     ) -> Result<(), ProcessorError> {
         let key = update.key().as_durable_key();
+        let peer_key = update.key().peer().as_durable_key();
         let task = self.task_mut(task_id)?;
         match update {
             LeafSessionUpdate::Observed { id, .. } => {
                 // Defence in depth: the adapter already refuses a malformed provider id, and the
-                // durable checkpoint must never become a carrier for one either.
+                // durable checkpoint must never become a carrier for one either. Reject before any
+                // mutation, so a rejected write leaves the map exactly as it was.
                 if !is_valid_session_id(id) {
                     return Err(ProcessorError::InvalidCommand(format!(
                         "task {task_id} reported a malformed provider session id for {key}"
                     )));
                 }
+                task.leaf_sessions.remove(&peer_key);
                 task.leaf_sessions.insert(key, id.clone());
             }
             LeafSessionUpdate::Invalidated { .. } => {
+                // A call that ran and failed may still have edited the tree before failing, so the
+                // peer is no less stale here than after a successful round.
+                task.leaf_sessions.remove(&peer_key);
                 task.leaf_sessions.remove(&key);
             }
         }
         Ok(())
     }
 
+    /// Retire recovery-only metadata after a non-command effect has completed.  Most effects do
+    /// not change reducer state at acknowledgement time; a legacy conflict return is the narrow
+    /// exception because retaining its import marker would schedule another counter increment on
+    /// the next Phase-0 pass.
     pub(crate) fn acknowledge_non_command_effect(
         &mut self,
         effect: &Effect,
@@ -6890,6 +6909,87 @@ mod tests {
         assert_eq!(
             with_state.tasks["T-1"].leaf_session(reviewer),
             Some("019f054f-5e70-7d42-8586-ee66e3ac1d1e")
+        );
+    }
+
+    #[test]
+    fn a_lineage_keeps_only_the_conversation_of_the_provider_that_last_ran_it() {
+        use crate::session::{LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProvider};
+
+        let claude_coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let codex_coder = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Coder);
+        let claude_reviewer =
+            LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer);
+        let codex_id = "019f054f-5e70-7d42-8586-ee66e3ac1d1e";
+        let claude_id = "11111111-2222-3333-4444-555555555555";
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        let observe = |p: &mut Processor, key, id: &str| {
+            p.record_leaf_session("T-1", &LeafSessionUpdate::Observed { key, id: id.into() })
+                .unwrap();
+        };
+
+        // Round 1 is routed to Codex, round 2 to Claude. Both are ordinary `route_coder`
+        // outcomes for one task, and only the second one saw the tree it left behind.
+        observe(&mut p, codex_coder, codex_id);
+        observe(&mut p, claude_reviewer, claude_id);
+        observe(&mut p, claude_coder, claude_id);
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(codex_coder),
+            None,
+            "round 3 must not resume the Codex conversation that predates Claude's round"
+        );
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(claude_coder),
+            Some(claude_id)
+        );
+        // Only the peer of the SAME lineage is dropped: an independent reviewer's conversation is
+        // untouched by whoever authored the code.
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(claude_reviewer),
+            Some(claude_id)
+        );
+
+        // Routing back to Codex re-seeds it, and now Claude's coder conversation is the stale one.
+        observe(&mut p, codex_coder, codex_id);
+        assert_eq!(p.state().tasks["T-1"].leaf_session(claude_coder), None);
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(codex_coder),
+            Some(codex_id)
+        );
+
+        // A call that ran and failed may still have edited the tree, so it leaves the lineage with
+        // no resumable conversation at all rather than handing one back to its peer.
+        observe(&mut p, claude_coder, claude_id);
+        p.record_leaf_session("T-1", &LeafSessionUpdate::Invalidated { key: codex_coder })
+            .unwrap();
+        assert_eq!(p.state().tasks["T-1"].leaf_session(claude_coder), None);
+        assert_eq!(p.state().tasks["T-1"].leaf_session(codex_coder), None);
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(claude_reviewer),
+            Some(claude_id)
+        );
+
+        // A rejected id changes nothing at all, peer included.
+        observe(&mut p, codex_coder, codex_id);
+        assert!(matches!(
+            p.record_leaf_session(
+                "T-1",
+                &LeafSessionUpdate::Observed {
+                    key: claude_coder,
+                    id: "../../escape".into()
+                }
+            ),
+            Err(ProcessorError::InvalidCommand(_))
+        ));
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(codex_coder),
+            Some(codex_id)
         );
     }
 

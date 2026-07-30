@@ -197,9 +197,13 @@ pub fn drive<E: EffectExecutor>(
                 }
                 let operation_started_at = wall_epoch_millis();
                 let started = Instant::now();
-                let resolutions = executor
-                    .execute_batch(&effects, runtime.state())
-                    .map_err(DriveError::Executor)?;
+                let resolutions = match executor.execute_batch(&effects, runtime.state()) {
+                    Ok(resolutions) => resolutions,
+                    Err(error) => {
+                        forget_staged_leaf_sessions(runtime, &effects, executor);
+                        return Err(DriveError::Executor(error));
+                    }
+                };
                 let batch_duration_ms = elapsed_millis(started);
                 let operation_ended_at = wall_epoch_millis();
                 if resolutions.len() != effects.len() {
@@ -249,9 +253,17 @@ pub fn drive<E: EffectExecutor>(
             _ => {
                 let operation_started_at = wall_epoch_millis();
                 let started = Instant::now();
-                let resolution = executor
-                    .execute(&effect, runtime.state())
-                    .map_err(DriveError::Executor)?;
+                let resolution = match executor.execute(&effect, runtime.state()) {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        forget_staged_leaf_sessions(
+                            runtime,
+                            std::slice::from_ref(&effect),
+                            executor,
+                        );
+                        return Err(DriveError::Executor(error));
+                    }
+                };
                 let duration_ms = elapsed_millis(started);
                 let operation_ended_at = wall_epoch_millis();
                 let event_occurred_at = executor
@@ -293,11 +305,8 @@ fn record_leaf_session<E: EffectExecutor>(
     effect: &Effect,
     executor: &mut E,
 ) -> Result<(), DriveError<E::Error>> {
-    let task_id = match effect {
-        Effect::PrepareTaskLeaf { task_id, .. }
-        | Effect::PrepareTaskReview { task_id }
-        | Effect::DispatchTask { task_id, .. } => task_id.clone(),
-        _ => return Ok(()),
+    let Some(task_id) = leaf_session_task_id(effect) else {
+        return Ok(());
     };
     let Some(update) = executor.take_leaf_session(&task_id) else {
         return Ok(());
@@ -305,6 +314,45 @@ fn record_leaf_session<E: EffectExecutor>(
     runtime
         .record_leaf_session(&task_id, &update)
         .map_err(DriveError::Runtime)
+}
+
+/// Only task-scoped leaf effects carry a conversation lineage.
+fn leaf_session_task_id(effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::PrepareTaskLeaf { task_id, .. }
+        | Effect::PrepareTaskReview { task_id }
+        | Effect::DispatchTask { task_id, .. } => Some(task_id.clone()),
+        _ => None,
+    }
+}
+
+/// Persist the coordinates a FAILING turn asked to forget, then let the adapter's error stand.
+///
+/// An executor error aborts the turn without acknowledging anything, so the leaf effect stays
+/// pending and a later run dispatches it again. Without this, a leaf whose report was unusable
+/// enough to abort the turn (a completed leaf that omitted its mandatory changed-path evidence)
+/// would keep its durable coordinate and the retry would resume the very conversation that
+/// produced it — the attractor the invalidation exists to break.
+///
+/// Only forgetting is applied here. Publishing a coordinate observed by a turn that then failed
+/// would let a retry resume a conversation whose effect was never acknowledged, which is a new
+/// resume rather than the removal of one; and the adapter's own error is the one worth reporting,
+/// so a rejection of this bookkeeping is deliberately dropped instead of replacing it.
+fn forget_staged_leaf_sessions<E: EffectExecutor>(
+    runtime: &mut ProcessorRuntime,
+    effects: &[Effect],
+    executor: &mut E,
+) {
+    for effect in effects {
+        let Some(task_id) = leaf_session_task_id(effect) else {
+            continue;
+        };
+        if let Some(update @ LeafSessionUpdate::Invalidated { .. }) =
+            executor.take_leaf_session(&task_id)
+        {
+            let _ = runtime.record_leaf_session(&task_id, &update);
+        }
+    }
 }
 
 /// Apply a single result only after its originating effect is known.  A batch reuses the exact
@@ -924,6 +972,137 @@ mod tests {
             reloaded.state().tasks["T-1"].leaf_session(key),
             Some("11111111-2222-3333-4444-555555555555")
         );
+
+        let _ = fs::remove_dir_all(work);
+    }
+
+    /// An adapter rejection that carries no reducer result, exactly like a leaf whose report
+    /// violated its protocol contract.
+    #[derive(Debug)]
+    struct AdapterRejection;
+
+    impl std::fmt::Display for AdapterRejection {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "adapter refused the leaf result")
+        }
+    }
+
+    impl std::error::Error for AdapterRejection {}
+
+    /// Behaves exactly like [`ScriptedExecutor`] until `armed`, then rejects the next task
+    /// dispatch after its session bookkeeping has already been staged.
+    #[derive(Default)]
+    struct FailingDispatchExecutor {
+        inner: ScriptedExecutor,
+        armed: bool,
+    }
+
+    impl EffectExecutor for FailingDispatchExecutor {
+        type Error = AdapterRejection;
+
+        fn take_leaf_session(&mut self, task_id: &str) -> Option<LeafSessionUpdate> {
+            self.inner.take_leaf_session(task_id)
+        }
+
+        fn execute(
+            &mut self,
+            effect: &Effect,
+            state: &ProcessorState,
+        ) -> Result<EffectResolution, Self::Error> {
+            if self.armed && matches!(effect, Effect::DispatchTask { .. }) {
+                return Err(AdapterRejection);
+            }
+            self.inner
+                .execute(effect, state)
+                .map_err(|error: Infallible| match error {})
+        }
+    }
+
+    #[test]
+    fn a_forget_staged_by_a_failing_turn_is_still_made_durable() {
+        let work = work();
+        let mut runtime = ProcessorRuntime::new(
+            ProcessorConfig {
+                max_parallel: 1,
+                cohort_size: 1,
+                ..ProcessorConfig::default()
+            },
+            &work,
+        )
+        .unwrap();
+        let key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        let at = "2026-07-24T12:00:00Z";
+        let mut executor = FailingDispatchExecutor::default();
+
+        let recovered = runtime
+            .apply_at(
+                ProcessorCommand::Recover {
+                    workspaces_present: Default::default(),
+                },
+                at,
+            )
+            .unwrap();
+        drive(&mut runtime, recovered, at, &mut executor, 100).unwrap();
+        let opened = runtime
+            .apply_at(
+                ProcessorCommand::Open {
+                    batch_id: "B-test".into(),
+                    base: "base".into(),
+                    now_secs: 1,
+                },
+                at,
+            )
+            .unwrap();
+        drive(&mut runtime, opened, at, &mut executor, 100).unwrap();
+        assert_eq!(runtime.state().tasks["T-1"].phase, TaskPhase::Ready);
+        runtime
+            .record_leaf_session("T-1", &LeafSessionUpdate::Observed { key, id: id.into() })
+            .unwrap();
+
+        // The leaf ran, returned something the adapter could not accept (a completed report
+        // without its mandatory changed-path evidence), and staged the forget that keeps its
+        // conversation from being continued. The turn then fails without acknowledging anything,
+        // so the effect stays pending and a later recovery dispatches it again.
+        executor.armed = true;
+        executor
+            .inner
+            .sessions
+            .insert("T-1".into(), LeafSessionUpdate::Invalidated { key });
+        let dispatch = || {
+            [Effect::DispatchTask {
+                task_id: "T-1".into(),
+                kind: LeafKind::Fix,
+            }]
+        };
+        assert!(matches!(
+            drive(&mut runtime, dispatch(), at, &mut executor, 100),
+            Err(DriveError::Executor(AdapterRejection))
+        ));
+        assert_eq!(
+            runtime.state().tasks["T-1"].leaf_session(key),
+            None,
+            "the retry must re-seed rather than resume the conversation that failed the turn"
+        );
+
+        // The converse is deliberately not symmetric: an observation from a turn that failed is
+        // dropped. Publishing it would let the retry of an unacknowledged effect resume a
+        // conversation, which is a new resume rather than the removal of one.
+        runtime
+            .record_leaf_session("T-1", &LeafSessionUpdate::Observed { key, id: id.into() })
+            .unwrap();
+        executor.inner.sessions.insert(
+            "T-1".into(),
+            LeafSessionUpdate::Observed {
+                key,
+                id: "66666666-7777-8888-9999-000000000000".into(),
+            },
+        );
+        assert!(matches!(
+            drive(&mut runtime, dispatch(), at, &mut executor, 100),
+            Err(DriveError::Executor(AdapterRejection))
+        ));
+        assert_eq!(runtime.state().tasks["T-1"].leaf_session(key), Some(id));
 
         let _ = fs::remove_dir_all(work);
     }

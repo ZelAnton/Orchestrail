@@ -49,6 +49,19 @@ impl SessionProvider {
             Self::Codex => "codex",
         }
     }
+
+    /// The other provider that can run the same leaf lineage for the same task.
+    ///
+    /// Routing decides per round which provider makes a task's next coder call, so both providers
+    /// legitimately hold a conversation about one lineage — and only one of them can have authored
+    /// the tree as it now stands. A third provider would deliberately fail to compile here rather
+    /// than silently leave two stale peers behind.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::Claude,
+        }
+    }
 }
 
 /// Which leaf role lineage a conversation belongs to.
@@ -102,17 +115,32 @@ impl LeafSessionKey {
     pub fn as_durable_key(&self) -> String {
         format!("{}:{}", self.provider.as_str(), self.lineage.as_str())
     }
+
+    /// The same lineage as run by the other provider.
+    ///
+    /// This peer is what makes a lineage's memory falsifiable across a route change: when one
+    /// provider runs a round, the peer's conversation still remembers a tree that provider never
+    /// saw change.
+    pub fn peer(&self) -> Self {
+        Self::new(self.provider.other(), self.lineage)
+    }
 }
 
 /// Orthogonal bookkeeping produced by a leaf call for its own conversation coordinate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeafSessionUpdate {
-    /// The provider reported this conversation id for the named lineage.
+    /// The provider reported this conversation id for the named lineage AND the call it came from
+    /// produced a usable result. Usability, not process health, is the condition: a conversation
+    /// worth continuing is one that did the job, and only the caller's own outcome classification
+    /// knows that.
     Observed { key: LeafSessionKey, id: String },
-    /// A call that DID resume this coordinate failed. Forgetting it guarantees the next attempt
-    /// re-seeds with full context instead of retrying an unusable resume, so a provider whose CLI
-    /// cannot resume at all costs at most one call per lineage before the engine is back to its
-    /// previous behaviour.
+    /// A call that DID resume this coordinate came back unusable — a crashed or cancelled child,
+    /// or an exit-zero child whose result the engine cannot accept (an incomplete review, an
+    /// escalated leaf, a report missing its machine-readable evidence). Forgetting the coordinate
+    /// guarantees the next attempt re-seeds with full context instead of continuing a conversation
+    /// that has already settled into that answer, so both a provider whose CLI cannot resume and a
+    /// conversation that became an attractor cost at most one call per lineage before the engine is
+    /// back to its previous behaviour.
     Invalidated { key: LeafSessionKey },
 }
 
