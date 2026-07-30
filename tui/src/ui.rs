@@ -192,12 +192,15 @@ fn cost_label(app: &AppState) -> String {
             if usage_events == 0 {
                 return "стоимость —".into();
             }
-            let model_note = summary
+            let model_note = if summary
                 .cost_by_model
                 .get("default")
                 .is_some_and(|cost| cost.unknown)
-                .then_some(" (модель не настроена)")
-                .unwrap_or("");
+            {
+                " (модель не настроена)"
+            } else {
+                ""
+            };
             format!(
                 "стоимость {}{model_note}",
                 summary.estimated_cost.format_usd()
