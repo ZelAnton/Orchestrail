@@ -7,9 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::approval::{
@@ -399,172 +399,24 @@ fn knowledge_sentinel_completed(work: &Path, batch_id: &str) -> io::Result<bool>
         .map(|value| value.is_some())
 }
 
-fn redirected_metadata(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-fn require_plain_native_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if !metadata.is_dir() || redirected_metadata(metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "native evidence parent is not a plain directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn require_plain_native_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if !metadata.is_file() || redirected_metadata(metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "native evidence is not a plain regular file: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_native_parent_chain(work: &Path, path: &Path, create: bool) -> io::Result<bool> {
-    let relative = path.strip_prefix(work).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("native evidence escapes .work: {}", path.display()),
-        )
-    })?;
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("native evidence path is not confined: {}", path.display()),
-        ));
-    }
-    require_plain_native_directory(work, &fs::symlink_metadata(work)?)?;
-    let mut current = work.to_path_buf();
-    if let Some(parent) = relative.parent() {
-        for component in parent.components() {
-            let Component::Normal(component) = component else {
-                unreachable!("validated above")
-            };
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) => require_plain_native_directory(&current, &metadata)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound && !create => {
-                    return Ok(false);
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    fs::create_dir(&current)?;
-                    require_plain_native_directory(&current, &fs::symlink_metadata(&current)?)?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    Ok(true)
-}
-
+/// Persist one native evidence transcript atomically below `.work`.
+///
+/// [`work_fs::replace_file`] is the shared atomic replacement: it proves the work root, the parent
+/// chain, and any existing target without following a symlink or Windows reparse point, syncs a
+/// same-directory temporary file before renaming it, and re-proves the result afterwards. A crash
+/// therefore never exposes a partially written transcript, and a redirected parent can never divert
+/// evidence outside the work root.
 fn replace_native_evidence(work: &Path, path: &Path, payload: &[u8]) -> io::Result<()> {
-    ensure_native_parent_chain(work, path, true)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => require_plain_native_file(path, &metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
     work_fs::replace_file(work, path, payload, MAX_NATIVE_EVIDENCE_BYTES)
 }
 
+/// Read one bounded native evidence transcript through the shared confined reader.
+///
+/// Absence — of the artifact itself or of its parent chain — is reported as `None`, so each caller
+/// decides whether a missing transcript blocks acknowledgement. Every confinement, limit, and
+/// encoding violation fails loudly instead of degrading into that recoverable absence.
 fn read_native_evidence(work: &Path, path: &Path) -> io::Result<Option<String>> {
-    if !ensure_native_parent_chain(work, path, false)? {
-        return Ok(None);
-    }
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    require_plain_native_file(path, &before)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    let opened = file.metadata()?;
-    require_plain_native_file(path, &opened)?;
-    if opened.len() > MAX_NATIVE_EVIDENCE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "native evidence exceeds the {MAX_NATIVE_EVIDENCE_BYTES}-byte limit: {}",
-                path.display()
-            ),
-        ));
-    }
-    let mut text = String::new();
-    (&mut file)
-        .take(MAX_NATIVE_EVIDENCE_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_NATIVE_EVIDENCE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "native evidence grew beyond the {MAX_NATIVE_EVIDENCE_BYTES}-byte limit: {}",
-                path.display()
-            ),
-        ));
-    }
-    require_plain_native_file(path, &fs::symlink_metadata(path)?)?;
-    Ok(Some(text))
-}
-
-fn read_native_evidence_directory(work: &Path, path: &Path) -> io::Result<Option<fs::ReadDir>> {
-    if !ensure_native_parent_chain(work, path, false)? {
-        return Ok(None);
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    require_plain_native_directory(path, &metadata)?;
-    fs::read_dir(path).map(Some)
+    work_fs::read_optional_text(work, path, MAX_NATIVE_EVIDENCE_BYTES)
 }
 
 impl<E: fmt::Display> fmt::Display for NativePortError<E> {
@@ -2309,7 +2161,7 @@ impl<E: ExternalPort> FileVcsPort<E> {
         head: &str,
     ) -> Result<Option<TaskReviewRangeEvidence>, NativePortError<E::Error>> {
         let directory = self.control.work().join("native-evidence");
-        let entries = match read_native_evidence_directory(self.control.work(), &directory)
+        let entries = match work_fs::plain_directory_entries(self.control.work(), &directory)
             .map_err(|error| NativePortError::Control(ControlError::Io(error)))?
         {
             Some(entries) => entries,
@@ -2318,7 +2170,6 @@ impl<E: ExternalPort> FileVcsPort<E> {
         let prefix = format!("review-range-{task_id}-");
         let mut matching = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|error| NativePortError::Control(ControlError::Io(error)))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -4379,8 +4230,12 @@ mod tests {
         assert!(validate_task_risk_elevation(None, crate::resolvers::Risk::High).is_err());
     }
 
+    /// Evidence writes and reads must fail closed whenever the `native-evidence` parent is not a
+    /// plain directory. The plain-file case runs everywhere; the redirected case additionally
+    /// proves that no symlinked parent can divert a transcript outside the work root, and is
+    /// skipped only on hosts where creating a symlink needs privileges the test does not have.
     #[test]
-    fn native_evidence_rejects_a_redirected_parent_directory() {
+    fn native_evidence_rejects_a_parent_that_is_not_a_plain_directory() {
         let root = std::env::temp_dir().join(format!(
             "orchestrail-native-evidence-parent-{}-{}",
             std::process::id(),
@@ -4390,6 +4245,19 @@ mod tests {
         let external = root.join("external");
         fs::create_dir_all(&work).unwrap();
         fs::create_dir_all(&external).unwrap();
+
+        let occupied = work.join("native-evidence");
+        fs::write(&occupied, "not a directory\n").unwrap();
+        let artifact = occupied.join("review-range-T-1-1.json");
+        assert!(replace_native_evidence(&work, &artifact, b"{}\n").is_err());
+        assert!(read_native_evidence(&work, &artifact).is_err());
+        assert_eq!(
+            fs::read_to_string(&occupied).unwrap(),
+            "not a directory\n",
+            "a rejected write must not overwrite the occupying entry"
+        );
+        fs::remove_file(&occupied).unwrap();
+
         let redirected = work.join("native-evidence");
         #[cfg(windows)]
         let linked = std::os::windows::fs::symlink_dir(&external, &redirected).is_ok();

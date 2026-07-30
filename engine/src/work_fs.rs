@@ -528,6 +528,66 @@ mod tests {
         let _ = fs::remove_dir_all(work);
     }
 
+    /// The confined optional reader is the primitive that `headless`, `vcs`, and `native_port`
+    /// delegate their former private copies to. Absence of the artifact — or of its parent chain
+    /// — must stay a recoverable `None`, while every confinement, limit, and encoding violation
+    /// must fail loudly: those two halves are exactly what those modules map onto their own error
+    /// types, so a silent change here would weaken three trust boundaries at once.
+    #[test]
+    fn confined_optional_reader_separates_absence_from_violation() {
+        let work = temp_root("optional-reader");
+        let outside = temp_root("optional-reader-outside");
+        fs::create_dir(&work).unwrap();
+        fs::create_dir(&outside).unwrap();
+
+        assert_eq!(
+            read_optional_text(&work, &work.join("review.md"), 32).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_optional_text(&work, &work.join("absent/review.md"), 32).unwrap(),
+            None
+        );
+        assert!(
+            plain_directory_entries(&work, &work.join("absent"))
+                .unwrap()
+                .is_none()
+        );
+
+        let directory = work.join("nested");
+        fs::create_dir(&directory).unwrap();
+        let error = read_optional_text(&work, &directory, 32).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("plain regular file"));
+
+        let binary = directory.join("binary.md");
+        fs::write(&binary, [0xff_u8, 0xfe]).unwrap();
+        let error = read_optional_text(&work, &binary, 32).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not UTF-8"));
+
+        // A parent component that exists but is not a plain directory must fail closed instead of
+        // degrading into "artifact absent". On a host without symlink privileges this is the only
+        // locally executable proof that the parent chain is *proven* rather than merely walked.
+        let error = read_optional_text(&work, &binary.join("leaf.md"), 32).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("plain directory"));
+
+        let external = outside.join("outside.md");
+        fs::write(&external, "outside\n").unwrap();
+        assert_eq!(
+            read_optional_text(&work, &external, 32).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            read_optional_text(&work, &work, 32).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let _ = fs::remove_dir_all(work);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[test]
     fn bounded_directory_enumeration_fails_loudly_at_its_ceiling() {
         let work = temp_root("bounded-directory");
