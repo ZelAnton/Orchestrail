@@ -41,8 +41,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use orchestrail_engine::config;
 use orchestrail_engine::events::TailReader;
 use orchestrail_engine::state::Snapshot;
+use orchestrail_engine::telemetry::batch_telemetry_summary_with_pricing;
 use orchestrail_engine::work_fs;
 
 use app::{AppState, InboxPanel, Modal, Screen};
@@ -82,6 +84,7 @@ fn run(cfg: Config) -> io::Result<()> {
     app.apply_all(&reader.poll()?);
     app.status = status::load(&status_path);
     app.replace_inbox(load_inbox(&cfg.work_dir));
+    refresh_batch_telemetry(&mut app, &cfg.work_dir);
 
     terminal::install_panic_hook();
     let mut term = terminal::init()?;
@@ -96,6 +99,7 @@ fn run(cfg: Config) -> io::Result<()> {
         let new = reader.poll()?;
         if !new.is_empty() {
             app.apply_all(&new);
+            refresh_batch_telemetry(&mut app, &cfg.work_dir);
         }
 
         // 2. Refresh the status.md overlay and the Decision Inbox on a gentle cadence (small
@@ -152,6 +156,7 @@ fn handle_key(
         KeyCode::Char('r') if k.modifiers.is_empty() => {
             app.status = status::load(status_path);
             app.replace_inbox(load_inbox(&cfg.work_dir));
+            refresh_batch_telemetry(app, &cfg.work_dir);
             *last_status_reload = Instant::now();
         }
         // ---- §5/§6.2 safe command subset --------------------------------------------------
@@ -235,6 +240,26 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+fn refresh_batch_telemetry(app: &mut AppState, work: &Path) {
+    let Ok(config) = config::load(work) else {
+        app.cohort_token_budget = None;
+        app.batch_telemetry = None;
+        return;
+    };
+    app.cohort_token_budget = config.processor.cohort_token_budget;
+    let Some(batch_id) = app.batch.as_ref().map(|batch| batch.batch_id.clone()) else {
+        app.batch_telemetry = None;
+        return;
+    };
+    app.batch_telemetry = batch_telemetry_summary_with_pricing(
+        work,
+        &batch_id,
+        config.events_outbox,
+        &config.model_pricing,
+    )
+    .ok();
 }
 
 /// Input while the force-lock confirmation modal is open: only an explicit confirm (`y`/`Y`/Enter)
