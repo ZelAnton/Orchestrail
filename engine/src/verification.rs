@@ -124,9 +124,14 @@ pub fn exemption_evidence(
     }
 }
 
-/// Legacy-compatible docs-only classifier over a typed VCS range. A range with no changed files
-/// is never a documentation change. Callers must supply both sides of a rename/copy so moving
-/// source into a Markdown-looking path remains executable rather than gaining an exemption.
+/// Fail-closed docs-only classifier over a typed VCS range. Documentation-like stems (`readme`,
+/// `changelog`, `contributing`, `license`, `agents`, and `claude`) count as documentation only
+/// without an extension or with `.md`, `.txt`, or `.rst`. This intentionally diverges from legacy
+/// `verification.ps1`, which accepts those stems with any extension: the stricter rule prevents
+/// code files such as `agents.rs`, `claude.rs`, or `license.py` from becoming docs-exempt solely
+/// because of their stem. A range with no changed files is never a documentation change. Callers
+/// must supply both sides of a rename/copy so moving source into a Markdown-looking path remains
+/// executable rather than gaining an exemption.
 pub fn is_docs_only(paths: &[PathBuf]) -> bool {
     !paths.is_empty() && paths.iter().all(|path| is_documentation_path(path))
 }
@@ -143,13 +148,19 @@ fn is_documentation_path(path: &Path) -> bool {
         return false;
     };
     let file_name = file_name.to_ascii_lowercase();
-    let stem = file_name
-        .split_once('.')
-        .map_or(file_name.as_str(), |(before, _)| before);
+    if file_name.ends_with(".md") {
+        return true;
+    }
+
+    let (stem, extension) = file_name
+        .rsplit_once('.')
+        .map_or((file_name.as_str(), None), |(stem, extension)| {
+            (stem, Some(extension))
+        });
     matches!(
         stem,
         "readme" | "changelog" | "contributing" | "license" | "agents" | "claude"
-    ) || file_name.ends_with(".md")
+    ) && matches!(extension, None | Some("md" | "txt" | "rst"))
 }
 
 /// JSON shape intentionally shared with legacy `verification.ps1`. The Rust engine does not use
@@ -821,16 +832,25 @@ mod tests {
     #[test]
     fn docs_only_classification_requires_a_nonempty_fully_documentary_typed_range() {
         assert!(is_docs_only(&[
-            PathBuf::from("docs/guide.rs"),
+            PathBuf::from("docs/code.rs"),
             PathBuf::from("README.md"),
             PathBuf::from("Docs/README.MD"),
             PathBuf::from("nested/CHANGELOG"),
+            PathBuf::from("LICENSE"),
+            PathBuf::from("AGENTS"),
+            PathBuf::from("readme.md"),
+            PathBuf::from("changelog.txt"),
+            PathBuf::from("contributing.rst"),
+            PathBuf::from("engine/design-notes.md"),
         ]));
         assert!(!is_docs_only(&[]));
         assert!(!is_docs_only(&[
             PathBuf::from("docs/guide.md"),
             PathBuf::from("engine/src/lib.rs"),
         ]));
+        assert!(!is_docs_only(&[PathBuf::from("claude.rs")]));
+        assert!(!is_docs_only(&[PathBuf::from("agents.rs")]));
+        assert!(!is_docs_only(&[PathBuf::from("license.py")]));
     }
 
     #[test]

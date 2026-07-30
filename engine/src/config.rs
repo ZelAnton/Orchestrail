@@ -13,6 +13,7 @@ use crate::codex::Sandbox;
 use crate::command_line::{parse_typed_argv, validate_direct_program};
 use crate::processor::{ProcessorConfig, ProcessorError};
 use crate::resolvers::{CodexCoder, CodexReviewer};
+use crate::telemetry::{DEFAULT_PRICING_EFFECTIVE_DATE, ModelPricing, PricingTable, UsdPerMillion};
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub struct EngineConfig {
     pub approval_deadline_secs: u64,
     pub reviewer_tiering: bool,
     pub codex: CodexConfig,
+    /// Dated built-in USD rates, selectively replaced or extended by operator configuration.
+    pub model_pricing: PricingTable,
 }
 
 /// Strictly resolved Codex routing/runtime configuration. The two routing flags may inherit an
@@ -170,6 +173,7 @@ impl Default for EngineConfig {
                 model: None,
                 command: "codex".into(),
             },
+            model_pricing: PricingTable::default(),
         }
     }
 }
@@ -416,6 +420,7 @@ fn parse_with_environment(
         })?;
         config.codex.command = command.to_string();
     }
+    apply_model_pricing_overrides(&mut config.model_pricing, &fields)?;
 
     config
         .processor
@@ -453,6 +458,129 @@ fn configured_value<'a>(fields: &'a BTreeMap<String, String>, key: &str) -> Opti
         .get(key)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn apply_model_pricing_overrides(
+    pricing: &mut PricingTable,
+    fields: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    const PRICES_KEY: &str = "MODEL_PRICES_USD_PER_MILLION";
+    let effective_date = configured_value(fields, "MODEL_PRICES_EFFECTIVE_DATE")
+        .unwrap_or(DEFAULT_PRICING_EFFECTIVE_DATE);
+    if !valid_pricing_date(effective_date) {
+        return Err(invalid(format!(
+            "MODEL_PRICES_EFFECTIVE_DATE must be YYYY-MM-DD; got {effective_date:?}"
+        )));
+    }
+    let Some(value) = configured_value(fields, PRICES_KEY) else {
+        return Ok(());
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for raw_entry in value.split(';') {
+        let entry = raw_entry.trim();
+        if entry.is_empty() {
+            return Err(invalid(format!("{PRICES_KEY} contains an empty entry")));
+        }
+        let (model, raw_rates) = entry.split_once('=').ok_or_else(|| {
+            invalid(format!(
+                "{PRICES_KEY} entries must be model=input,output[,cached[,cache-creation]]; got {entry:?}"
+            ))
+        })?;
+        let model = model.trim();
+        if !valid_pricing_model(model) {
+            return Err(invalid(format!(
+                "{PRICES_KEY} contains invalid model name {model:?}"
+            )));
+        }
+        if !seen.insert(model.to_owned()) {
+            return Err(invalid(format!(
+                "{PRICES_KEY} contains duplicate model {model:?}"
+            )));
+        }
+        let rates = raw_rates.split(',').map(str::trim).collect::<Vec<_>>();
+        if !(2..=4).contains(&rates.len()) {
+            return Err(invalid(format!(
+                "{PRICES_KEY} entry {model:?} needs 2 to 4 rates"
+            )));
+        }
+        let input = parse_usd_per_million(PRICES_KEY, rates[0])?;
+        let output = parse_usd_per_million(PRICES_KEY, rates[1])?;
+        let cached_input = rates
+            .get(2)
+            .map(|value| parse_usd_per_million(PRICES_KEY, value))
+            .transpose()?
+            .unwrap_or(input);
+        let cache_creation_input = rates
+            .get(3)
+            .map(|value| parse_usd_per_million(PRICES_KEY, value))
+            .transpose()?
+            .unwrap_or(input);
+        pricing.insert(ModelPricing {
+            model: model.into(),
+            input,
+            cached_input,
+            cache_creation_input,
+            output,
+            effective_date: effective_date.into(),
+        });
+    }
+    Ok(())
+}
+
+fn valid_pricing_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 160
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+fn valid_pricing_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn parse_usd_per_million(key: &str, value: &str) -> Result<UsdPerMillion, ConfigError> {
+    if value.is_empty() || value.starts_with('-') || value.starts_with('+') {
+        return Err(invalid(format!(
+            "{key} rates must be non-negative decimal USD values; got {value:?}"
+        )));
+    }
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+    {
+        return Err(invalid(format!(
+            "{key} rates must have at most 6 decimal places; got {value:?}"
+        )));
+    }
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| invalid(format!("{key} rate is too large: {value:?}")))?;
+    let mut fractional = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse::<u64>()
+            .map_err(|_| invalid(format!("{key} rate is invalid: {value:?}")))?
+    };
+    for _ in fraction.len()..6 {
+        fractional = fractional
+            .checked_mul(10)
+            .ok_or_else(|| invalid(format!("{key} rate is too large: {value:?}")))?;
+    }
+    let micro_usd = whole
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(fractional))
+        .ok_or_else(|| invalid(format!("{key} rate is too large: {value:?}")))?;
+    Ok(UsdPerMillion::from_micro_usd(micro_usd))
 }
 
 fn resolve_codex_coder(
@@ -755,6 +883,45 @@ mod tests {
     fn parses_a_positive_cohort_token_budget() {
         let parsed = parse("COHORT_TOKEN_BUDGET: 123456\n").unwrap();
         assert_eq!(parsed.processor.cohort_token_budget, Some(123_456));
+    }
+
+    #[test]
+    fn model_price_overrides_replace_defaults_and_add_models() {
+        let parsed = parse(
+            "MODEL_PRICES_EFFECTIVE_DATE: 2026-07-29\n\
+MODEL_PRICES_USD_PER_MILLION: gpt-5.6-terra=3.25,18,0.325; private-model=1,4\n",
+        )
+        .unwrap();
+        let terra = parsed.model_pricing.resolve("gpt-5.6-terra").unwrap();
+        assert_eq!(terra.input.micro_usd(), 3_250_000);
+        assert_eq!(terra.output.micro_usd(), 18_000_000);
+        assert_eq!(terra.cached_input.micro_usd(), 325_000);
+        assert_eq!(terra.cache_creation_input, terra.input);
+        assert_eq!(terra.effective_date, "2026-07-29");
+        let private = parsed.model_pricing.resolve("private-model").unwrap();
+        assert_eq!(private.input.micro_usd(), 1_000_000);
+        assert_eq!(private.cached_input, private.input);
+        assert_eq!(private.cache_creation_input, private.input);
+    }
+
+    #[test]
+    fn absent_price_override_keeps_dated_builtins_and_malformed_values_fail() {
+        let parsed = parse("").unwrap();
+        let builtin = parsed.model_pricing.resolve("gpt-5.6-sol").unwrap();
+        assert_eq!(builtin.effective_date, DEFAULT_PRICING_EFFECTIVE_DATE);
+        assert!(
+            parse("MODEL_PRICES_USD_PER_MILLION: model=1\n").is_err(),
+            "input and output are both required"
+        );
+        assert!(parse("MODEL_PRICES_USD_PER_MILLION: model=1,-2\n").is_err());
+        assert!(parse("MODEL_PRICES_USD_PER_MILLION: model=1,2,3,4,5\n").is_err());
+        assert!(
+            parse(
+                "MODEL_PRICES_EFFECTIVE_DATE: yesterday\n\
+MODEL_PRICES_USD_PER_MILLION: model=1,2\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

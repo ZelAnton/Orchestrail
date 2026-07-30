@@ -7,9 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -470,13 +470,12 @@ pub struct HeadlessExternalPort {
 
 impl HeadlessExternalPort {
     pub fn new(config: HeadlessConfig) -> Result<Self, HeadlessError> {
-        let work_metadata = fs::symlink_metadata(&config.work).map_err(|error| {
+        work_fs::require_plain_directory(&config.work).map_err(|error| {
             HeadlessError::InvalidState(format!(
-                "cannot inspect work directory {}: {error}",
+                "cannot use work directory {}: {error}",
                 config.work.display()
             ))
         })?;
-        assert_plain_artifact_directory(&config.work, &work_metadata)?;
         if !config.root.is_dir() {
             return Err(HeadlessError::InvalidState(format!(
                 "repository root does not exist: {}",
@@ -496,88 +495,26 @@ impl HeadlessExternalPort {
         &self.config
     }
 
-    /// Prove every existing directory component below the configured `.work` root without
-    /// following a symlink/reparse point. Writes create missing components one at a time and
-    /// immediately re-prove them, rather than letting `create_dir_all` traverse an untrusted
-    /// parent. A read with a genuinely absent parent reports `false` as an absent artifact.
-    fn ensure_work_parent_chain(
-        &self,
-        path: &Path,
-        create_missing: bool,
-    ) -> Result<bool, HeadlessError> {
-        let relative = path.strip_prefix(&self.config.work).map_err(|_| {
-            HeadlessError::InvalidState(format!(
-                "artifact path escapes the configured work directory: {}",
-                path.display()
-            ))
-        })?;
-        if relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(HeadlessError::InvalidState(format!(
-                "artifact path is not a confined normal path: {}",
-                path.display()
-            )));
-        }
-        let work_metadata = fs::symlink_metadata(&self.config.work).map_err(HeadlessError::Io)?;
-        assert_plain_artifact_directory(&self.config.work, &work_metadata)?;
-        let mut current = self.config.work.clone();
-        let Some(parent) = relative.parent() else {
-            return Ok(true);
-        };
-        for component in parent.components() {
-            let Component::Normal(component) = component else {
-                unreachable!("validated above")
-            };
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) => assert_plain_artifact_directory(&current, &metadata)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound && !create_missing => {
-                    return Ok(false);
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    fs::create_dir(&current).map_err(HeadlessError::Io)?;
-                    let metadata = fs::symlink_metadata(&current).map_err(HeadlessError::Io)?;
-                    assert_plain_artifact_directory(&current, &metadata)?;
-                }
-                Err(error) => return Err(HeadlessError::Io(error)),
-            }
-        }
-        Ok(true)
-    }
-
+    /// Read one bounded model artifact below the configured `.work` root.
+    ///
+    /// A reviewer which cleanly exits without writing its required artifact did not complete a
+    /// review pass. That absence is deliberately distinct from an unreadable artifact: the former
+    /// is a bounded `Incomplete` retry, while the latter may indicate a broken control plane and
+    /// must keep the durable effect unacknowledged for operator recovery. [`work_fs`] draws that
+    /// exact line — a missing artifact or missing parent chain is `None`, while a redirected
+    /// component, oversize payload, or non-UTF-8 byte fails loudly.
     fn read_work_artifact(&self, path: &Path) -> Result<Option<String>, HeadlessError> {
-        if !self.ensure_work_parent_chain(path, false)? {
-            return Ok(None);
-        }
-        Self::read_optional_plain_artifact(path)
+        work_fs::read_optional_text(&self.config.work, path, MAX_MODEL_ARTIFACT_BYTES)
+            .map_err(artifact_error)
     }
 
     fn replace_work_artifact(&self, path: &Path, payload: &[u8]) -> Result<(), HeadlessError> {
-        self.ensure_work_parent_chain(path, true)?;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => assert_plain_artifact(path, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(HeadlessError::Io(error)),
-        }
         work_fs::replace_file(&self.config.work, path, payload, MAX_MODEL_ARTIFACT_BYTES)
-            .map_err(HeadlessError::Io)?;
-        let metadata = fs::symlink_metadata(path).map_err(HeadlessError::Io)?;
-        assert_plain_artifact(path, &metadata)
+            .map_err(artifact_error)
     }
 
-    fn read_work_directory(&self, path: &Path) -> Result<Option<fs::ReadDir>, HeadlessError> {
-        if !self.ensure_work_parent_chain(path, false)? {
-            return Ok(None);
-        }
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(HeadlessError::Io(error)),
-        };
-        assert_plain_artifact_directory(path, &metadata)?;
-        fs::read_dir(path).map(Some).map_err(HeadlessError::Io)
+    fn read_work_directory(&self, path: &Path) -> Result<Option<Vec<fs::DirEntry>>, HeadlessError> {
+        work_fs::plain_directory_entries(&self.config.work, path).map_err(artifact_error)
     }
 
     /// Build one contained leaf spawn from an explicit execution root.  Visibility flags are
@@ -1209,8 +1146,9 @@ impl HeadlessExternalPort {
             None => return Ok(None),
         };
         let mut paths = entries
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .into_iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
         paths.sort();
 
         let mut hard_limit = None;
@@ -1355,7 +1293,6 @@ impl HeadlessExternalPort {
         let evidence_dir = self.config.work.join("native-evidence");
         if let Some(entries) = self.read_work_directory(&evidence_dir)? {
             for entry in entries {
-                let entry = entry?;
                 let file_name = entry.file_name();
                 let Some(file_name) = file_name.to_str() else {
                     continue;
@@ -1837,69 +1774,6 @@ impl HeadlessExternalPort {
                 })?;
         }
         Ok(())
-    }
-
-    /// A reviewer which cleanly exits without writing its required artifact did not complete a
-    /// review pass.  It is deliberately distinct from an unreadable artifact: the former is a
-    /// bounded `Incomplete` retry, while the latter may indicate a broken control plane and must
-    /// keep the durable effect unacknowledged for operator recovery.
-    fn read_optional_plain_artifact(path: &Path) -> Result<Option<String>, HeadlessError> {
-        let before = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(HeadlessError::Io(error)),
-        };
-        assert_plain_artifact(path, &before)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_NOFOLLOW: i32 = 0o400_000;
-            options.custom_flags(O_NOFOLLOW);
-        }
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_NOFOLLOW: i32 = 0x0100;
-            options.custom_flags(O_NOFOLLOW);
-        }
-        let mut file = options.open(path).map_err(HeadlessError::Io)?;
-        let opened = file.metadata().map_err(HeadlessError::Io)?;
-        assert_plain_artifact(path, &opened)?;
-        if opened.len() > MAX_MODEL_ARTIFACT_BYTES {
-            return Err(HeadlessError::Protocol(format!(
-                "model artifact exceeds the {MAX_MODEL_ARTIFACT_BYTES}-byte limit: {}",
-                path.display()
-            )));
-        }
-        let mut artifact = String::new();
-        (&mut file)
-            .take(MAX_MODEL_ARTIFACT_BYTES + 1)
-            .read_to_string(&mut artifact)
-            .map_err(HeadlessError::Io)?;
-        if artifact.len() as u64 > MAX_MODEL_ARTIFACT_BYTES {
-            return Err(HeadlessError::Protocol(format!(
-                "model artifact exceeds the {MAX_MODEL_ARTIFACT_BYTES}-byte limit while being read: {}",
-                path.display()
-            )));
-        }
-        let after = fs::symlink_metadata(path).map_err(HeadlessError::Io)?;
-        assert_plain_artifact(path, &after)?;
-        Ok(Some(artifact))
     }
 
     /// Append provider usage for one completed model call. A provider without counters emits an
@@ -4162,43 +4036,19 @@ fn safe_relative_path(path: &Path) -> bool {
         .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
-fn assert_plain_artifact(path: &Path, metadata: &fs::Metadata) -> Result<(), HeadlessError> {
-    #[cfg(windows)]
-    let redirected = {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    };
-    #[cfg(not(windows))]
-    let redirected = metadata.file_type().is_symlink();
-    if !metadata.is_file() || redirected {
-        return Err(HeadlessError::Protocol(format!(
-            "model artifact is not a plain regular file: {}",
-            path.display()
-        )));
+/// Map one confined-filesystem failure onto this module's error contract.
+///
+/// [`work_fs`] reports every confinement, limit, and encoding violation as `InvalidData` or
+/// `InvalidInput`. Those are control-plane protocol breaches — a redirected artifact or a payload
+/// over the model-artifact ceiling — rather than transport failures, so they must not be presented
+/// to the reducer as ordinary I/O that a caller might reasonably retry.
+fn artifact_error(error: io::Error) -> HeadlessError {
+    match error.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => {
+            HeadlessError::Protocol(error.to_string())
+        }
+        _ => HeadlessError::Io(error),
     }
-    Ok(())
-}
-
-fn assert_plain_artifact_directory(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), HeadlessError> {
-    #[cfg(windows)]
-    let redirected = {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    };
-    #[cfg(not(windows))]
-    let redirected = metadata.file_type().is_symlink();
-    if !metadata.is_dir() || redirected {
-        return Err(HeadlessError::Protocol(format!(
-            "model artifact parent is not a plain directory: {}",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -4982,25 +4832,48 @@ mod tests {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&root).unwrap();
-        let missing = root.join("review.md");
+        let work = root.join(".work");
+        fs::create_dir_all(&work).unwrap();
+        let port = HeadlessExternalPort::new(HeadlessConfig::new(
+            &work,
+            &root,
+            crate::config::EngineConfig::default().codex,
+        ))
+        .unwrap();
+
+        // Both an absent artifact and an absent parent chain remain recoverable absence.
         assert_eq!(
-            HeadlessExternalPort::read_optional_plain_artifact(&missing).unwrap(),
+            port.read_work_artifact(&work.join("review.md")).unwrap(),
             None
         );
-        assert!(HeadlessExternalPort::read_optional_plain_artifact(&root).is_err());
-        let oversized = root.join("oversized.md");
+        assert_eq!(
+            port.read_work_artifact(&work.join("tasks/T-1/review.md"))
+                .unwrap(),
+            None
+        );
+
+        // Everything else is a protocol breach that must not be mistaken for a missing artifact.
+        let directory = work.join("tasks");
+        fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            port.read_work_artifact(&directory),
+            Err(HeadlessError::Protocol(message)) if message.contains("plain regular file")
+        ));
+        let oversized = work.join("oversized.md");
         fs::write(&oversized, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
-        assert!(HeadlessExternalPort::read_optional_plain_artifact(&oversized).is_err());
+        assert!(matches!(
+            port.read_work_artifact(&oversized),
+            Err(HeadlessError::Protocol(message)) if message.contains("exceeds")
+        ));
         let target = root.join("external-review.md");
-        let link = root.join("redirected-review.md");
+        let link = work.join("redirected-review.md");
         fs::write(&target, "forged clean review\n").unwrap();
         #[cfg(windows)]
         let linked = std::os::windows::fs::symlink_file(&target, &link).is_ok();
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
         if linked {
-            assert!(HeadlessExternalPort::read_optional_plain_artifact(&link).is_err());
+            assert!(port.read_work_artifact(&link).is_err());
             assert_eq!(
                 fs::read_to_string(&target).unwrap(),
                 "forged clean review\n"

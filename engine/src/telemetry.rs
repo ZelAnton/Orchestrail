@@ -36,6 +36,24 @@ pub struct ProviderUsage {
     pub total_tokens: Option<u64>,
 }
 
+/// Provider token counters use different cache accounting conventions. This comes from the
+/// durable usage event source, never from a model-name heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    Claude,
+    Codex,
+}
+
+impl UsageSource {
+    fn from_event(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+}
+
 impl ProviderUsage {
     /// Construct an exact usage record from scalar backend fields. An explicit total wins;
     /// otherwise the known components form a total only when their unsigned sum cannot overflow.
@@ -78,6 +96,241 @@ impl ProviderUsage {
             cache_creation_input_tokens,
             total_tokens: total_tokens.or(any_component.then_some(computed.unwrap_or_default())),
         })
+    }
+}
+
+/// One USD-denominated rate per million tokens, stored as millionths of a dollar so pricing
+/// arithmetic never depends on binary floating point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsdPerMillion(u64);
+
+impl UsdPerMillion {
+    pub const fn from_micro_usd(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn micro_usd(self) -> u64 {
+        self.0
+    }
+}
+
+/// A dated model rate card. Cache creation is explicit because Claude bills cache writes at a
+/// different rate; operator overrides that omit it inherit the ordinary input rate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPricing {
+    pub model: String,
+    pub input: UsdPerMillion,
+    pub cached_input: UsdPerMillion,
+    pub cache_creation_input: UsdPerMillion,
+    pub output: UsdPerMillion,
+    pub effective_date: String,
+}
+
+/// Built-in rates plus operator overrides from `config.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PricingTable {
+    entries: BTreeMap<String, ModelPricing>,
+}
+
+pub const DEFAULT_PRICING_EFFECTIVE_DATE: &str = "2026-07-30";
+
+impl Default for PricingTable {
+    fn default() -> Self {
+        let mut table = Self {
+            entries: BTreeMap::new(),
+        };
+        // Standard API rates in USD per 1M tokens, current on the date above. Claude cache
+        // creation uses the default five-minute write price.
+        for (model, input, cached, creation, output) in [
+            ("gpt-5.6-sol", 5_000_000, 500_000, 5_000_000, 30_000_000),
+            ("gpt-5.6-terra", 2_500_000, 250_000, 2_500_000, 15_000_000),
+            ("gpt-5.6-luna", 1_000_000, 100_000, 1_000_000, 6_000_000),
+            ("gpt-5-codex", 1_250_000, 125_000, 1_250_000, 10_000_000),
+            ("gpt-5", 1_250_000, 125_000, 1_250_000, 10_000_000),
+            ("claude-opus-4-8", 5_000_000, 500_000, 6_250_000, 25_000_000),
+            ("claude-opus-4-7", 5_000_000, 500_000, 6_250_000, 25_000_000),
+            ("claude-opus-4-6", 5_000_000, 500_000, 6_250_000, 25_000_000),
+            ("claude-opus-4-5", 5_000_000, 500_000, 6_250_000, 25_000_000),
+            ("opus", 5_000_000, 500_000, 6_250_000, 25_000_000),
+            ("claude-sonnet-5", 2_000_000, 200_000, 2_500_000, 10_000_000),
+            (
+                "claude-sonnet-4-6",
+                3_000_000,
+                300_000,
+                3_750_000,
+                15_000_000,
+            ),
+            (
+                "claude-sonnet-4-5",
+                3_000_000,
+                300_000,
+                3_750_000,
+                15_000_000,
+            ),
+            ("sonnet", 2_000_000, 200_000, 2_500_000, 10_000_000),
+            ("claude-haiku-4-5", 1_000_000, 100_000, 1_250_000, 5_000_000),
+            ("haiku", 1_000_000, 100_000, 1_250_000, 5_000_000),
+        ] {
+            table.insert(ModelPricing {
+                model: model.into(),
+                input: UsdPerMillion::from_micro_usd(input),
+                cached_input: UsdPerMillion::from_micro_usd(cached),
+                cache_creation_input: UsdPerMillion::from_micro_usd(creation),
+                output: UsdPerMillion::from_micro_usd(output),
+                effective_date: DEFAULT_PRICING_EFFECTIVE_DATE.into(),
+            });
+        }
+        table
+    }
+}
+
+impl PricingTable {
+    pub fn insert(&mut self, pricing: ModelPricing) {
+        self.entries.insert(pricing.model.clone(), pricing);
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &ModelPricing> {
+        self.entries.values()
+    }
+
+    /// Resolve an exact model first, then a dated snapshot suffix such as `-20251015` or
+    /// `-2025-10-15`. The `default` sentinel is never a priced model: it records that the
+    /// invocation's concrete model was not configured. Longest base wins so a general family
+    /// cannot shadow a more specific model.
+    pub fn resolve(&self, model: &str) -> Option<&ModelPricing> {
+        if model == "default" {
+            return None;
+        }
+        if let Some(exact) = self.entries.get(model) {
+            return Some(exact);
+        }
+        self.entries
+            .iter()
+            .filter_map(|(base, pricing)| {
+                let suffix = model.strip_prefix(base)?.strip_prefix('-')?;
+                dated_model_suffix(suffix).then_some((base.len(), pricing))
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, pricing)| pricing)
+    }
+}
+
+fn dated_model_suffix(suffix: &str) -> bool {
+    (suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        || (suffix.len() == 10
+            && suffix.as_bytes().get(4) == Some(&b'-')
+            && suffix.as_bytes().get(7) == Some(&b'-')
+            && suffix
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()))
+}
+
+/// A composable cost estimate. `unknown` means at least one contribution could not be priced;
+/// `nano_usd` still retains any known partial sum for operator visibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CostEstimate {
+    pub nano_usd: u128,
+    pub estimated: bool,
+    pub unknown: bool,
+}
+
+impl CostEstimate {
+    pub const fn unknown() -> Self {
+        Self {
+            nano_usd: 0,
+            estimated: true,
+            unknown: true,
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if let Some(total) = self.nano_usd.checked_add(other.nano_usd) {
+            self.nano_usd = total;
+        } else {
+            self.nano_usd = u128::MAX;
+            self.unknown = true;
+        }
+        self.estimated |= other.estimated;
+        self.unknown |= other.unknown;
+    }
+
+    pub fn format_usd(self) -> String {
+        if self.unknown && self.nano_usd == 0 {
+            return "≈$?".into();
+        }
+        let cents_100 = self.nano_usd.saturating_add(50_000) / 100_000;
+        let dollars = cents_100 / 10_000;
+        let fraction = cents_100 % 10_000;
+        let marker = if self.estimated { "≈" } else { "" };
+        let unknown = if self.unknown { "+?" } else { "" };
+        format!("{marker}${dollars}.{fraction:04}{unknown}")
+    }
+}
+
+/// Convert provider usage into a rate-card estimate. Missing pricing or a provider total that
+/// cannot be reconciled with its category counters yields an explicit unknown contribution.
+pub fn estimate_usage_cost(
+    usage: ProviderUsage,
+    source: UsageSource,
+    model: &str,
+    pricing: &PricingTable,
+) -> CostEstimate {
+    let Some(rate) = pricing.resolve(model) else {
+        return CostEstimate::unknown();
+    };
+    if usage.input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && usage.cache_read_input_tokens.is_none()
+        && usage.cache_creation_input_tokens.is_none()
+    {
+        return CostEstimate::unknown();
+    }
+    let input = usage.input_tokens.unwrap_or(0);
+    let cached_input = usage.cache_read_input_tokens.unwrap_or(0);
+    // Codex/OpenAI reports cached input as part of `input_tokens`; Anthropic reports it as an
+    // independent category. Price only the non-cached portion at the ordinary input rate.
+    let non_cached_input = match source {
+        UsageSource::Codex => input.saturating_sub(cached_input),
+        UsageSource::Claude => input,
+    };
+    let minimum_total = match source {
+        UsageSource::Codex => non_cached_input.checked_add(usage.output_tokens.unwrap_or(0)),
+        UsageSource::Claude => input
+            .checked_add(usage.output_tokens.unwrap_or(0))
+            .and_then(|total| total.checked_add(cached_input))
+            .and_then(|total| total.checked_add(usage.cache_creation_input_tokens.unwrap_or(0))),
+    };
+    let Some(minimum_total) = minimum_total else {
+        return CostEstimate::unknown();
+    };
+    // Anthropic totals cover independent cache categories. Codex totals can include cached input
+    // within `input_tokens`, so their lower bound deliberately uses normalized input instead.
+    if usage.total_tokens.is_none_or(|total| total < minimum_total) {
+        return CostEstimate::unknown();
+    }
+    let Some(priced) = [
+        (non_cached_input, rate.input),
+        (usage.output_tokens.unwrap_or(0), rate.output),
+        (cached_input, rate.cached_input),
+        (
+            usage.cache_creation_input_tokens.unwrap_or(0),
+            rate.cache_creation_input,
+        ),
+    ]
+    .into_iter()
+    .try_fold(0_u128, |total, (tokens, rate)| {
+        let contribution = u128::from(tokens)
+            .checked_mul(u128::from(rate.micro_usd()))?
+            .checked_mul(1_000)?;
+        total.checked_add(contribution)
+    }) else {
+        return CostEstimate::unknown();
+    };
+    CostEstimate {
+        nano_usd: priced.saturating_add(500_000) / 1_000_000,
+        estimated: true,
+        unknown: false,
     }
 }
 
@@ -276,6 +529,9 @@ pub struct BatchTelemetrySummary {
     pub codex_fallback_reasons: BTreeMap<String, u64>,
     pub usage: TokenUsage,
     pub actual_by_source: BTreeMap<String, u64>,
+    pub estimated_cost: CostEstimate,
+    pub cost_by_model: BTreeMap<String, CostEstimate>,
+    pub cost_by_role: BTreeMap<String, CostEstimate>,
 }
 
 /// Aggregate operator telemetry without changing execution safety. Unlike the budget gate this
@@ -284,6 +540,20 @@ pub fn batch_telemetry_summary(
     work: &Path,
     batch_id: &str,
     events_outbox_enabled: bool,
+) -> Result<BatchTelemetrySummary, TelemetryUnavailable> {
+    batch_telemetry_summary_with_pricing(
+        work,
+        batch_id,
+        events_outbox_enabled,
+        &PricingTable::default(),
+    )
+}
+
+pub fn batch_telemetry_summary_with_pricing(
+    work: &Path,
+    batch_id: &str,
+    events_outbox_enabled: bool,
+    pricing: &PricingTable,
 ) -> Result<BatchTelemetrySummary, TelemetryUnavailable> {
     if !events_outbox_enabled {
         return Err(TelemetryUnavailable::EventsOutboxDisabled);
@@ -317,6 +587,9 @@ pub fn batch_telemetry_summary(
             unmetered_events: 0,
         },
         actual_by_source: BTreeMap::new(),
+        estimated_cost: CostEstimate::default(),
+        cost_by_model: BTreeMap::new(),
+        cost_by_role: BTreeMap::new(),
     };
     let mut task_batches = BTreeMap::<String, String>::new();
     for event in temporally_ordered(events) {
@@ -326,7 +599,7 @@ pub fn batch_telemetry_summary(
                 summarize_codex_attempt(&mut summary, &event)?
             }
             EventType::UsageRecorded if usage_belongs_to_batch(&event, &task_batches, batch_id) => {
-                summarize_usage(&mut summary, &event)?
+                summarize_usage(&mut summary, &event, pricing)?
             }
             _ => {}
         }
@@ -555,6 +828,7 @@ fn safe_codex_reason(reason: &str) -> bool {
 fn summarize_usage(
     summary: &mut BatchTelemetrySummary,
     event: &Event,
+    pricing: &PricingTable,
 ) -> Result<(), TelemetryUnavailable> {
     match event
         .payload
@@ -563,6 +837,7 @@ fn summarize_usage(
     {
         Some("unavailable") if is_unavailable_marker(&event.payload) => {
             summary.usage.unmetered_events = summary.usage.unmetered_events.saturating_add(1);
+            aggregate_cost(summary, event, CostEstimate::unknown());
             return Ok(());
         }
         Some("available") | None => {}
@@ -574,6 +849,36 @@ fn summarize_usage(
         .and_then(Value::as_bool)
         .ok_or(TelemetryUnavailable::MalformedActualUsage)?;
     let total = usage_total(&event.payload);
+    let provider_usage = ProviderUsage::from_fields(
+        event.payload.get("input_tokens").and_then(Value::as_u64),
+        event.payload.get("output_tokens").and_then(Value::as_u64),
+        event
+            .payload
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64),
+        event
+            .payload
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        total,
+    );
+    let model = event
+        .payload
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| safe_scalar(value));
+    let source = event
+        .payload
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(UsageSource::from_event);
+    let cost = provider_usage
+        .zip(source)
+        .zip(model)
+        .map_or_else(CostEstimate::unknown, |((usage, source), model)| {
+            estimate_usage_cost(usage, source, model, pricing)
+        });
+    aggregate_cost(summary, event, cost);
     if estimated {
         if let Some(total) = total {
             summary.usage.estimated_tokens = summary
@@ -595,17 +900,46 @@ fn summarize_usage(
             .payload
             .get("source")
             .and_then(Value::as_str)
-            .filter(|source| matches!(*source, "claude" | "codex"))
+            .and_then(UsageSource::from_event)
             .ok_or(TelemetryUnavailable::MalformedActualUsage)?;
         let value = summary
             .actual_by_source
-            .entry(source.to_owned())
+            .entry(match source {
+                UsageSource::Claude => "claude".to_owned(),
+                UsageSource::Codex => "codex".to_owned(),
+            })
             .or_default();
         *value = value
             .checked_add(total)
             .ok_or(TelemetryUnavailable::MalformedActualUsage)?;
     }
     Ok(())
+}
+
+fn aggregate_cost(summary: &mut BatchTelemetrySummary, event: &Event, cost: CostEstimate) {
+    summary.estimated_cost.merge(cost);
+    let model = event
+        .payload
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| safe_scalar(value))
+        .unwrap_or("unknown-model");
+    summary
+        .cost_by_model
+        .entry(model.to_owned())
+        .or_default()
+        .merge(cost);
+    let role = event
+        .payload
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|value| safe_scalar(value))
+        .unwrap_or("unknown-role");
+    summary
+        .cost_by_role
+        .entry(role.to_owned())
+        .or_default()
+        .merge(cost);
 }
 
 /// Legacy metrics prefers an explicit total. The native writer uses `total_tokens`, while the
@@ -1424,6 +1758,102 @@ mod tests {
     }
 
     #[test]
+    fn pricing_resolves_exact_then_dated_suffix_and_rejects_other_prefixes() {
+        let pricing = PricingTable::default();
+        let exact = pricing.resolve("gpt-5.6-terra").unwrap();
+        assert_eq!(exact.model, "gpt-5.6-terra");
+        let compact_date = pricing.resolve("gpt-5.6-terra-20251015").unwrap();
+        assert_eq!(compact_date.model, "gpt-5.6-terra");
+        let dashed_date = pricing.resolve("claude-sonnet-4-6-2025-10-15").unwrap();
+        assert_eq!(dashed_date.model, "claude-sonnet-4-6");
+        assert!(pricing.resolve("gpt-5.6-terra-preview").is_none());
+        assert!(pricing.resolve("default").is_none());
+        assert!(pricing.resolve("missing-model").is_none());
+    }
+
+    #[test]
+    fn provider_usage_prices_codex_and_claude_cache_conventions_without_double_counting() {
+        let usage = ProviderUsage::from_fields(
+            Some(9_700_000),
+            Some(100_000),
+            Some(9_400_000),
+            Some(0),
+            Some(9_800_000),
+        )
+        .unwrap();
+        let cost = estimate_usage_cost(
+            usage,
+            UsageSource::Codex,
+            "gpt-5.6-terra",
+            &PricingTable::default(),
+        );
+        assert_eq!(
+            cost.nano_usd, 4_600_000_000,
+            "0.30M non-cached input + 9.40M cached input + 0.10M output"
+        );
+        assert!(cost.estimated);
+        assert!(!cost.unknown);
+
+        let claude_usage = ProviderUsage::from_fields(
+            Some(300_000),
+            Some(100_000),
+            Some(9_400_000),
+            Some(0),
+            Some(9_800_000),
+        )
+        .unwrap();
+        let claude_cost = estimate_usage_cost(
+            claude_usage,
+            UsageSource::Claude,
+            "gpt-5.6-terra",
+            &PricingTable::default(),
+        );
+        assert_eq!(claude_cost.nano_usd, 4_600_000_000);
+    }
+
+    #[test]
+    fn missing_price_or_unreconciled_components_are_unknown_without_panicking() {
+        let usage = ProviderUsage::from_fields(Some(10), Some(5), None, None, Some(15)).unwrap();
+        assert!(
+            estimate_usage_cost(
+                usage,
+                UsageSource::Claude,
+                "missing-model",
+                &PricingTable::default()
+            )
+            .unknown
+        );
+        let total_only = ProviderUsage::from_fields(None, None, None, None, Some(15)).unwrap();
+        assert!(
+            estimate_usage_cost(
+                total_only,
+                UsageSource::Codex,
+                "gpt-5.6-terra",
+                &PricingTable::default()
+            )
+            .unknown
+        );
+    }
+
+    #[test]
+    fn estimated_and_unknown_flags_are_contagious_when_costs_aggregate() {
+        let mut total = CostEstimate {
+            nano_usd: 10,
+            estimated: false,
+            unknown: false,
+        };
+        total.merge(CostEstimate {
+            nano_usd: 20,
+            estimated: true,
+            unknown: false,
+        });
+        total.merge(CostEstimate::unknown());
+        assert_eq!(total.nano_usd, 30);
+        assert!(total.estimated);
+        assert!(total.unknown);
+    }
+
+    #[test]
     fn telemetry_clock_rejects_calendar_impossibilities_like_legacy_datetime() {
         assert_eq!(
             telemetry_epoch_millis("2024-02-29T23:59:59.9Z"),
@@ -1640,6 +2070,55 @@ mod tests {
             batch_telemetry_summary(&work, "B-1", true),
             Err(TelemetryUnavailable::InvalidEventRecord)
         );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn operator_summary_aggregates_cost_by_model_and_role_with_unknown_contagion() {
+        let work = temp_work("cost-summary");
+        let known = r#"{"schema_version":1,"event_id":"u-known","occurred_at":"2026-07-25T12:00:00Z","type":"usage.recorded","batch_id":"B-1","task_id":"T-1","actor":{"kind":"tool","name":"codex"},"payload":{"task_id":"T-1","role":"coder","mode":"full","attempt_number":1,"source":"codex","model":"gpt-5.6-terra","input_tokens":1000000,"output_tokens":1000000,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":1000000,"total_tokens":4000000,"estimated":false,"usage_availability":"available"}}"#;
+        let unknown = r#"{"schema_version":1,"event_id":"u-unknown","occurred_at":"2026-07-25T12:00:01Z","type":"usage.recorded","batch_id":"B-1","task_id":"T-2","actor":{"kind":"tool","name":"codex"},"payload":{"task_id":"T-2","role":"reviewer","mode":"full","attempt_number":1,"source":"codex","model":"future-model","input_tokens":10,"output_tokens":5,"total_tokens":15,"estimated":true,"usage_availability":"available"}}"#;
+        fs::write(work.join(OUTBOX_FILE), format!("{known}\n{unknown}\n")).unwrap();
+
+        let summary = batch_telemetry_summary(&work, "B-1", true).unwrap();
+        assert_eq!(summary.usage.actual_tokens, 4_000_000);
+        assert_eq!(summary.usage.estimated_tokens, 15);
+        assert_eq!(summary.estimated_cost.nano_usd, 17_750_000_000);
+        assert!(summary.estimated_cost.estimated);
+        assert!(summary.estimated_cost.unknown);
+        assert_eq!(
+            summary.cost_by_model["gpt-5.6-terra"].nano_usd,
+            17_750_000_000
+        );
+        assert!(summary.cost_by_model["future-model"].unknown);
+        assert_eq!(summary.cost_by_role["coder"].nano_usd, 17_750_000_000);
+        assert!(summary.cost_by_role["reviewer"].unknown);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn operator_summary_has_no_cost_contribution_without_usage_events() {
+        let work = temp_work("empty-cost-summary");
+        fs::write(work.join(OUTBOX_FILE), b"").unwrap();
+
+        let summary = batch_telemetry_summary(&work, "B-1", true).unwrap();
+        assert_eq!(summary.usage.actual_events, 0);
+        assert_eq!(summary.usage.estimated_events, 0);
+        assert_eq!(summary.usage.unmetered_events, 0);
+        assert_eq!(summary.estimated_cost, CostEstimate::default());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn operator_summary_marks_an_unconfigured_default_model_as_unknown() {
+        let work = temp_work("default-model-cost");
+        let event = r#"{"schema_version":1,"event_id":"u-default","occurred_at":"2026-07-25T12:00:00Z","type":"usage.recorded","batch_id":"B-1","task_id":"T-1","actor":{"kind":"tool","name":"codex"},"payload":{"task_id":"T-1","role":"coder","mode":"full","attempt_number":1,"source":"codex","model":"default","input_tokens":9700000,"output_tokens":100000,"cache_read_input_tokens":9400000,"total_tokens":9800000,"estimated":false,"usage_availability":"available"}}"#;
+        fs::write(work.join(OUTBOX_FILE), format!("{event}\n")).unwrap();
+
+        let summary = batch_telemetry_summary(&work, "B-1", true).unwrap();
+        assert_eq!(summary.usage.actual_events, 1);
+        assert!(summary.estimated_cost.unknown);
+        assert!(summary.cost_by_model["default"].unknown);
         let _ = fs::remove_dir_all(work);
     }
 

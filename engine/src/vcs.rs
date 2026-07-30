@@ -9,8 +9,6 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3887,135 +3885,28 @@ fn manifest_path(path: &Path) -> Result<String> {
 
 const MAX_WORK_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
 
-fn redirected_work_artifact(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+/// Map one confined-filesystem failure onto this module's error contract.
+///
+/// [`work_fs`] reports every confinement, limit, and encoding violation as `InvalidData` or
+/// `InvalidInput`. Those describe a managed path that may not be trusted rather than a transport
+/// failure, so recovery must keep seeing them as [`VcsError::ManagedPath`] exactly as this
+/// module's own former copies of those checks reported them.
+fn managed_path_error(error: std::io::Error) -> VcsError {
+    match error.kind() {
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+            VcsError::ManagedPath(error.to_string())
+        }
+        _ => VcsError::Io(error),
     }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-fn require_plain_work_directory(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    if !metadata.is_dir() || redirected_work_artifact(metadata) {
-        return Err(VcsError::ManagedPath(format!(
-            "managed control directory is not a plain directory: {}",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 /// Read a bounded UTF-8 artifact below `.work` without following a replaced file or parent.
-/// Recovery inputs are authority-bearing state, so ordinary `read_to_string` is not sufficient.
+/// Recovery inputs are authority-bearing state, so ordinary `read_to_string` is not sufficient;
+/// [`work_fs::read_optional_text`] is the single confined reader shared with the control plane. An
+/// absent artifact — or an absent parent chain — stays `None` so recovery treats a not-yet-written
+/// merge report as missing rather than as a broken control plane.
 fn read_plain_work_artifact(work: &Path, path: &Path) -> Result<Option<String>> {
-    let relative = path.strip_prefix(work).map_err(|_| {
-        VcsError::ManagedPath(format!(
-            "managed control artifact escapes .work: {}",
-            path.display()
-        ))
-    })?;
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(VcsError::ManagedPath(format!(
-            "managed control artifact is not confined: {}",
-            path.display()
-        )));
-    }
-    require_plain_work_directory(work, &fs::symlink_metadata(work)?)?;
-    let mut current = work.to_path_buf();
-    if let Some(parent) = relative.parent() {
-        for component in parent.components() {
-            let Component::Normal(component) = component else {
-                unreachable!("the relative path was validated above")
-            };
-            current.push(component);
-            let metadata = match fs::symlink_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
-            require_plain_work_directory(&current, &metadata)?;
-        }
-    }
-
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !before.is_file() || redirected_work_artifact(&before) {
-        return Err(VcsError::ManagedPath(format!(
-            "managed control artifact is not a plain regular file: {}",
-            path.display()
-        )));
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    let opened = file.metadata()?;
-    if !opened.is_file() || redirected_work_artifact(&opened) {
-        return Err(VcsError::ManagedPath(format!(
-            "opened control artifact is not a plain regular file: {}",
-            path.display()
-        )));
-    }
-    if opened.len() > MAX_WORK_ARTIFACT_BYTES {
-        return Err(VcsError::ManagedPath(format!(
-            "managed control artifact exceeds the {MAX_WORK_ARTIFACT_BYTES}-byte limit: {}",
-            path.display()
-        )));
-    }
-    let mut text = String::new();
-    (&mut file)
-        .take(MAX_WORK_ARTIFACT_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_WORK_ARTIFACT_BYTES {
-        return Err(VcsError::ManagedPath(format!(
-            "managed control artifact grew beyond the {MAX_WORK_ARTIFACT_BYTES}-byte limit: {}",
-            path.display()
-        )));
-    }
-    let after = fs::symlink_metadata(path)?;
-    if !after.is_file() || redirected_work_artifact(&after) {
-        return Err(VcsError::ManagedPath(format!(
-            "managed control artifact was replaced while being read: {}",
-            path.display()
-        )));
-    }
-    Ok(Some(text))
+    work_fs::read_optional_text(work, path, MAX_WORK_ARTIFACT_BYTES).map_err(managed_path_error)
 }
 
 fn update_manifest_field(digest: &mut Sha256, value: &str) {
