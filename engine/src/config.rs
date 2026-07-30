@@ -703,7 +703,10 @@ fn strip_inline_comment(value: &str) -> &str {
 
 /// Decode one JSON command-array key. `key` is echoed into every diagnostic so the Phase-4
 /// profile and the review/fix-cycle subset cannot report each other's malformed value.
-fn parse_verification_commands(key: &str, value: &str) -> Result<Vec<String>, ConfigError> {
+pub(crate) fn parse_verification_commands(
+    key: &str,
+    value: &str,
+) -> Result<Vec<String>, ConfigError> {
     let commands: Vec<String> = serde_json::from_str(value).map_err(|error| {
         invalid(format!(
             "{key} must be a JSON array of command strings: {error}"

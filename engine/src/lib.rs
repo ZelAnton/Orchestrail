@@ -63,6 +63,7 @@ pub mod claude;
 pub mod codex;
 pub mod command_line;
 pub mod config;
+pub mod config_discovery;
 pub mod contract;
 pub mod control;
 pub mod dependency_graph;
