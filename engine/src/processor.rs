@@ -98,9 +98,9 @@ impl ProcessorConfig {
                 "COHORT_MAX_AGE must be at least one minute".into(),
             ));
         }
-        if self.stagnation_limit == 0 {
+        if self.stagnation_limit < 2 {
             return Err(ProcessorError::InvalidConfig(
-                "STAGNATION_LIMIT must be at least 1".into(),
+                "STAGNATION_LIMIT must be at least 2".into(),
             ));
         }
         if self.review_loop_max == 0
@@ -4527,6 +4527,25 @@ mod tests {
             ..ProcessorConfig::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn stagnation_limit_requires_at_least_two_attempts() {
+        let invalid = ProcessorConfig {
+            stagnation_limit: 1,
+            ..ProcessorConfig::default()
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProcessorError::InvalidConfig(message))
+                if message == "STAGNATION_LIMIT must be at least 2"
+        ));
+
+        let valid = ProcessorConfig {
+            stagnation_limit: 2,
+            ..ProcessorConfig::default()
+        };
+        valid.validate().unwrap();
     }
 
     fn candidate(id: &str, domain: &str) -> AdmissionCandidate {
