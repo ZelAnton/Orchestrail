@@ -1108,6 +1108,137 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_fan_out_turn_forgets_every_workers_conversation() {
+        let work = work();
+        let at = "2026-07-25T12:00:00Z";
+        let mut runtime = ProcessorRuntime::new(
+            ProcessorConfig {
+                max_parallel: 2,
+                cohort_size: 2,
+                ..ProcessorConfig::default()
+            },
+            &work,
+        )
+        .unwrap();
+        runtime
+            .apply_at(
+                ProcessorCommand::Recover {
+                    workspaces_present: Default::default(),
+                },
+                at,
+            )
+            .unwrap();
+        runtime.complete_effect("write-journal-and-status").unwrap();
+        runtime
+            .apply_at(
+                ProcessorCommand::Open {
+                    batch_id: "B-fanout".into(),
+                    base: "base".into(),
+                    now_secs: 1,
+                },
+                at,
+            )
+            .unwrap();
+        runtime
+            .apply_at(
+                ProcessorCommand::DependencyGraphRefreshed {
+                    boundary: crate::dependency_graph::RefreshBoundary::CohortOpen,
+                    outcome: LeafOutcome::Completed { author: None },
+                },
+                at,
+            )
+            .unwrap();
+        runtime
+            .apply_at(
+                ProcessorCommand::InboxReconciled {
+                    free_slots: 2,
+                    curation_required: false,
+                },
+                at,
+            )
+            .unwrap();
+        runtime
+            .apply_at(ProcessorCommand::InboxDrained { free_slots: 2 }, at)
+            .unwrap();
+        runtime
+            .apply_at(
+                ProcessorCommand::Admit {
+                    candidates: vec![
+                        AdmissionCandidate {
+                            id: "T-1".into(),
+                            conflict_domain: "t1/**".into(),
+                            level: Level::Coder,
+                            risk: crate::resolvers::Risk::Medium,
+                            ready: true,
+                            current_delivery_lane: true,
+                        },
+                        AdmissionCandidate {
+                            id: "T-2".into(),
+                            conflict_domain: "t2/**".into(),
+                            level: Level::Coder,
+                            risk: crate::resolvers::Risk::Medium,
+                            ready: true,
+                            current_delivery_lane: true,
+                        },
+                    ],
+                    now_secs: 2,
+                },
+                at,
+            )
+            .unwrap();
+
+        let key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let id = "11111111-2222-3333-4444-555555555555";
+        for task in ["T-1", "T-2"] {
+            runtime
+                .record_leaf_session(task, &LeafSessionUpdate::Observed { key, id: id.into() })
+                .unwrap();
+        }
+
+        // Both tasks advance in ONE rolling round, so their leaves are fanned out into a single
+        // batch and share its fate. One worker's leaf came back unusable and staged the forget
+        // before returning the error that aborts the turn; its sibling staged a forget of its own
+        // and finished. The turn fails as a whole, and both effects stay pending.
+        let mut executor = FailingDispatchExecutor {
+            armed: true,
+            ..FailingDispatchExecutor::default()
+        };
+        for task in ["T-1", "T-2"] {
+            executor
+                .inner
+                .sessions
+                .insert(task.to_owned(), LeafSessionUpdate::Invalidated { key });
+        }
+        let dispatch = [
+            Effect::DispatchTask {
+                task_id: "T-1".into(),
+                kind: LeafKind::Fix,
+            },
+            Effect::DispatchTask {
+                task_id: "T-2".into(),
+                kind: LeafKind::Fix,
+            },
+        ];
+        assert!(matches!(
+            drive(&mut runtime, dispatch, at, &mut executor, 100),
+            Err(DriveError::Executor(AdapterRejection))
+        ));
+        for task in ["T-1", "T-2"] {
+            assert_eq!(
+                runtime.state().tasks[task].leaf_session(key),
+                None,
+                "every member of a failed fan-out must re-seed, not resume the conversation that failed it"
+            );
+        }
+        assert!(
+            executor.inner.sessions.is_empty(),
+            "the staged forgets were drained once, not left for a later effect to replay"
+        );
+
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
     fn driver_uses_the_port_event_clock_for_effect_completion_transitions() {
         let work = work();
         let mut runtime = ProcessorRuntime::new(

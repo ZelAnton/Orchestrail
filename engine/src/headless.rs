@@ -283,6 +283,35 @@ enum ClaudeTaskBatchPlan {
     },
 }
 
+/// Everything one fanned-out worker owes its parent, kept deliberately separate from whether that
+/// worker SUCCEEDED.
+///
+/// A worker runs in its own [`HeadlessExternalPort`], so the bookkeeping it stages — commit
+/// evidence, and the conversation coordinate a leaf asked to publish or to forget — lives in a map
+/// the parent never sees unless it is handed back. Returning that map inside the worker's `Result`
+/// made the two cases that need it most the exact two that dropped it: a worker that returned
+/// `Err`, and every sibling of a worker that returned `Err`. The coordinate lost that way is an
+/// invalidation, so the next run resumed the very conversation whose result the engine had just
+/// refused. The handover is therefore unconditional, and the parent decides afterwards which parts
+/// of it a failed turn may keep.
+struct TaskWorkerHandover {
+    result: Result<TaskEffectResult, HeadlessError>,
+    evidence: BTreeMap<String, CommitEvidence>,
+    sessions: BTreeMap<String, LeafSessionUpdate>,
+}
+
+impl TaskWorkerHandover {
+    /// A worker that failed before it owned a port, or that died together with it, has nothing
+    /// staged to hand back but the failure itself.
+    fn failed(error: HeadlessError) -> Self {
+        Self {
+            result: Err(error),
+            evidence: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+        }
+    }
+}
+
 /// The provider that supplied a model result. It is intentionally not inferred from the prose
 /// report: the source is a durable part of a usage event's idempotency key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3738,15 +3767,18 @@ impl ExternalPort for HeadlessExternalPort {
         self.arm_codex_canary(effects, state)?;
         let config = self.config.clone();
         let frozen_state = state.clone();
-        let completed = thread::scope(|scope| {
+        let handovers = thread::scope(|scope| {
             let workers = effects
                 .iter()
                 .cloned()
                 .map(|request| {
                     let config = config.clone();
                     let state = frozen_state.clone();
-                    scope.spawn(move || -> Result<_, HeadlessError> {
-                        let mut worker = HeadlessExternalPort::new(config)?;
+                    scope.spawn(move || -> TaskWorkerHandover {
+                        let mut worker = match HeadlessExternalPort::new(config) {
+                            Ok(worker) => worker,
+                            Err(error) => return TaskWorkerHandover::failed(error),
+                        };
                         let result = match &request.effect {
                             TaskEffect::PrepareLeaf { task_id, kind } => worker
                                 .prepare_task_leaf(task_id, *kind, &request.workspace, &state)
@@ -3760,44 +3792,33 @@ impl ExternalPort for HeadlessExternalPort {
                             TaskEffect::DispatchReview { task_id } => worker
                                 .task_review(task_id, &request.workspace, &state)
                                 .map(|outcome| TaskEffectResult::Review { outcome }),
-                        }?;
-                        Ok((result, worker.task_evidence, worker.leaf_sessions))
+                        };
+                        // Taken BESIDE the result rather than after proving it `Ok`: the staged
+                        // forget of a resumed conversation exists precisely for the calls that end
+                        // in `Err`, so a `?` here would discard exactly what it was added for.
+                        TaskWorkerHandover {
+                            result,
+                            evidence: std::mem::take(&mut worker.task_evidence),
+                            sessions: std::mem::take(&mut worker.leaf_sessions),
+                        }
                     })
                 })
                 .collect::<Vec<_>>();
+            // Join every worker before judging any of them, in the deterministic request order.
+            // Short-circuiting here would throw away the handovers of workers that had already
+            // finished honestly, which is the same loss by a different route.
             workers
                 .into_iter()
                 .map(|worker| {
-                    worker.join().map_err(|_| {
-                        HeadlessError::InvalidState(
+                    worker.join().unwrap_or_else(|_| {
+                        TaskWorkerHandover::failed(HeadlessError::InvalidState(
                             "ProcessKit task worker panicked before collection".into(),
-                        )
-                    })?
+                        ))
+                    })
                 })
-                .collect::<Result<Vec<_>, HeadlessError>>()
-        })?;
-
-        let mut results = Vec::with_capacity(completed.len());
-        for (result, evidence, sessions) in completed {
-            for (task_id, paths) in evidence {
-                if self.task_evidence.insert(task_id.clone(), paths).is_some() {
-                    return Err(HeadlessError::InvalidState(format!(
-                        "concurrent task batch produced duplicate commit evidence for {task_id}"
-                    )));
-                }
-            }
-            // Each worker observed its own task's conversation; without this merge the driver
-            // would never see it and every fanned-out cycle would silently re-seed. Unlike commit
-            // evidence, an already-present entry is overwritten rather than rejected: this map is
-            // a latest-observation cache, so a coordinate left behind by a held round is simply
-            // superseded by the newer call's, and the worst case of getting it wrong is one
-            // re-seeded call.
-            for (task_id, update) in sessions {
-                self.leaf_sessions.insert(task_id, update);
-            }
-            results.push(result);
-        }
-        Ok(results)
+                .collect::<Vec<_>>()
+        });
+        self.merge_task_workers(handovers)
     }
 
     fn task_commit_evidence(
@@ -4071,6 +4092,71 @@ impl ExternalPort for HeadlessExternalPort {
 }
 
 impl HeadlessExternalPort {
+    /// Fold every joined worker's handover into this port, then surface the first failure.
+    ///
+    /// What is merged unconditionally and what is not is the whole contract here.
+    ///
+    /// Conversation coordinates are merged for EVERY worker — the one that failed, and every
+    /// sibling of the one that failed — because a failing turn's staged coordinate is an
+    /// invalidation, and the driver persists exactly those before letting the adapter's error
+    /// stand ([`crate::execution`]'s `forget_staged_leaf_sessions`). Dropping them would leave the
+    /// durable coordinate of a conversation the engine has just refused, and the retry of the
+    /// still-pending effect would resume it into the same refusal: a hard loop where a stateless
+    /// call used to start over. The asymmetry that keeps an unconfirmed observation out of the
+    /// checkpoint is not duplicated here — this only refills the staging map that the driver
+    /// drains for every effect of the batch, and that driver publishes nothing but invalidations
+    /// from a turn that failed.
+    ///
+    /// Commit evidence is the opposite case and stays conditional: it is a claim about a mutation
+    /// whose effect the failed turn never acknowledged, so it must not outlive the turn that would
+    /// have consumed it, and its duplicate check must not fire on a retry that legitimately
+    /// re-runs the leaf.
+    fn merge_task_workers(
+        &mut self,
+        handovers: Vec<TaskWorkerHandover>,
+    ) -> Result<Vec<TaskEffectResult>, HeadlessError> {
+        let mut results = Vec::with_capacity(handovers.len());
+        let mut completed_evidence = Vec::with_capacity(handovers.len());
+        let mut failure: Option<HeadlessError> = None;
+        for handover in handovers {
+            // Each worker observed its own task's conversation; without this merge the driver
+            // would never see it and every fanned-out cycle would silently re-seed. Unlike commit
+            // evidence, an already-present entry is overwritten rather than rejected: this map is
+            // a latest-observation cache, so a coordinate left behind by a held round is simply
+            // superseded by the newer call's, and the worst case of getting it wrong is one
+            // re-seeded call.
+            for (task_id, update) in handover.sessions {
+                self.leaf_sessions.insert(task_id, update);
+            }
+            match handover.result {
+                Ok(result) => {
+                    completed_evidence.push(handover.evidence);
+                    results.push(result);
+                }
+                // Keep the first failure in request order, so which error a batch reports never
+                // depends on which worker happened to finish first.
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        for evidence in completed_evidence {
+            for (task_id, paths) in evidence {
+                if self.task_evidence.insert(task_id.clone(), paths).is_some() {
+                    return Err(HeadlessError::InvalidState(format!(
+                        "concurrent task batch produced duplicate commit evidence for {task_id}"
+                    )));
+                }
+            }
+        }
+        Ok(results)
+    }
+
     fn invoke_codex_read_only(
         &self,
         prompt: String,
@@ -5280,6 +5366,105 @@ mod tests {
                 id: id.into()
             })
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_fanned_out_batch_hands_back_every_forget_even_when_a_worker_fails() {
+        let (root, _home, mut port) = session_fixture("session-fanout-handover");
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let reviewer = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Reviewer);
+        let evidence = |path: &str| CommitEvidence {
+            paths: vec![PathBuf::from(path)],
+        };
+
+        // The mixed round that used to lose its bookkeeping. Worker T-1 resumed a leaf whose
+        // report claimed completion without its mandatory changed-path evidence: it staged the
+        // forget and then returned the protocol error that aborts the whole turn. Worker T-2 ran
+        // to completion and staged a forget of its own (a resumed reviewer that reported nothing
+        // new). Handing both back is what lets the driver persist them.
+        let handovers = vec![
+            TaskWorkerHandover {
+                result: Err(HeadlessError::Protocol(
+                    "leaf report omitted its changed files".into(),
+                )),
+                evidence: BTreeMap::from([("T-1".to_string(), evidence("engine/src/a.rs"))]),
+                sessions: BTreeMap::from([(
+                    "T-1".to_string(),
+                    LeafSessionUpdate::Invalidated { key: coder },
+                )]),
+            },
+            TaskWorkerHandover {
+                result: Ok(TaskEffectResult::Review {
+                    outcome: ReviewOutcome::Incomplete,
+                }),
+                evidence: BTreeMap::from([("T-2".to_string(), evidence("engine/src/b.rs"))]),
+                sessions: BTreeMap::from([(
+                    "T-2".to_string(),
+                    LeafSessionUpdate::Invalidated { key: reviewer },
+                )]),
+            },
+        ];
+        assert!(matches!(
+            port.merge_task_workers(handovers),
+            Err(HeadlessError::Protocol(_)),
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Invalidated { key: coder }),
+            "the failing worker's own forget is what keeps its retry from resuming that conversation"
+        );
+        assert_eq!(
+            port.take_leaf_session("T-2"),
+            Some(LeafSessionUpdate::Invalidated { key: reviewer }),
+            "a sibling's failure must not discard a healthy worker's forget"
+        );
+        // Evidence is the deliberate exception: it describes a mutation this turn never
+        // acknowledged, and the retry that re-runs the leaf produces it again.
+        assert!(port.task_evidence.is_empty());
+
+        // A round where every worker succeeded is unchanged: results keep request order, evidence
+        // is merged, and an observed conversation is published for the driver as before.
+        let id = "11111111-2222-3333-4444-555555555555";
+        let completed = vec![
+            TaskWorkerHandover {
+                result: Ok(TaskEffectResult::Leaf {
+                    outcome: LeafOutcome::Completed { author: None },
+                }),
+                evidence: BTreeMap::from([("T-1".to_string(), evidence("engine/src/a.rs"))]),
+                sessions: BTreeMap::from([(
+                    "T-1".to_string(),
+                    LeafSessionUpdate::Observed {
+                        key: coder,
+                        id: id.into(),
+                    },
+                )]),
+            },
+            TaskWorkerHandover {
+                result: Ok(TaskEffectResult::Review {
+                    outcome: ReviewOutcome::Incomplete,
+                }),
+                evidence: BTreeMap::from([("T-2".to_string(), evidence("engine/src/b.rs"))]),
+                sessions: BTreeMap::new(),
+            },
+        ];
+        let results = port.merge_task_workers(completed).unwrap();
+        assert!(matches!(
+            results.as_slice(),
+            [
+                TaskEffectResult::Leaf { .. },
+                TaskEffectResult::Review { .. }
+            ]
+        ));
+        assert_eq!(
+            port.take_leaf_session("T-1"),
+            Some(LeafSessionUpdate::Observed {
+                key: coder,
+                id: id.into()
+            })
+        );
+        assert_eq!(port.task_evidence["T-1"], evidence("engine/src/a.rs"));
+        assert_eq!(port.task_evidence["T-2"], evidence("engine/src/b.rs"));
         let _ = fs::remove_dir_all(root);
     }
 
