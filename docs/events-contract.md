@@ -180,9 +180,13 @@ Emitted when a task moves from the internal `Capturing` phase to `Implementing`.
 
 ### `task.status_changed`
 
-Emitted when the human-readable status projection changes. It is also emitted for a review loop
-that remains `на ревью` after review findings or an incomplete review. It carries `task_id` but
-intentionally omits `batch_id`.
+Emitted when the human-readable status projection changes. It is also emitted with
+`from == to == "на ревью"` only for a `TaskReview` outcome of `Findings` or `Incomplete`.
+It carries `task_id` but intentionally omits `batch_id`.
+
+Current behavior: `FindingsRiskElevated` increments `review_cycles` and moves a task from
+`Reviewing` to `Fixing`, but does not emit `task.status_changed`. Both phases project to
+`на ревью`, and this outcome is not a review-loop emission condition.
 
 | Payload field | Type | Semantics |
 | --- | --- | --- |
