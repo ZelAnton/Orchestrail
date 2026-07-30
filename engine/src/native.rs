@@ -19,6 +19,7 @@ use crate::processor::{
     TaskLeafPreparationOutcome, TaskReviewPreparationOutcome, TokenBudgetObservation,
     VerificationOutcome,
 };
+use crate::session::LeafSessionUpdate;
 use crate::supervise::CancellationProbe;
 
 /// Result of inspecting an interrupted operation during phase-0 recovery. A recovery adapter may
@@ -287,6 +288,12 @@ pub trait ProcessorPort {
         task_id: &str,
         state: &ProcessorState,
     ) -> Result<ReviewOutcome, Self::Error>;
+    /// Surrender the provider conversation coordinate the last task-scoped leaf observed for
+    /// `task_id`. It is orthogonal bookkeeping, never a result: a port that does not continue
+    /// conversations keeps this default and behaves exactly as before.
+    fn take_leaf_session(&mut self, _task_id: &str) -> Option<LeafSessionUpdate> {
+        None
+    }
     /// Run one wave of independent task-local model calls.  Ports without their own concurrent
     /// ProcessKit worker retain deterministic serial behaviour through this default.  An
     /// implementation that does fan out must return answers in request order and may only run
@@ -517,6 +524,10 @@ impl<P: ProcessorPort> EffectExecutor for NativeExecutor<P> {
 
     fn event_occurred_at(&mut self, fallback: &str) -> Result<String, Self::Error> {
         NativeExecutor::event_occurred_at(self, fallback)
+    }
+
+    fn take_leaf_session(&mut self, task_id: &str) -> Option<LeafSessionUpdate> {
+        self.port.take_leaf_session(task_id)
     }
 
     fn execute(

@@ -42,5 +42,5 @@ pub use integration::{
     IntegrationSnapshot, load_integration, parse_integration, try_load_integration,
 };
 pub use queue::{DeliveryTarget, QueueEntry, parse_queue};
-pub use snapshot::Snapshot;
+pub use snapshot::{Snapshot, SnapshotCache};
 pub use util::{archive_header_task_id, completed_ids, now_epoch_secs, try_completed_ids};

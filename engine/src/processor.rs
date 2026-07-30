@@ -23,6 +23,7 @@ use crate::resolvers::{
     CohortCounters, CohortThresholds, Domain, EmptyReason, Level, Risk, StagnationDecision,
     admission_gate, plan_admission, review_cycle_decision, stagnation_decision,
 };
+use crate::session::{LeafSessionKey, LeafSessionUpdate, is_valid_session_id};
 use crate::state::DeliveryTarget;
 use crate::task_id::is_task_id;
 
@@ -285,6 +286,19 @@ pub struct TaskRuntime {
     /// marker: their durable effect ledger already records the exact outstanding action.
     #[serde(default)]
     pub imported_recovery_intent: Option<ImportedRecoveryIntent>,
+    /// Provider conversation ids for repeated calls of the same leaf lineage, keyed by
+    /// [`LeafSessionKey::as_durable_key`] (`claude:coder`, `codex:reviewer`). It is durable for
+    /// the same reason `review_sha` is — a resumed cycle must not lose the coordinate — but it is
+    /// deliberately ORTHOGONAL: nothing in this reducer reads it, so no phase, transition, or
+    /// escalation can depend on whether a conversation happens to still exist. A checkpoint
+    /// written before durable sessions simply has no map and re-seeds full context, exactly as
+    /// the engine behaved before.
+    ///
+    /// [`Processor::record_leaf_session`] keeps at most one entry per lineage: the two providers'
+    /// keys for one lineage are mutually exclusive, because only the provider that last ran can
+    /// know what the working tree now contains.
+    #[serde(default)]
+    pub leaf_sessions: BTreeMap<String, String>,
 }
 
 impl TaskRuntime {
@@ -304,6 +318,7 @@ impl TaskRuntime {
             review_sha: None,
             reason: None,
             imported_recovery_intent: None,
+            leaf_sessions: BTreeMap::new(),
         }
     }
 
@@ -311,6 +326,14 @@ impl TaskRuntime {
         let attempts = self.leaf_attempts.entry(kind.as_str().into()).or_default();
         *attempts = attempts.saturating_add(1);
         *attempts
+    }
+
+    /// Durable conversation id for one leaf lineage, when a previous call recorded one. The
+    /// caller must still prove the conversation exists before resuming it.
+    pub fn leaf_session(&self, key: LeafSessionKey) -> Option<&str> {
+        self.leaf_sessions
+            .get(&key.as_durable_key())
+            .map(String::as_str)
     }
 }
 
@@ -2206,6 +2229,59 @@ impl Processor {
             effects.push(self.publishing_resume_effect()?);
         }
         Ok(effects)
+    }
+
+    /// Record or forget one task's provider conversation coordinate.
+    ///
+    /// This deliberately is NOT a [`ProcessorCommand`]. A session id is not a decision: it
+    /// produces no [`Effect`], acknowledges no pending ledger key, and — as the sibling assertions
+    /// in this module's tests pin down — cannot move `TaskPhase`, change a transition, or affect
+    /// an escalation. Threading it through the command surface would enlarge the deterministic
+    /// contract with a value the reducer never reads and would make every acknowledgement carry
+    /// an irrelevant field. It joins [`Self::acknowledge_non_command_effect`] as the narrow,
+    /// typed, effect-free mutation path instead.
+    ///
+    /// It is also safe outside the effect ledger precisely because it is orthogonal: a write lost
+    /// to a crash, or one durable for a call that was never acknowledged, can at worst cost one
+    /// re-seeded leaf call — never a replayed model call or a skipped review.
+    ///
+    /// One lineage keeps at most ONE resumable conversation, and it belongs to the provider whose
+    /// call last ran. Routing may hand the same task's coder lineage to Claude in one round and to
+    /// Codex in the next (`route_coder` reacts to durable descriptor metadata, and a Codex fallback
+    /// hands the round to Claude outright), and the provider that did not run has no way to learn
+    /// that the working tree moved underneath its conversation. Continuing such a peer would let it
+    /// re-apply a change that is already in the tree or "fix" code that no longer exists — a silent
+    /// corruption inside the fix cycle rather than a failed call. Forgetting it instead costs one
+    /// re-seeded call, which is exactly the behaviour that predates durable sessions.
+    pub(crate) fn record_leaf_session(
+        &mut self,
+        task_id: &str,
+        update: &LeafSessionUpdate,
+    ) -> Result<(), ProcessorError> {
+        let key = update.key().as_durable_key();
+        let peer_key = update.key().peer().as_durable_key();
+        let task = self.task_mut(task_id)?;
+        match update {
+            LeafSessionUpdate::Observed { id, .. } => {
+                // Defence in depth: the adapter already refuses a malformed provider id, and the
+                // durable checkpoint must never become a carrier for one either. Reject before any
+                // mutation, so a rejected write leaves the map exactly as it was.
+                if !is_valid_session_id(id) {
+                    return Err(ProcessorError::InvalidCommand(format!(
+                        "task {task_id} reported a malformed provider session id for {key}"
+                    )));
+                }
+                task.leaf_sessions.remove(&peer_key);
+                task.leaf_sessions.insert(key, id.clone());
+            }
+            LeafSessionUpdate::Invalidated { .. } => {
+                // A call that ran and failed may still have edited the tree before failing, so the
+                // peer is no less stale here than after a successful round.
+                task.leaf_sessions.remove(&peer_key);
+                task.leaf_sessions.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     /// Retire recovery-only metadata after a non-command effect has completed.  Most effects do
@@ -6702,6 +6778,264 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_written_before_durable_sessions_still_loads() {
+        // Exactly the shape an older engine persisted: every field it knew, and no
+        // `leaf_sessions`. It must deserialize into "no known conversation", which is the
+        // full-context re-seed the engine did before durable sessions existed.
+        let mut current = TaskRuntime::new(&candidate("T-1", "engine/**"), 1);
+        current.review_cycles = 2;
+        current.review_sha = Some("head-1".into());
+        current.leaf_sessions.insert(
+            LeafSessionKey::new(
+                crate::session::SessionProvider::Claude,
+                crate::session::SessionLineage::Coder,
+            )
+            .as_durable_key(),
+            "11111111-2222-3333-4444-555555555555".into(),
+        );
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("leaf_sessions")
+            .expect("the field is serialized for a current task");
+        let task: TaskRuntime = serde_json::from_value(legacy).unwrap();
+        assert!(task.leaf_sessions.is_empty());
+        assert_eq!(task.review_sha.as_deref(), Some("head-1"));
+        assert_eq!(task.review_cycles, 2);
+        assert_eq!(
+            task.leaf_session(LeafSessionKey::new(
+                crate::session::SessionProvider::Claude,
+                crate::session::SessionLineage::Coder
+            )),
+            None
+        );
+
+        // A whole checkpoint without the field is equally readable, and re-serializing it keeps
+        // the new map additive rather than migrating anything.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        let mut document = serde_json::to_value(p.state()).unwrap();
+        document["tasks"]["T-1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("leaf_sessions")
+            .expect("the field is serialized for a current checkpoint");
+        let loaded: ProcessorState = serde_json::from_value(document).unwrap();
+        assert!(loaded.tasks["T-1"].leaf_sessions.is_empty());
+        assert_eq!(loaded.schema_version, PROCESSOR_STATE_VERSION);
+        Processor::from_checkpoint(p.config.clone(), loaded).expect("legacy checkpoint resumes");
+    }
+
+    #[test]
+    fn a_recorded_session_is_orthogonal_to_every_reducer_decision() {
+        use crate::session::{LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProvider};
+
+        let coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let reviewer = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Reviewer);
+
+        // Drive one identical implement/review round twice: once with sessions recorded at every
+        // step, once without. The phases and the emitted effects must be indistinguishable.
+        let run = |with_sessions: bool| {
+            let mut p = processor();
+            open(&mut p);
+            p.apply(ProcessorCommand::Admit {
+                candidates: vec![candidate("T-1", "engine/**")],
+                now_secs: 101,
+            })
+            .unwrap();
+            p.apply(ProcessorCommand::WorkspaceReady {
+                task_id: "T-1".into(),
+            })
+            .unwrap();
+            if with_sessions {
+                p.record_leaf_session(
+                    "T-1",
+                    &LeafSessionUpdate::Observed {
+                        key: coder,
+                        id: "11111111-2222-3333-4444-555555555555".into(),
+                    },
+                )
+                .unwrap();
+            }
+            let mut effects = p
+                .apply(ProcessorCommand::TaskLeaf {
+                    task_id: "T-1".into(),
+                    outcome: LeafOutcome::Completed {
+                        author: Some("coder".into()),
+                    },
+                })
+                .unwrap();
+            if with_sessions {
+                p.record_leaf_session(
+                    "T-1",
+                    &LeafSessionUpdate::Observed {
+                        key: reviewer,
+                        id: "019f054f-5e70-7d42-8586-ee66e3ac1d1e".into(),
+                    },
+                )
+                .unwrap();
+                p.record_leaf_session("T-1", &LeafSessionUpdate::Invalidated { key: coder })
+                    .unwrap();
+            }
+            effects.extend(
+                p.apply(ProcessorCommand::TaskCommitted {
+                    task_id: "T-1".into(),
+                    commit: "head-1".into(),
+                })
+                .unwrap(),
+            );
+            (p.state().clone(), effects)
+        };
+
+        let (with_state, with_effects) = run(true);
+        let (without_state, without_effects) = run(false);
+        assert_eq!(with_effects, without_effects);
+        assert_eq!(
+            with_state.tasks["T-1"].phase,
+            without_state.tasks["T-1"].phase
+        );
+        // The ONLY difference between the two runs is the orthogonal map.
+        let mut normalized = with_state.clone();
+        normalized.tasks.get_mut("T-1").unwrap().leaf_sessions = BTreeMap::new();
+        assert_eq!(normalized, without_state);
+        // An invalidated coordinate is forgotten; a live one is retained verbatim.
+        assert_eq!(with_state.tasks["T-1"].leaf_session(coder), None);
+        assert_eq!(
+            with_state.tasks["T-1"].leaf_session(reviewer),
+            Some("019f054f-5e70-7d42-8586-ee66e3ac1d1e")
+        );
+    }
+
+    #[test]
+    fn a_lineage_keeps_only_the_conversation_of_the_provider_that_last_ran_it() {
+        use crate::session::{LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProvider};
+
+        let claude_coder = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let codex_coder = LeafSessionKey::new(SessionProvider::Codex, SessionLineage::Coder);
+        let claude_reviewer =
+            LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Reviewer);
+        let codex_id = "019f054f-5e70-7d42-8586-ee66e3ac1d1e";
+        let claude_id = "11111111-2222-3333-4444-555555555555";
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        let observe = |p: &mut Processor, key, id: &str| {
+            p.record_leaf_session("T-1", &LeafSessionUpdate::Observed { key, id: id.into() })
+                .unwrap();
+        };
+
+        // Round 1 is routed to Codex, round 2 to Claude. Both are ordinary `route_coder`
+        // outcomes for one task, and only the second one saw the tree it left behind.
+        observe(&mut p, codex_coder, codex_id);
+        observe(&mut p, claude_reviewer, claude_id);
+        observe(&mut p, claude_coder, claude_id);
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(codex_coder),
+            None,
+            "round 3 must not resume the Codex conversation that predates Claude's round"
+        );
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(claude_coder),
+            Some(claude_id)
+        );
+        // Only the peer of the SAME lineage is dropped: an independent reviewer's conversation is
+        // untouched by whoever authored the code.
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(claude_reviewer),
+            Some(claude_id)
+        );
+
+        // Routing back to Codex re-seeds it, and now Claude's coder conversation is the stale one.
+        observe(&mut p, codex_coder, codex_id);
+        assert_eq!(p.state().tasks["T-1"].leaf_session(claude_coder), None);
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(codex_coder),
+            Some(codex_id)
+        );
+
+        // A call that ran and failed may still have edited the tree, so it leaves the lineage with
+        // no resumable conversation at all rather than handing one back to its peer.
+        observe(&mut p, claude_coder, claude_id);
+        p.record_leaf_session("T-1", &LeafSessionUpdate::Invalidated { key: codex_coder })
+            .unwrap();
+        assert_eq!(p.state().tasks["T-1"].leaf_session(claude_coder), None);
+        assert_eq!(p.state().tasks["T-1"].leaf_session(codex_coder), None);
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(claude_reviewer),
+            Some(claude_id)
+        );
+
+        // A rejected id changes nothing at all, peer included.
+        observe(&mut p, codex_coder, codex_id);
+        assert!(matches!(
+            p.record_leaf_session(
+                "T-1",
+                &LeafSessionUpdate::Observed {
+                    key: claude_coder,
+                    id: "../../escape".into()
+                }
+            ),
+            Err(ProcessorError::InvalidCommand(_))
+        ));
+        assert_eq!(
+            p.state().tasks["T-1"].leaf_session(codex_coder),
+            Some(codex_id)
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_unknown_session_coordinate_is_refused() {
+        use crate::session::{LeafSessionKey, LeafSessionUpdate, SessionLineage, SessionProvider};
+
+        let key = LeafSessionKey::new(SessionProvider::Claude, SessionLineage::Coder);
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        assert!(matches!(
+            p.record_leaf_session(
+                "T-2",
+                &LeafSessionUpdate::Observed {
+                    key,
+                    id: "abc".into()
+                }
+            ),
+            Err(ProcessorError::MissingTask(_))
+        ));
+        // The id becomes a path component in the probe and an argv element in the call, so a
+        // traversal attempt must never reach the checkpoint.
+        assert!(matches!(
+            p.record_leaf_session(
+                "T-1",
+                &LeafSessionUpdate::Observed {
+                    key,
+                    id: "../../escape".into()
+                }
+            ),
+            Err(ProcessorError::InvalidCommand(_))
+        ));
+        assert!(p.state().tasks["T-1"].leaf_sessions.is_empty());
+        // Forgetting an unrecorded coordinate is a no-op, not an error: the fix path may run
+        // before any session was ever observed.
+        p.record_leaf_session("T-1", &LeafSessionUpdate::Invalidated { key })
+            .unwrap();
+        assert!(p.state().tasks["T-1"].leaf_sessions.is_empty());
+    }
+
+    #[test]
     fn checkpoint_rejects_invalid_or_cross_wired_durable_coordinates() {
         let p = processor();
         let mut invalid_batch = p.state().clone();
@@ -6741,6 +7075,7 @@ mod tests {
                 review_sha: None,
                 reason: None,
                 imported_recovery_intent: None,
+                leaf_sessions: BTreeMap::new(),
             },
         );
         assert!(matches!(

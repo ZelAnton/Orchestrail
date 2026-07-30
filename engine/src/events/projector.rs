@@ -937,6 +937,7 @@ mod tests {
             review_sha: None,
             reason: None,
             imported_recovery_intent: None,
+            leaf_sessions: std::collections::BTreeMap::new(),
         };
         before.tasks.insert(merged.id.clone(), merged.clone());
         let mut after = before.clone();
@@ -1060,6 +1061,7 @@ mod tests {
             review_sha: Some("reviewed1".into()),
             reason: None,
             imported_recovery_intent: None,
+            leaf_sessions: std::collections::BTreeMap::new(),
         };
         before.tasks.insert(task.id.clone(), task.clone());
         let mut after = before.clone();
