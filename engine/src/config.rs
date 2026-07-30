@@ -638,7 +638,7 @@ fn resolve_codex_reviewer(
         .unwrap_or(CodexReviewer::Off))
 }
 
-fn active_fields(text: &str) -> Result<BTreeMap<String, String>, ConfigError> {
+pub(crate) fn active_fields(text: &str) -> Result<BTreeMap<String, String>, ConfigError> {
     let mut fields = BTreeMap::new();
     for (line_number, line) in text.lines().enumerate() {
         if line.starts_with('#') || line.starts_with(char::is_whitespace) {

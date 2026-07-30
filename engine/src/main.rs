@@ -28,11 +28,17 @@
 //!                             (T-105). STRICTLY read-only: takes no `.work/orchestrator.lock`,
 //!                             calls no mutating `queue-tx`/`state-tx`, creates no worktree/branch,
 //!                             writes nothing. `--dry-run` is required (the only mode).
-//!   config   discover [--work <dir>] [--root <repo>]
-//!                             Make one contained, read-only Codex call for format/lint/test
+//!   config   discover --live [--work <dir>] [--root <repo>]
+//!                             Make one contained, read-only Codex call (opt-in via `--live`,
+//!                             like every other real model call below) for format/lint/test
 //!                             candidates, validate each executable and repository witness, then
 //!                             atomically augment `config.md`. Existing manual verification
-//!                             profiles win. Backend/JSON failure writes nothing.
+//!                             profiles win: any of `VERIFICATION_COMMANDS`,
+//!                             `REVIEW_CYCLE_VERIFICATION_COMMANDS`, `SMOKE_CMD`, or
+//!                             `VERIFICATION_MODE` already present leaves the file untouched
+//!                             (an already-invalid existing file is reported, not silently
+//!                             layered with a duplicate key). Backend/JSON failure writes
+//!                             nothing.
 //!   lease    <acquire|takeover|heartbeat|release|status> [--work <dir>] [--root <dir>]
 //!            [--script <state-tx.ps1>] [--owner <id>] [--ttl <sec>] [--session <id>]
 //!            [--pid <n>] [--json]
@@ -91,9 +97,10 @@
 //! mutating commands. The production modes use native guarded stores, typed VCS/forge APIs, and
 //! ProcessKit-contained leaves; `run` retains its legacy transactional tool fixture only for
 //! sandbox compatibility.
-//! Standalone model probes are strictly opt-in via `--live`; `config discover` is itself the
-//! explicit opt-in to its single read-only call. Every other default path is offline and
-//! token-free.
+//! Live model calls are strictly opt-in via `--live`; the default path is offline and
+//! token-free. `config discover` follows this invariant exactly like `claude`/`codex`/
+//! `processor`/`release-sync`: its single read-only Codex call still requires `--live` and still
+//! consumes tokens and needs auth, even though the call itself never mutates the checkout.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -170,7 +177,7 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: orchestrail-engine <selfcheck|argv|claude|codex|events|state|plan|config|approval|inbox|lease|processor|release-sync|run|version>\n\
-                 (see src/main.rs; live probes require --live, while config discover is explicit)"
+                 (see src/main.rs; every real model call, including `config discover`, requires --live)"
             );
             exit(2);
         }
@@ -178,10 +185,18 @@ fn main() {
 }
 
 fn cmd_config(args: &[String]) {
-    let (repository_root, work) = match parse_config_discover_args(args) {
+    let (live, repository_root, work) = match parse_config_discover_args(args) {
         Ok(paths) => paths,
         Err(error) => config_discover_usage(&error),
     };
+    if !live {
+        eprintln!(
+            "refusing to spawn a real model call without --live (this consumes tokens and needs \
+             auth). `config discover` follows the same opt-in as every other real model call in \
+             this binary; there is no discovery-specific exemption."
+        );
+        exit(2);
+    }
     let engine_config = match orchestrail_engine::config::load(&work) {
         Ok(config) => config,
         Err(error) => {
@@ -190,15 +205,9 @@ fn cmd_config(args: &[String]) {
         }
     };
     let environment = DiscoveryEnvironment::from_process();
-    let outcome = config_discovery::discover_and_write(
-        &repository_root,
-        &work,
-        &environment,
-        |prompt| {
-            let mut call = CodexCall::new(
-                repository_root.display().to_string(),
-                Sandbox::ReadOnly,
-            );
+    let outcome =
+        config_discovery::discover_and_write(&repository_root, &work, &environment, |prompt| {
+            let mut call = CodexCall::new(repository_root.display().to_string(), Sandbox::ReadOnly);
             call.model = engine_config.codex.model.clone();
             call.reasoning = engine_config.codex.reasoning.as_str().into();
             call.skip_git_repo_check = false;
@@ -209,9 +218,7 @@ fn cmd_config(args: &[String]) {
                 &SpawnSpec::new(engine_config.codex.command.as_str(), call.to_argv())
                     .stdin(prompt)
                     .current_dir(repository_root.as_path())
-                    .deadline(Some(Duration::from_secs(
-                        engine_config.call_deadline_secs,
-                    )))
+                    .deadline(Some(Duration::from_secs(engine_config.call_deadline_secs)))
                     .output_max_bytes(engine_config.call_output_max_bytes),
             );
             if verdict.reason != supervise::Reason::Ok {
@@ -227,8 +234,7 @@ fn cmd_config(args: &[String]) {
                 .ok_or_else(|| {
                     "successful model transcript contained no completed agent response".into()
                 })
-        },
-    );
+        });
     match outcome {
         Ok(outcome) if outcome.changed => println!(
             "config discover: wrote {} accepted command(s), {} explicit skip(s) to {}",
@@ -247,15 +253,24 @@ fn cmd_config(args: &[String]) {
     }
 }
 
-fn parse_config_discover_args(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
+fn parse_config_discover_args(args: &[String]) -> Result<(bool, PathBuf, PathBuf), String> {
     if args.get(2).map(String::as_str) != Some("discover") {
         return Err("expected the `discover` subcommand".into());
     }
     let mut root = None;
     let mut work = None;
+    let mut live = false;
     let mut index = 3;
     while index < args.len() {
         let option = args[index].as_str();
+        if option == "--live" {
+            if live {
+                return Err("--live may be specified only once".into());
+            }
+            live = true;
+            index += 1;
+            continue;
+        }
         if !matches!(option, "--root" | "--work") {
             return Err(format!("unknown argument {option:?}"));
         }
@@ -281,12 +296,12 @@ fn parse_config_discover_args(args: &[String]) -> Result<(PathBuf, PathBuf), Str
             .map_err(|error| format!("cannot determine repository root: {error}"))?,
     };
     let work = work.unwrap_or_else(|| root.join(".work"));
-    Ok((root, work))
+    Ok((live, root, work))
 }
 
 fn config_discover_usage(error: &str) -> ! {
     eprintln!(
-        "usage: orchestrail-engine config discover [--root <repository-root>] [--work <control-dir>]: {error}"
+        "usage: orchestrail-engine config discover --live [--root <repository-root>] [--work <control-dir>]: {error}"
     );
     exit(2)
 }
@@ -2948,6 +2963,7 @@ mod config_discover_argument_tests {
             "engine".into(),
             "config".into(),
             "discover".into(),
+            "--live".into(),
             "--root".into(),
             "repository".into(),
             "--work".into(),
@@ -2955,7 +2971,7 @@ mod config_discover_argument_tests {
         ];
         assert_eq!(
             parse_config_discover_args(&args).unwrap(),
-            (PathBuf::from("repository"), PathBuf::from("control"))
+            (true, PathBuf::from("repository"), PathBuf::from("control"))
         );
 
         for invalid in [
@@ -2966,10 +2982,31 @@ mod config_discover_argument_tests {
             vec![
                 "engine", "config", "discover", "--work", "one", "--work", "two",
             ],
+            vec!["engine", "config", "discover", "--live", "--live"],
         ] {
             let invalid = invalid.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert!(parse_config_discover_args(&invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    /// `--live` is optional at the argument-parsing layer (paths must resolve either way for a
+    /// clean usage message) but `cmd_config` refuses to proceed without it, matching every other
+    /// real-model-call command in this binary.
+    #[test]
+    fn without_live_the_paths_still_resolve_but_the_flag_reads_false() {
+        let args = vec![
+            "engine".into(),
+            "config".into(),
+            "discover".into(),
+            "--root".into(),
+            "repository".into(),
+            "--work".into(),
+            "control".into(),
+        ];
+        assert_eq!(
+            parse_config_discover_args(&args).unwrap(),
+            (false, PathBuf::from("repository"), PathBuf::from("control"))
+        );
     }
 }
 

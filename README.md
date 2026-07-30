@@ -69,6 +69,28 @@ publication gate several rounds later. `REVIEW_CYCLE_VERIFICATION_COMMANDS` narr
 profile (for example lint and build only, without the heavy tests). The option is off by default,
 and leaving it off keeps verification a Phase-4-only gate.
 
+A new repository can bootstrap that profile instead of writing it by hand:
+
+```pwsh
+cargo run -p orchestrail-engine -- config discover --live --work .work --root .
+```
+
+Like every other real model call in this binary, discovery is opt-in via `--live` and consumes
+tokens. It makes exactly one read-only Codex call proposing format/lint/test candidates, then
+validates each one locally before it can reach `config.md`: the executable must be one of a fixed
+allowlist of recognized verification tools (`cargo`/`rustfmt`, the `npm`/`pnpm`/`yarn`/`bun`/`npx`
+family, `just`, `make`, `go`, and the `python` toolchain), it must be on `PATH`, and its declared
+witness file (e.g. `Cargo.toml` for `cargo`) must actually exist in the repository — a program
+outside the allowlist is never accepted, no matter what file it names as evidence. A rejected
+candidate is never dropped silently: it is written as an explicit `off`-keyed comment naming the
+reason. If any of `VERIFICATION_COMMANDS`, `REVIEW_CYCLE_VERIFICATION_COMMANDS`, `SMOKE_CMD`, or
+`VERIFICATION_MODE` is already present — including a bare fail-closed `VERIFICATION_MODE:
+required` with no profile yet — discovery leaves `config.md` untouched instead of spending the
+call. An existing `config.md` that already fails to parse (for example an empty
+`VERIFICATION_COMMANDS: []`, which the engine's own loader rejects) is reported as invalid and
+never has a call spent on it or a second, duplicate key layered on top. A backend failure or
+unparsable model response also aborts before any write.
+
 Published releases use a separate mode and never enter the task queue:
 
 ```pwsh

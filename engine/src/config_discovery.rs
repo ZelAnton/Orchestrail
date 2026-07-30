@@ -93,6 +93,10 @@ pub struct DiscoveryOutcome {
 pub enum DiscoveryError {
     Io(io::Error),
     InvalidExistingConfig(config::ConfigError),
+    /// The text discovery itself assembled (existing file + accepted/skipped additions) failed
+    /// validation. Kept distinct from [`Self::InvalidExistingConfig`] so the diagnostic never
+    /// blames the operator's file for a duplicate key that discovery synthesized.
+    InvalidComposedConfig(config::ConfigError),
     Backend(String),
     InvalidModelOutput(String),
     EmptyModelOutput,
@@ -104,6 +108,13 @@ impl fmt::Display for DiscoveryError {
             Self::Io(error) => write!(formatter, "{error}"),
             Self::InvalidExistingConfig(error) => {
                 write!(formatter, "existing config.md is invalid: {error}")
+            }
+            Self::InvalidComposedConfig(error) => {
+                write!(
+                    formatter,
+                    "assembled config.md failed validation (this is a discovery bug, not the \
+                     existing file): {error}"
+                )
             }
             Self::Backend(error) => write!(formatter, "model backend failed: {error}"),
             Self::InvalidModelOutput(error) => {
@@ -138,9 +149,30 @@ pub fn discover_and_write(
         Ok(None) => String::new(),
         Err(error) => return Err(error.into()),
     };
-    let parsed_existing =
-        config::parse(&existing).map_err(DiscoveryError::InvalidExistingConfig)?;
-    if !parsed_existing.verification_commands.is_empty() || parsed_existing.smoke_cmd.is_some() {
+    // `config::parse` cannot distinguish some absent keys from operator-written but effectively
+    // empty ones -- `SMOKE_CMD: ""` and an absent `SMOKE_CMD` both decode to `None` -- so the
+    // "already configured" check reads the raw active keys directly instead: any of these four
+    // present at all, including a bare `VERIFICATION_MODE: required` fail-closed hold with no
+    // profile yet, means an operator decision already exists here and discovery must not touch
+    // it. (`VERIFICATION_COMMANDS: []`/`REVIEW_CYCLE_VERIFICATION_COMMANDS: []` never reach this
+    // check at all: the engine's own loader below already rejects an empty command array as
+    // invalid, so that file is reported as broken rather than silently treated as "no profile".)
+    let existing_fields =
+        config::active_fields(&existing).map_err(DiscoveryError::InvalidExistingConfig)?;
+    // Still decode the typed view so a malformed existing file (e.g. an unparsable
+    // `VERIFICATION_COMMANDS` value) is reported the same way as before, rather than silently
+    // ignored by a key-presence check that does not parse values.
+    config::parse(&existing).map_err(DiscoveryError::InvalidExistingConfig)?;
+    const ALREADY_CONFIGURED_KEYS: [&str; 4] = [
+        "VERIFICATION_COMMANDS",
+        "REVIEW_CYCLE_VERIFICATION_COMMANDS",
+        "SMOKE_CMD",
+        "VERIFICATION_MODE",
+    ];
+    if ALREADY_CONFIGURED_KEYS
+        .iter()
+        .any(|key| existing_fields.contains_key(*key))
+    {
         return Ok(DiscoveryOutcome {
             accepted: 0,
             skipped: 0,
@@ -164,13 +196,8 @@ pub fn discover_and_write(
     for candidate in response.candidates {
         let command = candidate.command.trim().to_string();
         let witness = candidate.witness.trim().to_string();
-        let rejection = validate_candidate(
-            repository_root,
-            environment,
-            &command,
-            &witness,
-            &mut seen,
-        );
+        let rejection =
+            validate_candidate(repository_root, environment, &command, &witness, &mut seen);
         match rejection {
             Some(reason) => skipped.push(reason),
             None => accepted.push(command),
@@ -183,7 +210,7 @@ pub fn discover_and_write(
         .map_err(|error| DiscoveryError::InvalidModelOutput(error.to_string()))?;
     if !accepted.is_empty() {
         config::parse_verification_commands("VERIFICATION_COMMANDS", &commands_json)
-            .map_err(DiscoveryError::InvalidExistingConfig)?;
+            .map_err(DiscoveryError::InvalidComposedConfig)?;
     }
 
     let mut addition = String::new();
@@ -212,13 +239,8 @@ pub fn discover_and_write(
 
     let mut updated = existing;
     updated.push_str(&addition);
-    config::parse(&updated).map_err(DiscoveryError::InvalidExistingConfig)?;
-    work_fs::replace_file(
-        work,
-        &config_path,
-        updated.as_bytes(),
-        MAX_CONTROL_BYTES,
-    )?;
+    config::parse(&updated).map_err(DiscoveryError::InvalidComposedConfig)?;
+    work_fs::replace_file(work, &config_path, updated.as_bytes(), MAX_CONTROL_BYTES)?;
     Ok(DiscoveryOutcome {
         accepted: accepted.len(),
         skipped: skipped.len(),
@@ -244,9 +266,15 @@ fn validate_candidate(
     if !program_is_available(repository_root, environment, program) {
         return Some(format!("{program}: not found on PATH"));
     }
-    if let Some(required) = required_witness(program)
-        && Path::new(witness) != Path::new(required)
-    {
+    // `required_witness` is an allowlist, not a hint: a program outside it is rejected outright
+    // rather than falling through to a generic "any existing file" witness check. Discovery feeds
+    // an executable, unsandboxed gate (`verification.rs::verify_integration`), so the model's
+    // output -- untrusted external data -- must never place an unrecognized program there merely
+    // because some unrelated repository file happens to exist.
+    let Some(required) = required_witness(program) else {
+        return Some(format!("{program}: not a recognized verification tool"));
+    };
+    if Path::new(witness) != Path::new(required) {
         return Some(format!(
             "{command}: expected witness {required}, got {witness}"
         ));
@@ -286,6 +314,10 @@ fn required_witness(program: &str) -> Option<&'static str> {
     match executable.as_str() {
         "cargo" | "rustfmt" => Some("Cargo.toml"),
         "npm" | "npx" | "pnpm" | "yarn" | "bun" => Some("package.json"),
+        "just" => Some("justfile"),
+        "make" => Some("Makefile"),
+        "go" => Some("go.mod"),
+        "python" | "python3" | "pytest" | "ruff" | "black" => Some("pyproject.toml"),
         _ => None,
     }
 }
@@ -412,11 +444,7 @@ mod tests {
                 permissions.set_mode(0o755);
                 fs::set_permissions(&executable, permissions).unwrap();
             }
-            Self {
-                root,
-                work,
-                bin,
-            }
+            Self { root, work, bin }
         }
 
         fn environment(&self) -> DiscoveryEnvironment {
@@ -493,9 +521,11 @@ mod tests {
         assert_eq!(outcome.skipped, 2);
         let config = fixture.config();
         assert!(config.contains("VERIFICATION_COMMANDS: [\"cargo fmt --all\"]"));
-        assert!(config.contains(
-            "VERIFICATION_COMMANDS_DISCOVERY_SKIPPED_1: off  # npm: not found on PATH"
-        ));
+        assert!(
+            config.contains(
+                "VERIFICATION_COMMANDS_DISCOVERY_SKIPPED_1: off  # npm: not found on PATH"
+            )
+        );
         assert!(config.contains(
             "VERIFICATION_COMMANDS_DISCOVERY_SKIPPED_2: off  # cargo test --workspace: expected witness Cargo.toml, got missing.toml"
         ));
@@ -520,10 +550,7 @@ mod tests {
                 Ok("not json".into())
             })
             .unwrap_err();
-        assert!(matches!(
-            json_error,
-            DiscoveryError::InvalidModelOutput(_)
-        ));
+        assert!(matches!(json_error, DiscoveryError::InvalidModelOutput(_)));
         assert_eq!(fixture.config(), original);
     }
 
@@ -551,5 +578,103 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, DiscoveryError::EmptyModelOutput));
         assert_eq!(fixture.config(), "MAX_PARALLEL: 2\n");
+    }
+
+    #[test]
+    fn a_program_outside_the_allowlist_is_skipped_even_with_an_existing_witness() {
+        let fixture = Fixture::new("allowlist");
+        // `git` is deliberately not registered on the fixture PATH so this exercises the
+        // allowlist rejection itself rather than the earlier "not found on PATH" branch: make it
+        // available like `cargo` and confirm it is still rejected purely for not being a
+        // recognized verification tool.
+        let program = if cfg!(windows) { "git.exe" } else { "git" };
+        let executable = fixture.bin.join(program);
+        fs::write(&executable, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&executable, permissions).unwrap();
+        }
+        let response = r#"{"candidates":[
+            {"command":"git clean -xdf","witness":"Cargo.toml"}
+        ]}"#;
+        let outcome =
+            discover_and_write(&fixture.root, &fixture.work, &fixture.environment(), |_| {
+                Ok(response.into())
+            })
+            .unwrap();
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.skipped, 1);
+        let config = fixture.config();
+        assert!(!config.contains("VERIFICATION_COMMANDS:"));
+        assert!(config.contains(
+            "VERIFICATION_COMMANDS_DISCOVERY_SKIPPED_1: off  # git: not a recognized verification tool"
+        ));
+    }
+
+    #[test]
+    fn a_fail_closed_verification_mode_without_a_profile_is_left_untouched() {
+        let fixture = Fixture::new("mode-required");
+        let original = "VERIFICATION_MODE: required\n";
+        fs::write(fixture.work.join(CONFIG_FILE), original).unwrap();
+        let mut called = false;
+        let outcome =
+            discover_and_write(&fixture.root, &fixture.work, &fixture.environment(), |_| {
+                called = true;
+                Ok(r#"{"candidates":[]}"#.into())
+            })
+            .unwrap();
+        assert!(
+            !called,
+            "discovery must not spend a model call once VERIFICATION_MODE is already decided"
+        );
+        assert!(!outcome.changed);
+        assert_eq!(fixture.config(), original);
+    }
+
+    #[test]
+    fn an_operator_written_but_empty_smoke_cmd_is_left_untouched() {
+        // `config::parse` decodes an empty `SMOKE_CMD` value the same way as an absent key (both
+        // become `None`), so this is the case that actually exercises reading raw active keys
+        // instead of the typed `EngineConfig` view: an operator who wrote `SMOKE_CMD:` with
+        // nothing after it has still made a decision, even though it is not a usable profile.
+        let fixture = Fixture::new("smoke-cmd-empty");
+        let original = "SMOKE_CMD: \n";
+        fs::write(fixture.work.join(CONFIG_FILE), original).unwrap();
+        let mut called = false;
+        let outcome =
+            discover_and_write(&fixture.root, &fixture.work, &fixture.environment(), |_| {
+                called = true;
+                Ok(r#"{"candidates":[]}"#.into())
+            })
+            .unwrap();
+        assert!(!called);
+        assert!(!outcome.changed);
+        assert_eq!(fixture.config(), original);
+    }
+
+    #[test]
+    fn an_unparsable_existing_verification_commands_array_aborts_without_a_call_or_a_write() {
+        let fixture = Fixture::new("explicit-empty");
+        // `VERIFICATION_COMMANDS: []` is itself rejected by `config::parse`
+        // (`parse_verification_commands` requires at least one non-empty entry), so this exact
+        // pre-existing file can never legally reach the "already configured" key-presence check.
+        // The regression this guards is not "discovery accepts it" but "discovery still never
+        // spends a model call or writes a second, duplicate `VERIFICATION_COMMANDS` key on top of
+        // an already-broken file" -- the honest existing-file diagnostic must surface instead.
+        let original = "VERIFICATION_COMMANDS: []\n";
+        fs::write(fixture.work.join(CONFIG_FILE), original).unwrap();
+        let mut called = false;
+        let error =
+            discover_and_write(&fixture.root, &fixture.work, &fixture.environment(), |_| {
+                called = true;
+                Ok(r#"{"candidates":[]}"#.into())
+            })
+            .unwrap_err();
+        assert!(!called);
+        assert!(matches!(error, DiscoveryError::InvalidExistingConfig(_)));
+        assert_eq!(fixture.config(), original);
     }
 }
