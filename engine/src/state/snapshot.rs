@@ -45,8 +45,8 @@ struct SnapshotInputStamp {
 /// Metadata-invalidated cache for passive observers that poll the same control-plane snapshot.
 ///
 /// Every probe and reload uses [`crate::work_fs`], so cache hits do not weaken confinement or
-/// size limits. A failed metadata probe discards the cached value and falls back to
-/// [`Snapshot::load`], preserving that compatibility loader's existing best-effort behavior.
+/// size limits. Only successfully loaded snapshots are cached; any error (metadata or read) clears
+/// the cache while preserving [`Snapshot::load`]'s existing best-effort return behavior.
 #[derive(Debug, Default)]
 pub struct SnapshotCache {
     cached: Option<(SnapshotInputStamp, Snapshot)>,
@@ -69,7 +69,13 @@ impl SnapshotCache {
             return snapshot.clone();
         }
 
-        let snapshot = Snapshot::load(work);
+        let snapshot = match Snapshot::try_load(work) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                self.cached = None;
+                return Snapshot::empty(work);
+            }
+        };
         match snapshot_input_stamp(work) {
             Ok(after) if after == before => {
                 self.cached = Some((after, snapshot.clone()));
@@ -500,6 +506,33 @@ mod tests {
             cache.cached.as_ref().expect("changed load is recached").0,
             first_stamp,
             "changed length/mtime must invalidate the snapshot parse"
+        );
+    }
+
+    #[test]
+    fn snapshot_cache_retries_after_a_read_error() {
+        let w = TmpWork::new();
+        fs::write(w.dir.join("Tasks_Queue.md"), [0xff])
+            .expect("write invalid UTF-8 queue artifact");
+        let mut cache = SnapshotCache::default();
+
+        let degraded = cache.load(&w.dir);
+        assert!(degraded.queue.is_empty());
+        assert!(
+            cache.cached.is_none(),
+            "a degraded snapshot must not be cached"
+        );
+
+        w.write(
+            "Tasks_Queue.md",
+            "### [T-102] Recovered title — статус: в работе\n",
+        );
+        let recovered = cache.load(&w.dir);
+        assert_eq!(recovered.queue.len(), 1);
+        assert_eq!(recovered.queue[0].title, "Recovered title");
+        assert!(
+            cache.cached.is_some(),
+            "the successful retry should be cached"
         );
     }
 }
