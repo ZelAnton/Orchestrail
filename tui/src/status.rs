@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use orchestrail_engine::task_id::is_task_id;
-use orchestrail_engine::work_fs;
+
+use crate::cache::PlainFileCache;
 
 const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -38,14 +39,31 @@ pub struct StatusSnapshot {
     pub task_meta: BTreeMap<String, TaskMeta>,
 }
 
+/// Parsed status cache retained by the TUI refresh loop.
+#[derive(Debug, Default)]
+pub struct Cache {
+    file: PlainFileCache<Option<StatusSnapshot>>,
+}
+
+impl Cache {
+    /// Force the next status refresh to read and parse the file.
+    pub fn invalidate(&mut self) {
+        self.file.invalidate();
+    }
+}
+
 /// Load and parse `path` (e.g. `.work/status.md`). Returns `None` if the file is absent or
 /// unreadable — the TUI degrades to the event-only projection.
-pub fn load(path: &Path) -> Option<StatusSnapshot> {
+pub fn load(cache: &mut Cache, path: &Path) -> Option<StatusSnapshot> {
     let work = path.parent()?;
-    let text = work_fs::read_optional_text(work, path, MAX_STATUS_BYTES)
+    cache
+        .file
+        .load_with(work, path, MAX_STATUS_BYTES, |text| {
+            text.map(|text| parse(&text))
+        })
         .ok()
-        .flatten()?;
-    Some(parse(&text))
+        .cloned()
+        .flatten()
 }
 
 /// Pure parse of status.md content (separated from IO for testability).
