@@ -48,10 +48,16 @@
 //!                             Inspect or reconcile the optional cross-project inbox through
 //!                             the native contract. `reconcile` writes only proven local links.
 //!   processor --once --live --work <.work-dir> [--root <repo>] [--base <branch>] [--continue]
+//!            [--watch]
 //!                             Run the native deterministic processor across all current-lane
 //!                             cohorts under one owner lease. It recovers/imports a compatible
 //!                             legacy control plane fail-closed, contains agents with ProcessKit,
-//!                             and uses typed VCS/forge operations.
+//!                             and uses typed VCS/forge operations. `--watch` keeps the same
+//!                             invocation alive after the lane is drained and waits (bounded
+//!                             backoff poll) for new current-lane work, so the engine can run as a
+//!                             long-lived local service; `.work/WATCH_STOP` ends that waiting
+//!                             cleanly and `.work/PAUSE` holds it. Without `--watch` the command
+//!                             behaves exactly as before and exits on the drained lane.
 //!   release-sync --live --work <.work-dir> --version <version> [--resume]
 //!                             Run the separate published-release fast-forward/tag/graph/notes/
 //!                             dependent-notification mode under the owner lease. It never
@@ -102,7 +108,7 @@ use orchestrail_engine::inbox;
 use orchestrail_engine::lease::{LeaseOp, exit as lease_exit};
 use orchestrail_engine::native::{NativeExecutor, ProcessorPort};
 use orchestrail_engine::native_loop::{
-    NativeLoopConfig, NativeLoopOutcome, run_until_queue_exhausted,
+    NativeLoopConfig, NativeLoopOutcome, WatchConfig, run_until_queue_exhausted, run_watching,
 };
 use orchestrail_engine::native_port::{FileVcsPort, ReleaseNotesRequest, ReviewCycleVerification};
 use orchestrail_engine::ownership::{
@@ -122,7 +128,7 @@ use orchestrail_engine::runtime::{ProcessorRuntime, RUNTIME_CHECKPOINT_FILE};
 use orchestrail_engine::state::{
     DeliveryTarget, IntegrationState, Snapshot, TaskState, completed_ids, now_epoch_secs,
 };
-use orchestrail_engine::supervise::{self, SpawnSpec};
+use orchestrail_engine::supervise::{self, CancellationProbe, SpawnSpec};
 use orchestrail_engine::time::{days_from_civil, epoch_to_iso};
 use orchestrail_engine::toolscript;
 use orchestrail_engine::vcs::VcsService;
@@ -1543,13 +1549,49 @@ fn release_sync_usage() -> ! {
     exit(2)
 }
 
+/// Run the native deterministic processor over one `.work` control plane under one owner lease.
+///
+/// Without `--watch` this drains the current delivery lane through successive cohorts and exits —
+/// the long-standing behaviour, unchanged.
+///
+/// `--watch` adds the continuous operating mode: when the lane is drained the process does not
+/// exit but waits at that settled boundary for new current-lane queue rows and then drains them
+/// as the next delivery wave, so the engine can be left running as a local service that populators
+/// simply append tasks to. Waiting is a bounded backoff poll of the queue —
+/// [`WATCH_INITIAL_POLL_SECS`] after a drained lane, doubling per empty poll up to
+/// [`WATCH_MAX_POLL_SECS`], reset after every drained lane — never a busy loop, and it never opens
+/// an empty cohort or calls the planner to discover that there is nothing to do.
+///
+/// Stopping a watching processor (the mechanism chosen for this mode):
+///
+/// * **`.work/WATCH_STOP`** — the operator-owned clean-shutdown marker. Creating this file ends
+///   waiting at the next poll boundary; the process releases its lease and exits reporting the
+///   number of delivery waves it completed. Nothing removes the marker automatically, so it must be
+///   deleted before the next watching invocation; a marker that already exists at startup simply
+///   makes this invocation behave like a plain `--once` run (the lane is drained, then the process
+///   exits without waiting). An unreadable control plane is treated as a stop request: a long-lived
+///   mutating service must not keep opening cohorts over state it can no longer observe.
+/// * **`.work/PAUSE`** — the ordinary pipeline kill switch, honoured here exactly as at every other
+///   phase/round boundary: waiting stops as a hold, the derived pause status is written, and the
+///   lease is released. Use it to pause the pipeline; use `WATCH_STOP` to end only this process.
+///
+/// Both are observed only at poll boundaries, i.e. at most one poll interval late, and never
+/// interrupt a cohort that is already executing. A signal (`Ctrl+C`/`SIGINT`) is deliberately not
+/// the documented mechanism: it can arrive in the middle of a durable mutation, where the safety
+/// contract is the runtime checkpoint and Phase-0 recovery of the *next* invocation rather than a
+/// clean stop. The owner lease keeps being renewed by the background heartbeat during waiting, and
+/// a renewal that loses ownership ends the watch loop with an error instead of letting a former
+/// owner open another cohort.
 fn cmd_processor(args: &[String]) {
     if let Err(error) = validate_processor_args(args) {
         eprintln!("processor: {error}");
         eprintln!(
             "usage: processor --once --live --work <.work-dir> [--root <repo>] [--base <branch>]\n\
              \x20                 [--batch <id>] [--owner <id>] [--ttl <seconds>] [--continue] [--max-turns <n>]\n\
-             \x20                 [--max-effects <n>] [--json]"
+             \x20                 [--max-effects <n>] [--watch] [--json]\n\
+             \x20      --watch: after the current delivery lane is drained, keep the lease and wait\n\
+             \x20               for new current-lane work (bounded backoff poll). Create\n\
+             \x20               .work/WATCH_STOP to end waiting cleanly, .work/PAUSE to hold."
         );
         exit(2);
     }
@@ -1627,6 +1669,7 @@ fn cmd_processor(args: &[String]) {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(fresh_owner_id);
     let continue_requested = args.iter().any(|arg| arg == "--continue");
+    let watch_requested = args.iter().any(|arg| arg == "--watch");
     let json = args.iter().any(|arg| arg == "--json");
     let lease = LeaseStore::new(&work);
     let lease_record = match acquire_processor_lease(
@@ -1841,16 +1884,26 @@ fn cmd_processor(args: &[String]) {
             None => ProcessorRuntime::resume(config.processor, &work)
                 .map_err(|error| error.to_string())?,
         };
-        run_until_queue_exhausted(
+        let loop_config = NativeLoopConfig {
+            batch_id: batch_id.clone(),
+            base: base.clone(),
+            occurred_at: epoch_to_iso(now_epoch_secs()),
+            max_turns,
+            max_effects_per_turn,
+        };
+        if !watch_requested {
+            return run_until_queue_exhausted(&mut runtime, &mut executor, &loop_config)
+                .map_err(|error| error.to_string());
+        }
+        run_watching(
             &mut runtime,
             &mut executor,
-            &NativeLoopConfig {
-                batch_id: batch_id.clone(),
-                base: base.clone(),
-                occurred_at: epoch_to_iso(now_epoch_secs()),
-                max_turns,
-                max_effects_per_turn,
-            },
+            &loop_config,
+            &WatchConfig::new(
+                Duration::from_secs(WATCH_INITIAL_POLL_SECS),
+                Duration::from_secs(WATCH_MAX_POLL_SECS),
+            )
+            .with_stop_probe(watch_stop_probe(&work)),
         )
         .map_err(|error| error.to_string())
     })();
@@ -1876,6 +1929,12 @@ fn cmd_processor(args: &[String]) {
                         "escalated",
                         Some(format!("{count} task(s) require manual review")),
                     ),
+                    NativeLoopOutcome::WatchStopped { waves } => (
+                        "watch-stopped",
+                        Some(format!(
+                            "operator ended --watch after {waves} completed delivery wave(s)"
+                        )),
+                    ),
                 };
                 println!(
                     "{}",
@@ -1894,6 +1953,9 @@ fn cmd_processor(args: &[String]) {
                     NativeLoopOutcome::Held { reason } => println!("processor: held · {reason}"),
                     NativeLoopOutcome::Escalated { count } => println!(
                         "processor: queue stopped · {count} escalated task(s) require manual review"
+                    ),
+                    NativeLoopOutcome::WatchStopped { waves } => println!(
+                        "processor: watch stopped by .work/{WATCH_STOP_FILE} · {waves} delivery wave(s) completed (starting {batch_id})"
                     ),
                 }
             }
@@ -1924,7 +1986,29 @@ const PROCESSOR_VALUE_OPTIONS: &[&str] = &[
     "--max-turns",
     "--max-effects",
 ];
-const PROCESSOR_SWITCH_OPTIONS: &[&str] = &["--once", "--live", "--continue", "--json"];
+const PROCESSOR_SWITCH_OPTIONS: &[&str] = &["--once", "--live", "--continue", "--watch", "--json"];
+
+/// First `--watch` poll interval after a drained delivery lane: short enough that appending a task
+/// starts a wave within seconds, long enough not to poll the control plane in a spin.
+const WATCH_INITIAL_POLL_SECS: u64 = 5;
+/// Ceiling for the doubling `--watch` backoff, so an idle service settles at one queue read per
+/// minute instead of growing unboundedly less responsive.
+const WATCH_MAX_POLL_SECS: u64 = 60;
+/// Operator-owned marker that ends `--watch` waiting cleanly at the next poll boundary. It is only
+/// ever read, never created or removed by the engine — like `.work/PAUSE`, the operator owns it.
+const WATCH_STOP_FILE: &str = "WATCH_STOP";
+
+/// Observe the operator's clean-stop marker for `--watch` waiting.
+///
+/// The probe is evaluated at poll boundaries only, so it never interrupts a cohort. An I/O failure
+/// while testing the marker resolves to "stop requested": a control plane this process can no
+/// longer read is not a safe basis for opening another cohort, and the ordinary single-run path
+/// remains available to an operator once the cause is repaired.
+fn watch_stop_probe(work: &Path) -> CancellationProbe {
+    let work = work.to_path_buf();
+    let marker = work.join(WATCH_STOP_FILE);
+    CancellationProbe::new(move || control_entry_exists(&work, &marker).unwrap_or(true))
+}
 
 /// Validate the complete native processor argv before acquiring its owner lease. Unknown,
 /// duplicate, missing, and empty arguments are errors: silently accepting a misspelled safety
@@ -2820,7 +2904,12 @@ mod parse_iso_utc_tests {
 
 #[cfg(test)]
 mod native_processor_argument_tests {
-    use super::{positive_u64_option, positive_usize_option, validate_processor_args};
+    use std::fs;
+
+    use super::{
+        WATCH_STOP_FILE, positive_u64_option, positive_usize_option, validate_processor_args,
+        watch_stop_probe,
+    };
 
     fn args(tail: &[&str]) -> Vec<String> {
         std::iter::once("orchestrail-engine")
@@ -2846,9 +2935,51 @@ mod native_processor_argument_tests {
             ]),
             args(&["--once", "--live", "--work", "--json"]),
             args(&["--once", "--work", ".work"]),
+            args(&["--once", "--live", "--work", ".work", "--watch", "--watch"]),
+            args(&["--once", "--live", "--work", ".work", "--watch", "5"]),
         ] {
             assert!(validate_processor_args(&invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn watch_is_an_optional_switch_that_leaves_the_single_run_vocabulary_intact() {
+        let watching = args(&["--once", "--live", "--work", ".work", "--watch"]);
+        validate_processor_args(&watching).unwrap();
+        assert!(watching.iter().any(|arg| arg == "--watch"));
+
+        let single_run = args(&["--once", "--live", "--work", ".work"]);
+        validate_processor_args(&single_run).unwrap();
+        assert!(
+            !single_run.iter().any(|arg| arg == "--watch"),
+            "omitting --watch must remain the unchanged single-run invocation"
+        );
+    }
+
+    #[test]
+    fn the_watch_stop_marker_is_observed_only_while_the_operator_keeps_it() {
+        let work =
+            std::env::temp_dir().join(format!("orchestrail-watch-stop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).expect("create the fixture control plane");
+        let marker = work.join(WATCH_STOP_FILE);
+        let probe = watch_stop_probe(&work);
+
+        assert!(
+            !probe.is_cancelled(),
+            "a watching processor keeps waiting while the operator has not asked it to stop"
+        );
+        fs::write(&marker, "operator stop\n").expect("write the stop marker");
+        assert!(
+            probe.is_cancelled(),
+            "creating .work/{WATCH_STOP_FILE} must end watch waiting at the next poll boundary"
+        );
+        fs::remove_file(&marker).expect("remove the stop marker");
+        assert!(
+            !probe.is_cancelled(),
+            "the engine never consumes the marker, so removing it lets a later invocation watch again"
+        );
+        let _ = fs::remove_dir_all(work);
     }
 
     #[test]
@@ -2879,6 +3010,7 @@ mod native_processor_argument_tests {
             "--once",
             "--live",
             "--continue",
+            "--watch",
             "--json",
             "--work",
             ".work",

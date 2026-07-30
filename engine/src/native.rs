@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use crate::dependency_graph::RefreshBoundary;
 use crate::execution::{EffectExecutor, EffectResolution};
@@ -186,6 +187,17 @@ pub trait ProcessorPort {
     /// A malformed, unreadable, or unexpectedly non-terminal idle queue row must be returned as
     /// an error rather than treated as completion.
     fn current_queue_readiness(&mut self) -> Result<QueueReadiness, Self::Error>;
+    /// Wait out exactly one bounded backoff interval of the continuous `--watch` scheduler while
+    /// the normal delivery lane is empty. This is the only place where the native scheduler is
+    /// allowed to spend wall time without a durable effect, so an implementation must do nothing
+    /// else here: no control-plane mutation, no model call, no reducer command. Returning early
+    /// (for example on a filesystem change notification) is permitted and counts only as one poll
+    /// boundary; it is never evidence that new work exists, because the scheduler re-reads
+    /// [`Self::current_queue_readiness`] afterwards.
+    fn wait_for_watch_interval(&mut self, interval: Duration) -> Result<(), Self::Error> {
+        std::thread::sleep(interval);
+        Ok(())
+    }
     /// Return the explicit control-plane clock used for admission/budget commands. Implementors
     /// may source it from an injected clock or a persisted run input, but must not make reducer
     /// event identities depend on an implicit leaf completion timestamp.
@@ -929,6 +941,22 @@ impl<P: ProcessorPort> NativeExecutor<P> {
         Ok(readiness)
     }
 
+    /// Spend one bounded `--watch` backoff interval under the same owner boundary as every other
+    /// observation. The check after the wait is the load-bearing one: a renewal worker can lose
+    /// this process's lease precisely while the scheduler is idle, and the watch loop must not
+    /// then read the queue or open another cohort as a former owner.
+    pub fn wait_for_watch_interval(
+        &mut self,
+        interval: Duration,
+    ) -> Result<(), NativeError<P::Error>> {
+        self.ensure_lease_active()?;
+        self.port
+            .wait_for_watch_interval(interval)
+            .map_err(NativeError::Port)?;
+        self.ensure_lease_active()?;
+        Ok(())
+    }
+
     /// Read the explicit scheduler clock without allowing a lease loss during the port call to
     /// advance the reducer with a stale owner's input.
     pub fn now_secs(&mut self) -> Result<u64, NativeError<P::Error>> {
@@ -975,29 +1003,43 @@ impl<P: ProcessorPort> NativeExecutor<P> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
+pub(crate) mod test_support {
+    //! One configurable in-memory [`ProcessorPort`] shared by the native adapter tests and the
+    //! scheduler tests in [`crate::native_loop`]. Keeping a single stub here means a new port
+    //! obligation has exactly one test double to satisfy, instead of one per module.
+
+    use std::collections::{BTreeSet, VecDeque};
     use std::convert::Infallible;
-    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use super::*;
-    use crate::processor::{
-        IntegrationRuntime, MergeResolutionRuntime, ProcessorCommand, ProcessorConfig,
-        ProcessorState,
-    };
-    use crate::runtime::{ProcessorRuntime, RecoveryRequirement};
 
     #[derive(Default)]
-    struct Port {
-        plan_calls: Option<Arc<AtomicUsize>>,
-        cancel_after_plan: Option<Arc<AtomicBool>>,
-        paused: bool,
-        pause_status_writes: usize,
-        publish_hold: Option<String>,
-        publish_reanchor: Option<PublicationReanchorTarget>,
+    pub struct Port {
+        pub plan_calls: Option<Arc<AtomicUsize>>,
+        pub cancel_after_plan: Option<Arc<AtomicBool>>,
+        pub paused: bool,
+        pub pause_status_writes: usize,
+        pub publish_hold: Option<String>,
+        pub publish_reanchor: Option<PublicationReanchorTarget>,
+        /// Programmed answers for [`ProcessorPort::current_queue_readiness`], consumed in order.
+        /// An exhausted programme keeps reporting a drained lane, so an unprogrammed call can
+        /// never be mistaken for newly arrived work.
+        pub readiness: VecDeque<QueueReadiness>,
+        /// Every interval the watch scheduler asked to wait out, in request order.
+        pub waits: Vec<Duration>,
+        /// Really sleep the requested interval. Only real-time lease fixtures need this; the
+        /// scheduler tests assert the requested intervals instead of spending them.
+        pub sleep_during_wait: bool,
+        /// Request an operator pause once exactly this many waits have completed.
+        pub pause_after_waits: Option<usize>,
+        /// Set the shared flag once exactly this many waits have completed. Fixtures use it for
+        /// both an operator stop request and a lease lost while the scheduler was idle.
+        pub flip_after_waits: Option<(usize, Arc<AtomicBool>)>,
+        /// Cohort ids the planner was invoked for, in call order.
+        pub planned_batches: Vec<String>,
     }
 
     impl ProcessorPort for Port {
@@ -1008,7 +1050,26 @@ mod tests {
         }
 
         fn current_queue_readiness(&mut self) -> Result<QueueReadiness, Self::Error> {
-            Ok(QueueReadiness::Exhausted { escalated: 0 })
+            Ok(self
+                .readiness
+                .pop_front()
+                .unwrap_or(QueueReadiness::Exhausted { escalated: 0 }))
+        }
+
+        fn wait_for_watch_interval(&mut self, interval: Duration) -> Result<(), Self::Error> {
+            self.waits.push(interval);
+            if self.sleep_during_wait {
+                std::thread::sleep(interval);
+            }
+            if self.pause_after_waits == Some(self.waits.len()) {
+                self.paused = true;
+            }
+            if let Some((after, flag)) = &self.flip_after_waits
+                && *after == self.waits.len()
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Ok(())
         }
 
         fn now_secs(&mut self) -> Result<u64, Self::Error> {
@@ -1057,11 +1118,14 @@ mod tests {
         }
         fn plan_candidates(
             &mut self,
-            _: &ProcessorState,
+            state: &ProcessorState,
             _: usize,
         ) -> Result<Vec<AdmissionCandidate>, Self::Error> {
             if let Some(calls) = &self.plan_calls {
                 calls.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(cohort) = state.batch.as_ref() {
+                self.planned_batches.push(cohort.id.clone());
             }
             if let Some(cancelled) = &self.cancel_after_plan {
                 cancelled.store(true, Ordering::SeqCst);
@@ -1252,6 +1316,23 @@ mod tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::test_support::Port;
+    use super::*;
+    use crate::processor::{
+        IntegrationRuntime, MergeResolutionRuntime, ProcessorCommand, ProcessorConfig,
+        ProcessorState,
+    };
+    use crate::runtime::{ProcessorRuntime, RecoveryRequirement};
 
     #[test]
     fn every_reducer_effect_has_one_native_mapping_or_is_driver_owned() {

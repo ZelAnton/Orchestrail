@@ -41,6 +41,16 @@ cargo run -p orchestrail-engine -- processor --once --live --work .work --root .
 It uses the native lease, reducer checkpoint/effect ledger, ProcessKit-contained
 headless agents, and typed VCS operations. One invocation keeps its owner lease across
 successive cohorts until the normal delivery lane is exhausted, without opening an empty cohort.
+
+Adding `--watch` turns that single drain into a long-lived local service: when the lane is
+exhausted the process keeps its lease and waits at that settled boundary for new current-lane
+queue rows, then drains them as the next delivery wave under a distinct cohort id. Waiting is a
+bounded backoff poll of the queue (5 s after a drained lane, doubling up to 60 s, reset after every
+drained lane), so populators can simply append tasks instead of restarting the engine per wave.
+Create `.work/WATCH_STOP` to end the waiting cleanly at the next poll boundary, or the ordinary
+`.work/PAUSE` to hold the pipeline; both are observed only between waves and never interrupt a
+running cohort. Escalated tasks still stop the run instead of being hidden behind an endless wait.
+
 After the final integration review and immediately
 before publication, `VERIFICATION_COMMANDS` (or the `SMOKE_CMD` fallback) runs sequentially
 against that exact integration tip; `VERIFICATION_MODE: auto|required` without a profile is held

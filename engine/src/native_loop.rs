@@ -7,11 +7,13 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use crate::execution::{DriveError, DriveReport, drive};
 use crate::native::{NativeError, NativeExecutor, ProcessorPort, QueueReadiness};
 use crate::processor::{Effect, Phase, ProcessorCommand};
 use crate::runtime::{ProcessorRuntime, RecoveryRequirement, RuntimeError};
+use crate::supervise::CancellationProbe;
 
 #[derive(Debug, Clone)]
 pub struct NativeLoopConfig {
@@ -20,6 +22,52 @@ pub struct NativeLoopConfig {
     pub occurred_at: String,
     pub max_turns: usize,
     pub max_effects_per_turn: usize,
+}
+
+/// Floor for one `--watch` poll interval. A misconfigured zero interval must degrade into a slow
+/// poll, never into a busy loop that reads the control plane as fast as the CPU allows.
+const MIN_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Bounded waiting policy for the continuous `--watch` scheduler.
+///
+/// The wait is a plain backoff poll of the same read-only queue fact the cohort boundary already
+/// uses: the first interval after a drained lane is short so a populator's new task starts almost
+/// immediately, and every consecutive empty poll doubles the interval up to
+/// [`Self::max_poll_interval`], so an idle service costs one directory read per ceiling instead of
+/// a spin. The interval resets after each drained lane.
+///
+/// `stop` is the operator's clean-shutdown fact. It is injected rather than read from a fixed file
+/// because "stop watching" is an operating-mode decision of the embedder: the CLI backs it with an
+/// operator-owned marker file, and an interactive embedder can back it with an in-process flag.
+#[derive(Debug, Clone)]
+pub struct WatchConfig {
+    pub initial_poll_interval: Duration,
+    pub max_poll_interval: Duration,
+    pub stop: Option<CancellationProbe>,
+}
+
+impl WatchConfig {
+    pub fn new(initial_poll_interval: Duration, max_poll_interval: Duration) -> Self {
+        Self {
+            initial_poll_interval,
+            max_poll_interval,
+            stop: None,
+        }
+    }
+
+    /// Bind the operator-owned clean-stop fact observed at every poll boundary.
+    pub fn with_stop_probe(mut self, stop: CancellationProbe) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+}
+
+/// Why one `--watch` wait ended. Only [`Self::CurrentLaneWork`] permits another delivery wave.
+enum WatchWakeup {
+    CurrentLaneWork,
+    Stopped,
+    Held { reason: String },
+    Escalated { count: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +82,10 @@ pub enum NativeLoopOutcome {
     /// The normal delivery lane is exhausted, but terminal escalations require a human decision
     /// before the overall queue can be reported as cleanly completed.
     Escalated { count: usize },
+    /// Continuous `--watch` waiting ended because the operator requested a clean stop. `waves`
+    /// counts the delivery lanes fully drained during this invocation, so a stopped service can
+    /// still be distinguished from one that never had work. Only [`run_watching`] returns this.
+    WatchStopped { waves: usize },
 }
 
 #[derive(Debug)]
@@ -224,6 +276,11 @@ pub fn run_until_queue_exhausted<P: ProcessorPort>(
             NativeLoopOutcome::Escalated { count } => {
                 return Ok(NativeLoopOutcome::Escalated { count });
             }
+            // A single cohort has no waiting phase, so it cannot report a watch stop. Forward it
+            // unchanged rather than reinterpreting an outcome this function did not produce.
+            NativeLoopOutcome::WatchStopped { waves } => {
+                return Ok(NativeLoopOutcome::WatchStopped { waves });
+            }
             NativeLoopOutcome::Completed => {
                 completed_cohort_count = completed_cohort_count.saturating_add(1);
                 match executor
@@ -265,6 +322,126 @@ pub fn run_until_queue_exhausted<P: ProcessorPort>(
                 );
             }
         }
+    }
+}
+
+/// Keep one owner lease across successive delivery waves: drain the current lane exactly as
+/// [`run_until_queue_exhausted`] does, then — instead of exiting — wait at a settled boundary for
+/// new current-lane work and drain it again. This is the continuous `--watch` mode of the CLI.
+///
+/// The wait is deliberately the weakest possible operation: a bounded backoff poll of the same
+/// read-only queue fact the cohort boundary already trusts (see [`WatchConfig`]). Every poll
+/// boundary is a full stop boundary, in this order:
+///
+/// 1. the owner lease must still be held (a renewal worker that lost ownership ends the loop with
+///    an error instead of letting a former owner open another cohort);
+/// 2. an operator stop request ([`WatchConfig::stop`]) ends waiting cleanly with
+///    [`NativeLoopOutcome::WatchStopped`];
+/// 3. `.work/PAUSE` ends waiting as a hold, exactly like the per-turn boundary of
+///    [`run_until_idle`] — the durable ledger is already settled here, so no in-flight mutation
+///    can be interrupted;
+/// 4. the interval is spent, and only then is the queue re-read; terminal escalations end watching
+///    with [`NativeLoopOutcome::Escalated`] rather than being hidden behind an endless wait.
+///
+/// Each new wave receives a deterministic, distinct descendant batch id (`<first>-w2`, `<first>-w3`,
+/// …) so a second wave can never reuse the first wave's cohort identity, and a fresh lifecycle
+/// timestamp sampled through the port clock.
+///
+/// A hold, an escalation, or a scheduler error inside a wave is returned unchanged: `--watch` adds
+/// waiting, never a second opinion about a safety gate.
+pub fn run_watching<P: ProcessorPort>(
+    runtime: &mut ProcessorRuntime,
+    executor: &mut NativeExecutor<P>,
+    config: &NativeLoopConfig,
+    watch: &WatchConfig,
+) -> Result<NativeLoopOutcome, NativeLoopError<P::Error>> {
+    let initial_interval = watch.initial_poll_interval.max(MIN_WATCH_POLL_INTERVAL);
+    let max_interval = watch.max_poll_interval.max(initial_interval);
+    let mut wave_config = config.clone();
+    let mut waves = 0_usize;
+    let mut wave_number = 1_u32;
+
+    loop {
+        match run_until_queue_exhausted(runtime, executor, &wave_config)? {
+            NativeLoopOutcome::Completed => waves = waves.saturating_add(1),
+            NativeLoopOutcome::Idle => {}
+            outcome @ (NativeLoopOutcome::Held { .. }
+            | NativeLoopOutcome::Escalated { .. }
+            | NativeLoopOutcome::WatchStopped { .. }) => return Ok(outcome),
+        }
+        match wait_for_current_lane_work(
+            runtime,
+            executor,
+            watch.stop.as_ref(),
+            initial_interval,
+            max_interval,
+        )? {
+            WatchWakeup::CurrentLaneWork => {}
+            WatchWakeup::Stopped => return Ok(NativeLoopOutcome::WatchStopped { waves }),
+            WatchWakeup::Held { reason } => return Ok(NativeLoopOutcome::Held { reason }),
+            WatchWakeup::Escalated { count } => {
+                return Ok(NativeLoopOutcome::Escalated { count });
+            }
+        }
+        wave_number = wave_number.saturating_add(1);
+        wave_config.batch_id = format!("{}-w{wave_number}", config.batch_id);
+        wave_config.occurred_at = executor
+            .event_occurred_at(&config.occurred_at)
+            .map_err(NativeLoopError::Port)?;
+    }
+}
+
+/// Poll for new current-lane work at settled boundaries only. The caller has just observed a
+/// drained lane, so the durable checkpoint and effect ledger are consistent and every exit from
+/// this function is a safe stopping point for the process.
+///
+/// Each iteration spends its interval *before* re-reading the queue. The caller's own exhaustion
+/// check already read the lane microseconds ago, so an immediate re-read would only be a redundant
+/// control-plane read — and, were two consecutive reads ever to disagree, a poll-free spin between
+/// this function and a wave that finds nothing to open. Operator markers are still observed first,
+/// so a stop or pause never has to wait out an interval it did not cause.
+fn wait_for_current_lane_work<P: ProcessorPort>(
+    runtime: &ProcessorRuntime,
+    executor: &mut NativeExecutor<P>,
+    stop: Option<&CancellationProbe>,
+    initial_interval: Duration,
+    max_interval: Duration,
+) -> Result<WatchWakeup, NativeLoopError<P::Error>> {
+    let mut interval = initial_interval;
+    loop {
+        // Ownership first: neither the operator markers nor the queue may be turned into a
+        // scheduling decision by a process whose lease renewal has already failed.
+        executor
+            .ensure_lease_active()
+            .map_err(NativeLoopError::Port)?;
+        if stop.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(WatchWakeup::Stopped);
+        }
+        if executor.pause_requested().map_err(NativeLoopError::Port)? {
+            executor
+                .write_pause_status(runtime.state())
+                .map_err(NativeLoopError::Port)?;
+            return Ok(WatchWakeup::Held {
+                reason: format!(
+                    "paused by .work/PAUSE while --watch waited for new current-lane work at the {:?} boundary; remove it and rerun to resume through phase-0 recovery",
+                    runtime.state().phase
+                ),
+            });
+        }
+        executor
+            .wait_for_watch_interval(interval)
+            .map_err(NativeLoopError::Port)?;
+        match executor
+            .current_queue_readiness()
+            .map_err(NativeLoopError::Port)?
+        {
+            QueueReadiness::Pending => return Ok(WatchWakeup::CurrentLaneWork),
+            QueueReadiness::Exhausted { escalated: 0 } => {}
+            QueueReadiness::Exhausted { escalated } => {
+                return Ok(WatchWakeup::Escalated { count: escalated });
+            }
+        }
+        interval = interval.saturating_mul(2).min(max_interval);
     }
 }
 
@@ -460,17 +637,27 @@ pub fn run_command<P: ProcessorPort>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
+    use crate::native::test_support::Port;
+    use crate::native::{NativeError, NativeExecutor, QueueReadiness};
+    use crate::ownership::{LeaseHeartbeat, LeaseStatus, LeaseStore};
     use crate::processor::{
         AdmissionCandidate, Effect, LeafKind, ProcessorCommand, ProcessorConfig,
     };
     use crate::resolvers::Level;
     use crate::runtime::ProcessorRuntime;
+    use crate::state::now_epoch_secs;
+    use crate::supervise::CancellationProbe;
 
     use super::{
+        NativeLoopConfig, NativeLoopError, NativeLoopOutcome, WatchConfig,
         activate_recovery_effects, inspection_recovery_hold, replayable_recovery_effects_for,
+        run_watching,
     };
 
     fn temp_work(name: &str) -> std::path::PathBuf {
@@ -478,6 +665,285 @@ mod tests {
             "orchestrail-native-loop-{name}-{}",
             std::process::id()
         ))
+    }
+
+    fn watch_config(batch_id: &str) -> NativeLoopConfig {
+        NativeLoopConfig {
+            batch_id: batch_id.into(),
+            base: "main".into(),
+            occurred_at: "2026-07-30T10:00:00Z".into(),
+            max_turns: 64,
+            max_effects_per_turn: 512,
+        }
+    }
+
+    fn flag_probe(flag: &Arc<AtomicBool>) -> CancellationProbe {
+        let flag = Arc::clone(flag);
+        CancellationProbe::new(move || flag.load(Ordering::SeqCst))
+    }
+
+    fn fresh_runtime(work: &std::path::Path) -> ProcessorRuntime {
+        let _ = fs::remove_dir_all(work);
+        ProcessorRuntime::new(ProcessorConfig::default(), work).expect("fresh native runtime")
+    }
+
+    #[test]
+    fn watch_backs_off_while_the_lane_is_empty_and_opens_a_distinct_wave_on_new_work() {
+        let work = temp_work("watch-backoff");
+        let mut runtime = fresh_runtime(&work);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut executor = NativeExecutor::new(Port {
+            // The first answer drains the initial lane; the next two keep the watch loop waiting
+            // (each answer follows one spent interval); the last two admit exactly one further
+            // delivery wave.
+            readiness: VecDeque::from([
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Pending,
+                QueueReadiness::Pending,
+            ]),
+            flip_after_waits: Some((4, Arc::clone(&stop))),
+            ..Default::default()
+        });
+
+        let outcome = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(100))
+                .with_stop_probe(flag_probe(&stop)),
+        )
+        .expect("watch scheduler");
+
+        assert_eq!(outcome, NativeLoopOutcome::WatchStopped { waves: 1 });
+        assert_eq!(
+            executor.port().waits,
+            vec![
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+            ],
+            "an empty lane doubles the poll interval up to the ceiling and resets it after a drained lane"
+        );
+        assert_eq!(
+            executor.port().planned_batches,
+            vec!["B-watch-w2".to_string()],
+            "the woken wave must open a distinct descendant cohort id, never reuse the first one"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn watch_stops_at_a_pause_boundary_without_opening_another_cohort() {
+        let work = temp_work("watch-pause");
+        let mut runtime = fresh_runtime(&work);
+        let mut executor = NativeExecutor::new(Port {
+            pause_after_waits: Some(2),
+            ..Default::default()
+        });
+
+        let outcome = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-pause"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(60)),
+        )
+        .expect("watch scheduler");
+
+        assert!(
+            matches!(outcome, NativeLoopOutcome::Held { ref reason }
+                if reason.contains(".work/PAUSE") && reason.contains("--watch")),
+            "an operator pause during waiting must hold with an explicit reason: {outcome:?}"
+        );
+        assert_eq!(
+            executor.port().waits,
+            vec![Duration::from_millis(50), Duration::from_millis(60)],
+            "PAUSE is observed at the poll boundary that follows the wait, not inside it"
+        );
+        assert_eq!(
+            executor.port().pause_status_writes,
+            1,
+            "the derived pause status is materialized exactly once before the caller releases the lease"
+        );
+        assert!(
+            executor.port().planned_batches.is_empty(),
+            "a paused watch loop must never open another cohort or call the planner"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn an_operator_stop_request_ends_watch_waiting_cleanly() {
+        let work = temp_work("watch-stop");
+        let mut runtime = fresh_runtime(&work);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut executor = NativeExecutor::new(Port {
+            flip_after_waits: Some((2, Arc::clone(&stop))),
+            ..Default::default()
+        });
+
+        let outcome = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-stop"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50))
+                .with_stop_probe(flag_probe(&stop)),
+        )
+        .expect("watch scheduler");
+
+        assert_eq!(outcome, NativeLoopOutcome::WatchStopped { waves: 0 });
+        assert_eq!(executor.port().waits.len(), 2);
+        assert_eq!(
+            executor.port().pause_status_writes,
+            0,
+            "a requested clean stop is not an operator pause and must not rewrite pause status"
+        );
+        assert!(executor.port().planned_batches.is_empty());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_stop_request_present_before_the_first_wait_degrades_to_a_single_run() {
+        let work = temp_work("watch-stop-cold");
+        let mut runtime = fresh_runtime(&work);
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut executor = NativeExecutor::new(Port::default());
+
+        let outcome = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-cold-stop"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50))
+                .with_stop_probe(flag_probe(&stop)),
+        )
+        .expect("watch scheduler");
+
+        assert_eq!(outcome, NativeLoopOutcome::WatchStopped { waves: 0 });
+        assert!(
+            executor.port().waits.is_empty(),
+            "an already requested stop must be observed before the first wait is spent"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn watch_reports_an_escalation_observed_while_waiting_instead_of_hiding_it() {
+        let work = temp_work("watch-escalated");
+        let mut runtime = fresh_runtime(&work);
+        let mut executor = NativeExecutor::new(Port {
+            readiness: VecDeque::from([
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Exhausted { escalated: 3 },
+            ]),
+            ..Default::default()
+        });
+
+        let outcome = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-escalated"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50)),
+        )
+        .expect("watch scheduler");
+
+        assert_eq!(outcome, NativeLoopOutcome::Escalated { count: 3 });
+        assert_eq!(
+            executor.port().waits.len(),
+            1,
+            "a queue that only holds escalations is reported at the first poll, not waited on for ever"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_lease_lost_while_watch_waits_stops_before_the_next_wave() {
+        let work = temp_work("watch-lease-lost");
+        let mut runtime = fresh_runtime(&work);
+        let lost = Arc::new(AtomicBool::new(false));
+        let mut executor = NativeExecutor::new(Port {
+            // The lane is drained once, and every later answer offers new work: the lost lease
+            // must win over that work rather than letting a former owner drain it.
+            readiness: VecDeque::from([
+                QueueReadiness::Exhausted { escalated: 0 },
+                QueueReadiness::Pending,
+                QueueReadiness::Pending,
+            ]),
+            flip_after_waits: Some((1, Arc::clone(&lost))),
+            ..Default::default()
+        })
+        .with_cancellation_probe(flag_probe(&lost));
+
+        let error = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-lease"),
+            &WatchConfig::new(Duration::from_millis(50), Duration::from_millis(50)),
+        )
+        .expect_err("a former owner must not continue watching");
+
+        assert!(
+            matches!(error, NativeLoopError::Port(NativeError::LeaseLost)),
+            "losing ownership during a wait is a fail-closed error, not a clean stop: {error}"
+        );
+        assert_eq!(executor.port().waits.len(), 1);
+        assert!(
+            executor.port().planned_batches.is_empty(),
+            "the woken wave must not open a cohort after ownership was lost"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    /// The renewal worker is a background thread owned by the CLI, so the guarantee under test is
+    /// that `--watch` waiting does not starve it: a wait longer than the whole lease TTL must leave
+    /// the durable `lease.json` record renewed and live rather than stale.
+    #[test]
+    fn watch_waiting_longer_than_the_lease_ttl_keeps_the_owner_lease_live() {
+        let work = temp_work("watch-heartbeat");
+        let mut runtime = fresh_runtime(&work);
+        let store = LeaseStore::new(&work);
+        let acquired = store
+            .acquire("engine-watch", &work, 2, now_epoch_secs())
+            .expect("acquire the watch fixture lease");
+        let heartbeat = LeaseHeartbeat::start(store.clone(), &acquired);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut executor = NativeExecutor::new(Port {
+            sleep_during_wait: true,
+            flip_after_waits: Some((1, Arc::clone(&stop))),
+            ..Default::default()
+        })
+        .with_cancellation_probe(heartbeat.cancellation_probe());
+
+        let outcome = run_watching(
+            &mut runtime,
+            &mut executor,
+            &watch_config("B-watch-heartbeat"),
+            &WatchConfig::new(Duration::from_millis(2_500), Duration::from_millis(2_500))
+                .with_stop_probe(flag_probe(&stop)),
+        )
+        .expect("watch scheduler");
+
+        assert_eq!(outcome, NativeLoopOutcome::WatchStopped { waves: 0 });
+        heartbeat
+            .stop()
+            .expect("the renewal worker must not have lost ownership while watch waited");
+        let status = store
+            .status(now_epoch_secs())
+            .expect("read the lease record");
+        assert!(
+            matches!(&status, LeaseStatus::Live { record, liveness }
+                if record.owner_id == "engine-watch"
+                    && record.generation > acquired.generation
+                    && liveness.heartbeat_age_secs < record.ttl_seconds),
+            "the heartbeat must keep renewing the lease across a wait longer than its TTL: {status:?}"
+        );
+        assert!(
+            store
+                .release("engine-watch", now_epoch_secs())
+                .expect("release the fixture lease")
+        );
+        let _ = fs::remove_dir_all(work);
     }
 
     #[test]
