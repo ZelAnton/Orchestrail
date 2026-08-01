@@ -3262,7 +3262,9 @@ impl ExternalPort for HeadlessExternalPort {
         };
         let terminal = if matches!(
             &outcome,
-            LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. }
+            LeafOutcome::Completed { .. }
+                | LeafOutcome::RiskElevated { .. }
+                | LeafOutcome::CompletedWithWontFix { .. }
         ) {
             CodexAttemptOutcome::Success
         } else {
@@ -3279,7 +3281,15 @@ impl ExternalPort for HeadlessExternalPort {
             );
         }
         let prepared = match &outcome {
-            LeafOutcome::Completed { .. } => TaskLeafPreparationOutcome::Completed,
+            // `TaskLeafPreparationOutcome::Completed` carries no fields, so a Codex fix round's
+            // `не исправлено` count (task T-014) does not survive this Codex-preparation
+            // indirection the way it does on the direct Claude `finish_task_leaf` path. This is a
+            // scoped, accepted gap: the empty-fixed-set early exit simply does not fire for a
+            // Codex-completed fix round — it still commits normally, and the unaffected
+            // `stagnation_decision` path remains the correctness backstop for that case.
+            LeafOutcome::Completed { .. } | LeafOutcome::CompletedWithWontFix { .. } => {
+                TaskLeafPreparationOutcome::Completed
+            }
             LeafOutcome::RiskElevated { risk, .. } => {
                 TaskLeafPreparationOutcome::RiskElevated { risk: *risk }
             }
@@ -3778,7 +3788,6 @@ impl ExternalPort for HeadlessExternalPort {
         let handovers = thread::scope(|scope| {
             let workers = effects
                 .iter()
-                .cloned()
                 .map(|request| {
                     let config = config.clone();
                     let state = frozen_state.clone();
@@ -4035,6 +4044,12 @@ impl ExternalPort for HeadlessExternalPort {
                     "CI fixer reported unsupported task risk elevation {}",
                     risk.as_str()
                 ),
+            }),
+            // A CI fixer runs the Mode-3 point-fix contract, never Mode 2, so `не исправлено`
+            // metadata (task T-014, gated on `режим=2` in `task_leaf_outcome`) cannot legitimately
+            // originate here.
+            LeafOutcome::CompletedWithWontFix { .. } => Ok(CiFixPreparationOutcome::Escalated {
+                reason: "CI fixer reported unsupported fix-cycle won't-fix metadata".into(),
             }),
         }
     }
@@ -4709,7 +4724,9 @@ fn unix_epoch_millis() -> Result<u64, HeadlessError> {
 fn leaf_completed(outcome: &LeafOutcome) -> bool {
     matches!(
         outcome,
-        LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. }
+        LeafOutcome::Completed { .. }
+            | LeafOutcome::RiskElevated { .. }
+            | LeafOutcome::CompletedWithWontFix { .. }
     )
 }
 
@@ -5664,6 +5681,7 @@ mod tests {
             ]),
             review_cycles: 1,
             review_signatures: Vec::new(),
+            pending_fix_open_findings: None,
             implementation_author: Some("coder".into()),
             previous_review_sha: None,
             review_sha: Some("head".into()),
@@ -5960,6 +5978,7 @@ mod tests {
                 leaf_attempts: BTreeMap::new(),
                 review_cycles: 0,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: None,
@@ -6357,6 +6376,7 @@ mod tests {
                 leaf_attempts: BTreeMap::from([(LeafKind::Implement.as_str().into(), 1)]),
                 review_cycles: 0,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: Some("head".into()),
@@ -6850,6 +6870,7 @@ mod tests {
                 leaf_attempts: BTreeMap::from([(LeafKind::Review.as_str().into(), 1)]),
                 review_cycles: 0,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author: Some("coder".into()),
                 previous_review_sha: None,
                 review_sha: Some("head".into()),
@@ -6956,6 +6977,7 @@ mod tests {
                 leaf_attempts: BTreeMap::from([(LeafKind::Review.as_str().into(), 1)]),
                 review_cycles: 0,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author: Some("coder".into()),
                 previous_review_sha: None,
                 review_sha: Some("head".into()),

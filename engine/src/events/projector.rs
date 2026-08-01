@@ -777,6 +777,7 @@ mod tests {
                 task_id: "T-101".into(),
                 outcome: ReviewOutcome::Findings {
                     signature: "0123456789abcdef".into(),
+                    open_findings: 1,
                 },
             },
         );
@@ -887,6 +888,7 @@ mod tests {
                 task_id: "T-1".into(),
                 outcome: ReviewOutcome::Findings {
                     signature: "0123456789abcdef".into(),
+                    open_findings: 1,
                 },
             },
         ));
@@ -932,6 +934,7 @@ mod tests {
             leaf_attempts: Default::default(),
             review_cycles: 0,
             review_signatures: Vec::new(),
+            pending_fix_open_findings: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: None,
@@ -1056,6 +1059,7 @@ mod tests {
             leaf_attempts: Default::default(),
             review_cycles: 0,
             review_signatures: Vec::new(),
+            pending_fix_open_findings: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: Some("reviewed1".into()),

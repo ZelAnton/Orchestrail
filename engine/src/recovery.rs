@@ -587,6 +587,10 @@ pub fn import_closed_ready_cohort(
                 leaf_attempts: BTreeMap::new(),
                 review_cycles,
                 review_signatures: Vec::new(),
+                // A legacy import never has an in-flight fix round to correlate — it is only
+                // ever set (and consumed the same round) by the native reducer's own
+                // `ReviewOutcome::Findings` -> `LeafOutcome::CompletedWithWontFix` pairing.
+                pending_fix_open_findings: None,
                 implementation_author: descriptor.implementation_authors.last().cloned(),
                 previous_review_sha: None,
                 review_sha,
@@ -978,6 +982,7 @@ pub fn import_active_cohort(
                 leaf_attempts: BTreeMap::new(),
                 review_cycles,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author,
                 previous_review_sha,
                 review_sha,

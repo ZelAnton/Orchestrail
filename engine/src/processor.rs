@@ -21,7 +21,8 @@ use crate::dependency_graph::RefreshBoundary;
 use crate::resolvers::{
     ActiveClass, ActiveTask, AdmissionGate, AttemptSignature, Candidate, CloseReason,
     CohortCounters, CohortThresholds, Domain, EmptyReason, Level, Risk, StagnationDecision,
-    admission_gate, plan_admission, review_cycle_decision, stagnation_decision,
+    admission_gate, empty_fixed_set_decision, plan_admission, review_cycle_decision,
+    stagnation_decision,
 };
 use crate::session::{LeafSessionKey, LeafSessionUpdate, is_valid_session_id};
 use crate::state::DeliveryTarget;
@@ -273,6 +274,14 @@ pub struct TaskRuntime {
     /// durable `Циклов-ревью` coordinate used to enforce `REVIEW_LOOP_MAX` across recovery.
     pub review_cycles: u32,
     pub review_signatures: Vec<String>,
+    /// The open-finding count (`ReviewOutcome::Findings`'s own `open_findings`) of the review
+    /// round that most recently dispatched a fix leaf, or `None` outside a fix round / on a
+    /// checkpoint written before task T-014. Consumed (and cleared) the moment the fix leaf
+    /// returns, so it never survives stale across an unrelated later round; a resumed checkpoint
+    /// missing it simply skips the empty-fixed-set early exit for that one round and falls back to
+    /// the unaffected `stagnation_decision` path.
+    #[serde(default)]
+    pub pending_fix_open_findings: Option<u32>,
     pub implementation_author: Option<String>,
     /// The last committed tip that a reviewer completed before the current `review_sha` was
     /// created. `None` identifies the first full review from the immutable cohort base.  It is
@@ -313,6 +322,7 @@ impl TaskRuntime {
             leaf_attempts: BTreeMap::new(),
             review_cycles: 0,
             review_signatures: Vec::new(),
+            pending_fix_open_findings: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: None,
@@ -380,6 +390,11 @@ fn non_success_leaf_reason(outcome: LeafOutcome, role: &str) -> Option<String> {
         LeafOutcome::RiskElevated { risk, .. } => Some(format!(
             "{role} reported unsupported task risk elevation {}",
             risk.as_str()
+        )),
+        // Won't-fix metadata (task T-014) is, like risk elevation above, a task-fix-cycle-only
+        // extension: only `TaskLeaf`'s fix path owns the descriptor it correlates against.
+        LeafOutcome::CompletedWithWontFix { .. } => Some(format!(
+            "{role} reported unsupported fix-cycle won't-fix metadata"
         )),
     }
 }
@@ -825,6 +840,17 @@ pub enum LeafOutcome {
         author: Option<String>,
         risk: Risk,
     },
+    /// A successful FIX round (task T-014) that additionally declared `wont_fixed` findings it
+    /// did NOT fix via the fixer's additive `не исправлено` outcome field
+    /// (`crate::contract::Outcome::wont_fix`). Kept distinct from the plain `Completed` variant so
+    /// only `TaskLeaf`'s fix path — the one place that tracks a round's open-finding count
+    /// (`TaskRuntime::pending_fix_open_findings`) — needs to correlate it; every other leaf role
+    /// (Implement, merger, curators, ...) that can never emit it treats it exactly like an
+    /// ordinary completion wherever it is matched.
+    CompletedWithWontFix {
+        author: Option<String>,
+        wont_fixed: u32,
+    },
     RetryableFailure {
         reason: String,
     },
@@ -849,12 +875,28 @@ pub enum ReviewOutcome {
     },
     Findings {
         signature: String,
+        /// Count of open (`статус: новая`) findings this round (task T-014). Threaded through so
+        /// the per-task fix path can correlate it against the fixer's own `не исправлено` count
+        /// and detect an empty fixed set without waiting for a repeat review pass — see
+        /// `TaskRuntime::pending_fix_open_findings` and
+        /// [`crate::resolvers::empty_fixed_set_decision`]. The integration (`F-`) loop threads the
+        /// same field but does not (yet) act on it; only the per-task loop (phases 2.5/2.8) does.
+        /// `#[serde(default)]` (0) so a durable Codex replay receipt written before task T-014
+        /// still deserializes — a defaulted 0 simply never satisfies `open_findings > 0` in
+        /// [`crate::resolvers::empty_fixed_set_decision`], degrading that one round back to the
+        /// unaffected `stagnation_decision` path rather than failing to load.
+        #[serde(default)]
+        open_findings: u32,
     },
     /// An open R-finding concurrently records a strict risk elevation. It follows the ordinary
     /// repair loop and never introduces a separate human gate.
     FindingsRiskElevated {
         signature: String,
         risk: Risk,
+        /// Same meaning and same `#[serde(default)]` compatibility rationale as
+        /// [`ReviewOutcome::Findings::open_findings`] (task T-014).
+        #[serde(default)]
+        open_findings: u32,
     },
     Incomplete,
     Escalated {
@@ -2499,6 +2541,13 @@ impl Processor {
                 self.state.blocked_reason = Some(reason.clone());
                 Ok(vec![Effect::WaitForOperator { reason }])
             }
+            LeafOutcome::CompletedWithWontFix { .. } => {
+                let reason =
+                    "inbox curator reported unsupported fix-cycle won't-fix metadata".to_string();
+                self.state.phase = Phase::Blocked;
+                self.state.blocked_reason = Some(reason.clone());
+                Ok(vec![Effect::WaitForOperator { reason }])
+            }
         }
     }
 
@@ -2679,6 +2728,37 @@ impl Processor {
             }
             LeafOutcome::RiskElevated { author, risk } => {
                 if let Err(reason) = raise_task_risk(task, risk) {
+                    task.phase = TaskPhase::Escalated;
+                    task.reason = Some(reason.clone());
+                    return Ok(vec![Effect::EscalateTask {
+                        task_id: task_id.into(),
+                        reason,
+                    }]);
+                }
+                if author.is_some() {
+                    task.implementation_author = author;
+                }
+                task.phase = TaskPhase::Committing;
+                Ok(vec![Effect::CommitTask {
+                    task_id: task_id.into(),
+                }])
+            }
+            LeafOutcome::CompletedWithWontFix { author, wont_fixed } => {
+                if kind != LeafKind::Fix {
+                    return Err(ProcessorError::InvalidCommand(format!(
+                        "task {task_id} reported fix-cycle won't-fix metadata outside a fix leaf"
+                    )));
+                }
+                // Consumed (and cleared) here so it never survives stale into a later,
+                // unrelated round; `None` (no durable coordinate — a checkpoint predating
+                // T-014, or a defensive gap) means the empty-fixed-set signal simply cannot be
+                // judged this round, so it is skipped and the ordinary path (below,
+                // `stagnation_decision` on the NEXT review pass) remains the sole backstop.
+                let open_findings = task.pending_fix_open_findings.take();
+                if let Some(open_findings) = open_findings
+                    && let Some(reason) =
+                        empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
+                {
                     task.phase = TaskPhase::Escalated;
                     task.reason = Some(reason.clone());
                     return Ok(vec![Effect::EscalateTask {
@@ -2938,7 +3018,10 @@ impl Processor {
                 task.review_sha = Some(review_sha);
                 Ok(Vec::new())
             }
-            ReviewOutcome::Findings { signature } => {
+            ReviewOutcome::Findings {
+                signature,
+                open_findings,
+            } => {
                 validate_signature(&signature)?;
                 task.review_cycles = task.review_cycles.saturating_add(1);
                 task.review_signatures.push(signature);
@@ -2960,6 +3043,10 @@ impl Processor {
                         reason,
                     }]);
                 }
+                // Durable coordinate for T-014's empty-fixed-set early exit: correlated against
+                // the fixer's own `не исправлено` count the moment this fix round returns (see
+                // `task_leaf`'s `LeafOutcome::CompletedWithWontFix` arm).
+                task.pending_fix_open_findings = Some(open_findings);
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -2967,7 +3054,11 @@ impl Processor {
                     kind: LeafKind::Fix,
                 }])
             }
-            ReviewOutcome::FindingsRiskElevated { signature, risk } => {
+            ReviewOutcome::FindingsRiskElevated {
+                signature,
+                risk,
+                open_findings,
+            } => {
                 validate_signature(&signature)?;
                 if let Err(reason) = raise_task_risk(task, risk) {
                     task.phase = TaskPhase::Escalated;
@@ -2997,6 +3088,7 @@ impl Processor {
                         reason,
                     }]);
                 }
+                task.pending_fix_open_findings = Some(open_findings);
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -3205,6 +3297,10 @@ impl Processor {
                     risk.as_str()
                 ),
             }]),
+            LeafOutcome::CompletedWithWontFix { .. } => Ok(vec![Effect::AbortMergeResolution {
+                task_id: task_id.into(),
+                reason: "merger reported unsupported fix-cycle won't-fix metadata".into(),
+            }]),
         }
     }
 
@@ -3382,7 +3478,13 @@ impl Processor {
                     })?;
                 Ok(vec![Effect::VerifyIntegration { head }])
             }
-            ReviewOutcome::Findings { signature } => {
+            // `open_findings` (task T-014) is not (yet) consumed here — the empty-fixed-set
+            // early exit is scoped to the per-task loop (phases 2.5/2.8); this batch-level loop
+            // keeps `stagnation_decision` as its sole stall detector.
+            ReviewOutcome::Findings {
+                signature,
+                open_findings: _,
+            } => {
                 validate_signature(&signature)?;
                 self.state.integration.verification_head = None;
                 self.state.integration.f_cycles = self.state.integration.f_cycles.saturating_add(1);
@@ -3425,7 +3527,16 @@ impl Processor {
     fn integration_fix(&mut self, outcome: LeafOutcome) -> Result<Vec<Effect>, ProcessorError> {
         self.require_phase(Phase::Publishing, "integration fix")?;
         match outcome {
-            LeafOutcome::Completed { .. } => Ok(vec![Effect::CommitIntegrationFix]),
+            // An integration (`F-`) fixer runs the same Mode-2 contract as a per-task fixer (both
+            // are `agents/coder.md` "Режим 2") and may equally report `не исправлено` entries.
+            // Unlike the per-task loop (phases 2.5/2.8), this batch-level loop does not (yet)
+            // correlate them against an open-finding count — task T-014 scopes the early-exit
+            // signal to the per-task loop only — so a won't-fix report here is treated exactly
+            // like an ordinary completion; the batch's own review-signature `stagnation_decision`
+            // remains the sole stall detector for this loop.
+            LeafOutcome::Completed { .. } | LeafOutcome::CompletedWithWontFix { .. } => {
+                Ok(vec![Effect::CommitIntegrationFix])
+            }
             LeafOutcome::RetryableFailure { reason } | LeafOutcome::Escalated { reason } => {
                 self.fail_integration(format!("integration fix failed: {reason}"))
             }
@@ -3820,6 +3931,12 @@ impl Processor {
                 "CI fix reported unsupported task risk elevation {}",
                 risk.as_str()
             )),
+            // A CI fixer runs the Mode-3 point-fix contract (`агент.md` "Режим 3"), never
+            // Mode 2, so `не исправлено` metadata cannot legitimately originate here — held to
+            // the same "unsupported extension" treatment as an out-of-scope risk elevation above.
+            LeafOutcome::CompletedWithWontFix { .. } => self.hold_failed_published_ci(
+                "CI fix reported unsupported fix-cycle won't-fix metadata".into(),
+            ),
         };
         self.state.integration.ci_fix_provider_fallback = false;
         effects
@@ -3886,6 +4003,17 @@ impl Processor {
                     "knowledge curator reported unsupported task risk elevation {}",
                     risk.as_str()
                 ));
+                self.state
+                    .integration
+                    .pending_knowledge_curations
+                    .insert(batch_id, pending);
+                Ok(self.cleanup_effects())
+            }
+            LeafOutcome::CompletedWithWontFix { .. } => {
+                pending.degradations = pending.degradations.saturating_add(1);
+                self.state.integration.degradations.push(
+                    "knowledge curator reported unsupported fix-cycle won't-fix metadata".into(),
+                );
                 self.state
                     .integration
                     .pending_knowledge_curations
@@ -5846,6 +5974,7 @@ mod tests {
                 task_id: "T-1".into(),
                 outcome: ReviewOutcome::Findings {
                     signature: signature("R-01 missing error path"),
+                    open_findings: 1,
                 },
             })
             .unwrap();
@@ -6258,6 +6387,7 @@ mod tests {
             task_id: "T-1".into(),
             outcome: ReviewOutcome::Findings {
                 signature: sig.clone(),
+                open_findings: 1,
             },
         })
         .unwrap();
@@ -6274,11 +6404,180 @@ mod tests {
         let effects = p
             .apply(ProcessorCommand::TaskReview {
                 task_id: "T-1".into(),
-                outcome: ReviewOutcome::Findings { signature: sig },
+                outcome: ReviewOutcome::Findings {
+                    signature: sig,
+                    open_findings: 1,
+                },
             })
             .unwrap();
         assert!(matches!(effects.last(), Some(Effect::EscalateTask { .. })));
         assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Escalated);
+    }
+
+    // -- Empty-fixed-set early exit (T-014) -------------------------------------------------
+
+    #[test]
+    fn empty_fixed_set_escalates_after_a_single_fix_round_before_a_repeat_review() {
+        // The whole point of task T-014: escalate from ONE fix round's own report, never reaching
+        // a SECOND review pass — unlike `repeated_finding_escalates_before_spending_full_review_limit`
+        // above, which needs two `Findings` rounds (a full extra review call) before
+        // `stagnation_decision` fires. Different signatures each round (as the task description's
+        // "даже если по сигнатурам находки формально отличаются" scenario) still catch it, because
+        // this signal never looks at the signature at all.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-1".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("R-05 wording A"),
+                open_findings: 2,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            p.state().tasks["T-1"].pending_fix_open_findings,
+            Some(2),
+            "the round's open-finding count is durably recorded for the fix leaf to correlate"
+        );
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::CompletedWithWontFix {
+                    author: Some("coder".into()),
+                    wont_fixed: 2,
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(effects.last(), Some(Effect::EscalateTask { .. })),
+            "an all-won't-fix round escalates immediately: {effects:?}"
+        );
+        assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Escalated);
+        assert!(
+            p.state().tasks["T-1"]
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("пустой fixed-набор:"),
+            "escalation reason is the empty-fixed-set literal, not stagnation's: {:?}",
+            p.state().tasks["T-1"].reason
+        );
+        assert_eq!(
+            p.state().tasks["T-1"].pending_fix_open_findings,
+            None,
+            "the coordinate is consumed (cleared) once judged"
+        );
+    }
+
+    #[test]
+    fn empty_fixed_set_does_not_fire_on_a_partial_fix() {
+        // Real progress (some findings genuinely fixed, wont_fixed < open_findings) is left
+        // entirely to the ordinary path — never a spurious early escalation.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-1".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("R-05, R-06, R-07"),
+                open_findings: 3,
+            },
+        })
+        .unwrap();
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::CompletedWithWontFix {
+                    author: Some("coder".into()),
+                    wont_fixed: 1,
+                },
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
+        assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Committing);
+    }
+
+    #[test]
+    fn empty_fixed_set_absent_field_does_not_regress_the_ordinary_completion_path() {
+        // A fixer that has never heard of `не исправлено` (task T-014 is purely additive) reports
+        // an ordinary `Completed`, not `CompletedWithWontFix` — the fix round proceeds exactly as
+        // it always has, with no new escalation path engaged at all.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-1".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("R-05 out of scope"),
+                open_findings: 1,
+            },
+        })
+        .unwrap();
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::Completed {
+                    author: Some("coder".into()),
+                },
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
+        assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Committing);
     }
 
     #[test]
@@ -7070,6 +7369,7 @@ mod tests {
                 leaf_attempts: BTreeMap::new(),
                 review_cycles: 0,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: None,
@@ -7093,6 +7393,7 @@ mod tests {
             .apply(ProcessorCommand::IntegrationReview {
                 outcome: ReviewOutcome::Findings {
                     signature: signature("F-01 missing integration guard"),
+                    open_findings: 1,
                 },
             })
             .unwrap();
@@ -8066,6 +8367,7 @@ mod tests {
             .apply(ProcessorCommand::IntegrationReview {
                 outcome: ReviewOutcome::Findings {
                     signature: signature("F-01 irreparable"),
+                    open_findings: 1,
                 },
             })
             .unwrap();

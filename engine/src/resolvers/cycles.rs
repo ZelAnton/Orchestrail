@@ -304,6 +304,74 @@ pub fn stagnation_decision(signatures: &[AttemptSignature], limit: u32) -> Stagn
     }
 }
 
+// ============================================================================
+// Empty-fixed-set detector — the cheap, EARLY-EXIT sibling of the stagnation detector (T-014).
+// ============================================================================
+
+/// The empty-fixed-set decision (task T-014, `agents/processor.md` phases 2.5/2.8). Where
+/// [`stagnation_decision`] needs the SAME finding to repeat across `STAGNATION_LIMIT` consecutive
+/// REVIEW passes before it fires — and can be defeated by a reviewer that rewords the same finding
+/// enough each round to change its [`AttemptSignature`] — this decision is evaluated once, right
+/// after a SINGLE fix round, from the fixer's OWN report: task T-014's additive `не исправлено`
+/// outcome field ([`crate::contract::Outcome::wont_fix`]) lets a Mode-2 fixer declare exactly which
+/// of the round's open findings it declined to fix. When that declared count accounts for every
+/// finding the round was dispatched to address, the round's fixed set was PROVABLY empty — no
+/// need to spend another full review pass to rediscover the same stall via repetition. It is
+/// additive and independent: it never replaces [`stagnation_decision`], which still runs
+/// unconditionally on the review-signature history exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyFixedSetDecision {
+    /// Either the fixer reported no won't-fix entries this round, or it accounted for fewer than
+    /// all of the round's open findings — real progress (or at least not PROVABLY zero progress).
+    Progressing,
+    /// The fixer's won't-fix count accounts for every finding this round was dispatched to
+    /// address: the fixed set was empty. `wont_fixed` may exceed `open_findings` (a fixer that
+    /// over-reports, e.g. duplicate entries) — that is still proof of zero progress, not a reason
+    /// to keep going.
+    Empty { wont_fixed: u32, open_findings: u32 },
+}
+
+impl EmptyFixedSetDecision {
+    /// The canonical early-escalation reason literal, or `None` while progressing. Distinct by
+    /// construction from both [`CycleDecision::escalation_reason`] and
+    /// [`StagnationDecision::escalation_reason`], so all three escalation causes stay observably
+    /// separate in the descriptor, journal and outbox.
+    pub fn escalation_reason(&self) -> Option<String> {
+        match self {
+            EmptyFixedSetDecision::Empty {
+                wont_fixed,
+                open_findings,
+            } => Some(format!(
+                "пустой fixed-набор: фиксер не исправил ни одной находки в раунде (не исправлено: {wont_fixed} из {open_findings})"
+            )),
+            EmptyFixedSetDecision::Progressing => None,
+        }
+    }
+
+    /// Whether this decision is an empty-fixed-set escalation (a convenience for the caller's
+    /// early-exit branch, symmetric with [`StagnationDecision::is_stagnated`]).
+    pub fn is_empty(&self) -> bool {
+        matches!(self, EmptyFixedSetDecision::Empty { .. })
+    }
+}
+
+/// Decide whether a single fix round left an EMPTY fixed set. `wont_fixed` is the count of
+/// distinct findings the fixer's `не исправлено` field named this round; `open_findings` is the
+/// count of findings (`ReviewOutcome::Findings`'s own count) the round was dispatched to address.
+/// `open_findings == 0` never escalates (there was nothing to fix in the first place, a
+/// structurally impossible but defensively-handled case) — nor does `wont_fixed == 0` (no
+/// won't-fix field reported at all, the ordinary/legacy case this stays additive over).
+pub fn empty_fixed_set_decision(wont_fixed: u32, open_findings: u32) -> EmptyFixedSetDecision {
+    if open_findings > 0 && wont_fixed >= open_findings {
+        EmptyFixedSetDecision::Empty {
+            wont_fixed,
+            open_findings,
+        }
+    } else {
+        EmptyFixedSetDecision::Progressing
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +616,87 @@ mod tests {
             stagnation_decision(&[sig("a")], 1),
             StagnationDecision::Stagnated { repeats: 1 }
         );
+    }
+
+    // -- Empty-fixed-set detector (T-014) -------------------------------------------------
+
+    #[test]
+    fn empty_fixed_set_fires_on_a_single_round_no_repeat_needed() {
+        // The whole point: it fires from ONE round's own report, unlike stagnation which needs
+        // STAGNATION_LIMIT consecutive repeats across separate review passes.
+        assert_eq!(
+            empty_fixed_set_decision(3, 3),
+            EmptyFixedSetDecision::Empty {
+                wont_fixed: 3,
+                open_findings: 3,
+            }
+        );
+        assert!(empty_fixed_set_decision(3, 3).is_empty());
+    }
+
+    #[test]
+    fn empty_fixed_set_over_reporting_still_proves_zero_progress() {
+        // A fixer that names MORE findings than were open (duplicate/stale ids) still accounts
+        // for the whole open set — still proof of zero progress, not a reason to keep going.
+        assert_eq!(
+            empty_fixed_set_decision(5, 3),
+            EmptyFixedSetDecision::Empty {
+                wont_fixed: 5,
+                open_findings: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_fixed_set_partial_wont_fix_is_progress() {
+        // Some findings were genuinely fixed (wont_fixed < open_findings): real progress, left
+        // entirely to the ordinary review/stagnation path.
+        assert_eq!(
+            empty_fixed_set_decision(1, 3),
+            EmptyFixedSetDecision::Progressing
+        );
+        assert!(!empty_fixed_set_decision(1, 3).is_empty());
+    }
+
+    #[test]
+    fn empty_fixed_set_no_wont_fix_field_is_progress() {
+        // The ordinary/legacy case this stays additive over: no `не исправлено` field at all.
+        assert_eq!(
+            empty_fixed_set_decision(0, 3),
+            EmptyFixedSetDecision::Progressing
+        );
+    }
+
+    #[test]
+    fn empty_fixed_set_zero_open_findings_never_escalates() {
+        // Structurally impossible (a fix round is only dispatched when there ARE open findings)
+        // but defensively never escalates on a round with nothing to fix.
+        assert_eq!(
+            empty_fixed_set_decision(0, 0),
+            EmptyFixedSetDecision::Progressing
+        );
+        assert_eq!(
+            empty_fixed_set_decision(4, 0),
+            EmptyFixedSetDecision::Progressing
+        );
+    }
+
+    #[test]
+    fn empty_fixed_set_reason_is_distinct_from_other_escalations() {
+        let empty = EmptyFixedSetDecision::Empty {
+            wont_fixed: 2,
+            open_findings: 2,
+        };
+        let reason = empty.escalation_reason().expect("empty set has a reason");
+        assert!(reason.starts_with("пустой fixed-набор:"));
+        assert_ne!(
+            Some(reason.clone()),
+            review_cycle_decision(9, 8).escalation_reason()
+        );
+        assert_ne!(
+            Some(reason),
+            StagnationDecision::Stagnated { repeats: 2 }.escalation_reason()
+        );
+        assert_eq!(EmptyFixedSetDecision::Progressing.escalation_reason(), None);
     }
 }

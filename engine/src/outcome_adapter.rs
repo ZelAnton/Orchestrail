@@ -23,12 +23,31 @@ pub fn task_leaf_outcome(verdict: &Verdict, report: &str, author: &str) -> LeafO
             reason: supervisor_reason(verdict),
         },
         Reason::Ok => match strict_outcome(report) {
-            Some(outcome) if outcome.verdict == "готово" && valid_mode(outcome.field("режим")) => {
+            Some(outcome) if outcome.verdict == "готово" && valid_mode(outcome.field("режим")) =>
+            {
                 match reported_risk(&outcome) {
                     Ok(Some(risk)) => LeafOutcome::RiskElevated {
                         author: Some(author.to_string()),
                         risk,
                     },
+                    // A fix round (`режим=2`, `agents/coder.md` "Режим 2") may additionally
+                    // declare `не исправлено` entries (task T-014). Risk elevation above takes
+                    // priority and is left untouched: a round that ALSO strictly raised the
+                    // task's blast-radius classification keeps the ordinary human-visible risk
+                    // path rather than the robotic empty-fixed-set escalation.
+                    Ok(None) if outcome.field("режим") == Some("2") => {
+                        let wont_fix = outcome.wont_fix();
+                        if wont_fix.is_empty() {
+                            LeafOutcome::Completed {
+                                author: Some(author.to_string()),
+                            }
+                        } else {
+                            LeafOutcome::CompletedWithWontFix {
+                                author: Some(author.to_string()),
+                                wont_fixed: u32::try_from(wont_fix.len()).unwrap_or(u32::MAX),
+                            }
+                        }
+                    }
                     Ok(None) => LeafOutcome::Completed {
                         author: Some(author.to_string()),
                     },
@@ -110,10 +129,18 @@ pub fn task_review_outcome(
             },
         },
         "открытые находки" if !open.is_empty() => {
+            let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
             let signature = finding_signature(open.into_iter());
             match risk {
-                Some(risk) => ReviewOutcome::FindingsRiskElevated { signature, risk },
-                None => ReviewOutcome::Findings { signature },
+                Some(risk) => ReviewOutcome::FindingsRiskElevated {
+                    signature,
+                    risk,
+                    open_findings,
+                },
+                None => ReviewOutcome::Findings {
+                    signature,
+                    open_findings,
+                },
             }
         }
         "эскалация codex" => ReviewOutcome::Escalated {
@@ -128,10 +155,18 @@ pub fn task_review_outcome(
         // round into a terminal one. A missing fresh `SUMMARY-R` remains a protocol error below:
         // there the reviewer claims a clean gate it never proved during this invocation.
         "готово к слиянию" if !open.is_empty() => {
+            let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
             let signature = finding_signature(open.into_iter());
             match risk {
-                Some(risk) => ReviewOutcome::FindingsRiskElevated { signature, risk },
-                None => ReviewOutcome::Findings { signature },
+                Some(risk) => ReviewOutcome::FindingsRiskElevated {
+                    signature,
+                    risk,
+                    open_findings,
+                },
+                None => ReviewOutcome::Findings {
+                    signature,
+                    open_findings,
+                },
             }
         }
         "готово к слиянию" => review_protocol_error(
@@ -198,6 +233,7 @@ pub fn integration_review_outcome(
             }
         }
         "открытые находки" if !open.is_empty() => ReviewOutcome::Findings {
+            open_findings: u32::try_from(open.len()).unwrap_or(u32::MAX),
             signature: finding_signature(open.into_iter()),
         },
         "готово к публикации" => review_protocol_error(
@@ -381,6 +417,55 @@ mod tests {
     }
 
     #[test]
+    fn fix_round_wont_fix_field_yields_completed_with_wont_fix() {
+        // A режим=2 fix round that additionally reports `не исправлено` entries (task T-014)
+        // decodes to the distinct `CompletedWithWontFix` variant, carrying the count.
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: review.md\nИТОГ: готово \u{00B7} режим=2 \u{00B7} \
+не исправлено=R-05=вне скоупа \u{00B7} не исправлено=R-07=false positive\n",
+                "coder",
+            ),
+            LeafOutcome::CompletedWithWontFix {
+                author: Some("coder".into()),
+                wont_fixed: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn fix_round_without_wont_fix_field_stays_ordinary_completed() {
+        // Additive and OPTIONAL: an ordinary режим=2 round without the field is unaffected.
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: x\nИТОГ: готово \u{00B7} режим=2\n",
+                "coder",
+            ),
+            LeafOutcome::Completed {
+                author: Some("coder".into())
+            }
+        );
+    }
+
+    #[test]
+    fn implement_round_wont_fix_field_is_ignored_at_mode_1() {
+        // The won't-fix decode is gated on режим=2 (a fix round); a Mode-1 report with the same
+        // field text (implausible in practice, but not relied upon) stays ordinary Completed.
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: x\nИТОГ: готово \u{00B7} режим=1 \u{00B7} не исправлено=R-05=x\n",
+                "coder",
+            ),
+            LeafOutcome::Completed {
+                author: Some("coder".into())
+            }
+        );
+    }
+
+    #[test]
     fn supervisor_reason_redacts_processkit_diagnostics_from_durable_outcomes() {
         let verdict = Verdict {
             reason: Reason::Crash,
@@ -498,7 +583,11 @@ mod tests {
             REVIEW_UNTIL,
             "review-head",
         );
-        let ReviewOutcome::Findings { signature } = outcome else {
+        let ReviewOutcome::Findings {
+            signature,
+            open_findings,
+        } = outcome
+        else {
             panic!("a ready claim over an open finding must reduce to Findings: {outcome:?}");
         };
         let declared_open = task_review_outcome(
@@ -510,7 +599,10 @@ mod tests {
         );
         assert_eq!(
             declared_open,
-            ReviewOutcome::Findings { signature },
+            ReviewOutcome::Findings {
+                signature,
+                open_findings
+            },
             "the same open findings sign the round the same way whichever tail the reviewer wrote"
         );
 

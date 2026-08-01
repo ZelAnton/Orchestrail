@@ -982,9 +982,9 @@ fn integration_attempt(state: &ProcessorState, kind: LeafKind) -> u64 {
 
 fn leaf_operation_outcome(outcome: &LeafOutcome) -> OperationOutcome {
     match outcome {
-        LeafOutcome::Completed { .. } | LeafOutcome::RiskElevated { .. } => {
-            OperationOutcome::Success
-        }
+        LeafOutcome::Completed { .. }
+        | LeafOutcome::RiskElevated { .. }
+        | LeafOutcome::CompletedWithWontFix { .. } => OperationOutcome::Success,
         LeafOutcome::RetryableFailure { reason } | LeafOutcome::Escalated { reason } => {
             classified_model_failure(reason)
         }
@@ -1303,6 +1303,7 @@ mod tests {
                     leaf_attempts: BTreeMap::new(),
                     review_cycles: 1,
                     review_signatures: Vec::new(),
+                    pending_fix_open_findings: None,
                     implementation_author: Some("coder".into()),
                     previous_review_sha: None,
                     review_sha: Some("reviewed".into()),
@@ -1335,6 +1336,7 @@ mod tests {
                 leaf_attempts: BTreeMap::new(),
                 review_cycles: 1,
                 review_signatures: Vec::new(),
+                pending_fix_open_findings: None,
                 implementation_author: Some("coder".into()),
                 previous_review_sha: None,
                 review_sha: Some("reviewed".into()),

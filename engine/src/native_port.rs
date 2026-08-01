@@ -1908,6 +1908,15 @@ impl<E: ExternalPort> FileVcsPort<E> {
             | ReviewOutcome::FindingsRiskElevated { risk, .. } => Some(*risk),
             ReviewOutcome::Escalated { .. } | ReviewOutcome::Incomplete => return Ok(outcome),
         };
+        // The re-imposed engine finding is ALWAYS in the rebuilt round; a reviewer that already
+        // reported its own open findings (task T-014's `open_findings`) has that count preserved,
+        // otherwise (the reviewer thought the round clean) the engine's own re-imposed finding is
+        // the round's only open finding.
+        let open_findings = match &outcome {
+            ReviewOutcome::Findings { open_findings, .. }
+            | ReviewOutcome::FindingsRiskElevated { open_findings, .. } => *open_findings,
+            _ => 1,
+        };
         if restore_finding {
             self.mix_review_cycle_finding(task_id, &failure.body)?;
         }
@@ -1915,8 +1924,15 @@ impl<E: ExternalPort> FileVcsPort<E> {
         // whether this path restored it.
         let signature = self.review_cycle_round_signature(task_id, &failure.signature)?;
         Ok(match risk {
-            Some(risk) => ReviewOutcome::FindingsRiskElevated { signature, risk },
-            None => ReviewOutcome::Findings { signature },
+            Some(risk) => ReviewOutcome::FindingsRiskElevated {
+                signature,
+                risk,
+                open_findings,
+            },
+            None => ReviewOutcome::Findings {
+                signature,
+                open_findings,
+            },
         })
     }
 
@@ -4299,6 +4315,7 @@ mod tests {
             leaf_attempts: BTreeMap::new(),
             review_cycles: 0,
             review_signatures: Vec::new(),
+            pending_fix_open_findings: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: review_sha.map(str::to_owned),
@@ -6088,6 +6105,7 @@ mod tests {
                     leaf_attempts: BTreeMap::from([(LeafKind::Review.as_str().into(), 7)]),
                     review_cycles: 0,
                     review_signatures: Vec::new(),
+                    pending_fix_open_findings: None,
                     implementation_author: Some("coder".into()),
                     previous_review_sha: None,
                     review_sha: Some(head.clone()),
@@ -6281,6 +6299,7 @@ mod tests {
                     leaf_attempts: BTreeMap::from([(LeafKind::Review.as_str().into(), 1)]),
                     review_cycles: 1,
                     review_signatures: Vec::new(),
+                    pending_fix_open_findings: None,
                     implementation_author: Some("coder".into()),
                     previous_review_sha: None,
                     review_sha: Some(head),
@@ -6507,7 +6526,7 @@ mod tests {
 
         // The engine proved this tip does not build. A reviewer report — however clean, and whether
         // or not it kept the engine's finding — cannot be the authority that closes the round.
-        let ReviewOutcome::Findings { signature } = outcome else {
+        let ReviewOutcome::Findings { signature, .. } = outcome else {
             panic!("a proved cycle failure must hold the round open: {outcome:?}");
         };
         assert_eq!(
@@ -6648,7 +6667,7 @@ mod tests {
                 state.tasks.get_mut("T-1").unwrap().review_sha = Some(head);
             }
             let outcome = dispatch_review_returning_outcome(&mut port, &fixture.work, &state, None);
-            let ReviewOutcome::Findings { signature } = outcome else {
+            let ReviewOutcome::Findings { signature, .. } = outcome else {
                 panic!("round {round} must stay open: {outcome:?}");
             };
             signatures.push(crate::resolvers::AttemptSignature::of(&signature));

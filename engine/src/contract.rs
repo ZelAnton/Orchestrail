@@ -392,10 +392,49 @@ impl Outcome {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
+
+    /// Every `не исправлено=<finding-id>=<причина>` field, in report order (task T-014). The
+    /// grammar reuses the ordinary `key=value` field shape from [`parse_outcome`] unchanged: the
+    /// key is the fixed literal `не исправлено`, repeated once per declined finding, and the
+    /// VALUE itself carries one more `<finding-id>=<причина>` pair split on its FIRST `=` (so a
+    /// reason that happens to contain `=` is not truncated). A field whose value has no inner `=`
+    /// (missing причина) is skipped rather than guessed — malformed input degrades to "not
+    /// reported", never a fabricated entry. Absent entirely, this returns an empty list: the field
+    /// is purely additive, so a report from an executor that predates it parses exactly as before.
+    pub fn wont_fix(&self) -> Vec<WontFixEntry> {
+        self.fields
+            .iter()
+            .filter(|(k, _)| k == WONT_FIX_KEY)
+            .filter_map(|(_, v)| {
+                v.split_once('=').map(|(id, reason)| WontFixEntry {
+                    finding_id: id.trim().to_string(),
+                    reason: reason.trim().to_string(),
+                })
+            })
+            .collect()
+    }
 }
 
 /// The ` · ` separator shared by the terminal outcome line and the queue-status line.
 const OUTCOME_SEP: &str = " \u{00B7} ";
+
+/// The `ИТОГ:` field key a Mode-2 fixer uses to declare one finding it deliberately did NOT fix
+/// this round (task T-014, additive — see [`Outcome::wont_fix`]).
+const WONT_FIX_KEY: &str = "не исправлено";
+
+/// One review/integration finding (`R-NN`/`F-NN`) a fixer explicitly reported as NOT fixed this
+/// round, and why. Decoded from a repeated `не исправлено=<finding-id>=<причина>` field on the
+/// fixer's terminal `ИТОГ:` line (task T-014) — the machine-readable twin of the free-text
+/// `Причина отклонения:` a coder already writes into `review.md` for the same finding
+/// (`agents/coder.md` Mode-2 contract, upstream). Additive and OPTIONAL: an executor that has
+/// never heard of this field simply emits none, and [`Outcome::wont_fix`] returns an empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WontFixEntry {
+    /// The `R-NN`/`F-NN` id of the finding the fixer declined to fix.
+    pub finding_id: String,
+    /// The fixer's stated reason (out of scope, environmental, false positive, ...).
+    pub reason: String,
+}
 
 /// Parse the terminal `ИТОГ: ...` line out of a leaf-agent report. The contract puts it LAST,
 /// so the LAST matching line wins — a quoted example higher up (docs, a cited prior report)
@@ -777,6 +816,56 @@ mod tests {
         let o = parse_outcome(report).unwrap();
         assert_eq!(o.verdict, "готово");
         assert_eq!(o.field("причина"), None);
+    }
+
+    #[test]
+    fn wont_fix_field_parses_repeated_entries_in_order() {
+        // Happy path: two declined findings, in report order, alongside ordinary fields.
+        let report = "\
+Реализовал часть, остальное вне скоупа.\n\
+ИТОГ: готово \u{00B7} режим=2 \u{00B7} не исправлено=R-05=вне скоупа \u{00B7} \
+не исправлено=R-07=false positive\n";
+        let o = parse_outcome(report).unwrap();
+        let wont_fix = o.wont_fix();
+        assert_eq!(wont_fix.len(), 2);
+        assert_eq!(wont_fix[0].finding_id, "R-05");
+        assert_eq!(wont_fix[0].reason, "вне скоупа");
+        assert_eq!(wont_fix[1].finding_id, "R-07");
+        assert_eq!(wont_fix[1].reason, "false positive");
+    }
+
+    #[test]
+    fn wont_fix_field_absent_is_empty_not_an_error() {
+        // Additive and OPTIONAL: an executor that has never heard of the field simply omits it,
+        // and existing key=value parsing is unaffected.
+        let report = "ИТОГ: готово \u{00B7} режим=2\n";
+        let o = parse_outcome(report).unwrap();
+        assert!(o.wont_fix().is_empty());
+        assert_eq!(o.field("режим"), Some("2"));
+    }
+
+    #[test]
+    fn wont_fix_field_reason_may_itself_contain_equals() {
+        // The value splits on its FIRST `=`, so a reason that happens to contain `=` is preserved
+        // whole rather than truncated.
+        let report = "ИТОГ: готово \u{00B7} режим=2 \u{00B7} не исправлено=R-03=x=y since a=b\n";
+        let o = parse_outcome(report).unwrap();
+        let wont_fix = o.wont_fix();
+        assert_eq!(wont_fix.len(), 1);
+        assert_eq!(wont_fix[0].finding_id, "R-03");
+        assert_eq!(wont_fix[0].reason, "x=y since a=b");
+    }
+
+    #[test]
+    fn wont_fix_field_malformed_entry_is_skipped_not_guessed() {
+        // A `не исправлено` value with no inner `=` (missing причина) degrades to "not reported"
+        // rather than being fabricated into a finding with an empty reason.
+        let report = "ИТОГ: готово \u{00B7} режим=2 \u{00B7} не исправлено=R-05 \u{00B7} \
+не исправлено=R-07=вне скоупа\n";
+        let o = parse_outcome(report).unwrap();
+        let wont_fix = o.wont_fix();
+        assert_eq!(wont_fix.len(), 1);
+        assert_eq!(wont_fix[0].finding_id, "R-07");
     }
 
     #[test]

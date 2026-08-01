@@ -53,8 +53,8 @@ pub use coder::{
     network_need, route_coder,
 };
 pub use cycles::{
-    AttemptSignature, CycleDecision, StagnationDecision, normalize_signature_text,
-    review_cycle_decision, stagnation_decision,
+    AttemptSignature, CycleDecision, EmptyFixedSetDecision, StagnationDecision,
+    empty_fixed_set_decision, normalize_signature_text, review_cycle_decision, stagnation_decision,
 };
 pub use gate::{ReviewGate, integration_gate, review_gate};
 pub use reviewer::{
