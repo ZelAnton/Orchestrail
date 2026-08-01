@@ -13,12 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use vcs_gitea::Gitea;
 use vcs_github::{GitHub, GitHubApi};
+use vcs_gitlab::{GitLab, GitLabApi};
 
 use crate::claude::{self, ClaudeCall, PermissionPosture};
 use crate::codex::{self, CodexCall, Sandbox};
@@ -29,6 +31,9 @@ use crate::events::outbox::lock_outbox;
 use crate::events::{
     Actor, ActorKind, Event, EventType, OUTBOX_FILE, Outbox, SCHEMA_VERSION, TailReader,
     deterministic_event_id, parse_line,
+};
+use crate::forge_ci::{
+    self, CiPoll, Forge, GitLabCommitStatus, GiteaCombinedStatus, is_full_commit_id,
 };
 use crate::native::Reconciliation;
 use crate::native::{TaskEffect, TaskEffectResult};
@@ -140,9 +145,13 @@ pub struct HeadlessConfig {
     /// Maximum number of entries in each curated knowledge area.
     pub knowledge_cap_per_area: usize,
     /// `CI_WATCH=off` means no remote watcher is required; the reducer still records an explicit
-    /// passed verification result. With it enabled, GitHub repositories use the typed
-    /// commit-checks endpoint; unsupported forges remain fail-closed.
+    /// passed verification result. With it enabled, the [`forge`](Self::forge) client polls that
+    /// forge's commit-bound checks endpoint for the exact published commit.
     pub ci_watch: bool,
+    /// Which typed forge client the enabled watcher polls. Configuration already rejected any
+    /// forge outside this set, so the dispatch below is total and no unsupported forge can
+    /// reach a publication gate that would then have nothing to observe.
+    pub forge: Forge,
     /// Bound the whole publication CI observation, including pending workflow backoff.
     pub ci_deadline: Duration,
     /// Delay between typed commit-check snapshots while GitHub reports pending work.
@@ -185,6 +194,7 @@ impl HeadlessConfig {
             knowledge_ttl_batches: 8,
             knowledge_cap_per_area: 12,
             ci_watch: true,
+            forge: Forge::default(),
             ci_deadline: Duration::from_secs(1_800),
             ci_backoff: Duration::from_secs(30),
             verification_mode: VerificationMode::Disabled,
@@ -535,13 +545,6 @@ struct GitHubCheckRun {
     status: String,
     #[serde(default)]
     conclusion: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GitHubCiPoll {
-    Passing,
-    Pending { reason: String },
-    Failing { signature: String, reason: String },
 }
 
 /// The production model/leaf side of [`crate::native_port::FileVcsPort`]. Commit evidence is
@@ -2278,6 +2281,45 @@ impl HeadlessExternalPort {
         Ok(CommitEvidence { paths })
     }
 
+    /// Run one bounded forge request on its own current-thread runtime.
+    ///
+    /// The engine boundary is synchronous while every typed forge client is async, and the
+    /// request is additionally clipped to the CI backoff (never under 30s) so a hung endpoint
+    /// cannot consume the whole publication deadline in a single poll.
+    fn forge_request<F>(
+        &self,
+        forge: Forge,
+        head: &str,
+        request: F,
+    ) -> Result<String, HeadlessError>
+    where
+        F: Future<Output = Result<String, processkit::Error>>,
+    {
+        let name = forge.display_name();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                HeadlessError::Protocol(format!("create {name} CI runtime: {error}"))
+            })?;
+        let request_timeout = self.config.ci_backoff.max(Duration::from_secs(30));
+        runtime
+            .block_on(async { tokio::time::timeout(request_timeout, request).await })
+            .map_err(|_| {
+                HeadlessError::Protocol(format!(
+                    "typed {name} CI request for {head} exceeded {}s",
+                    request_timeout.as_secs()
+                ))
+            })
+            .and_then(|result| {
+                result.map_err(|error| {
+                    HeadlessError::Protocol(format!(
+                        "typed {name} CI request for {head} failed: {error}"
+                    ))
+                })
+            })
+    }
+
     /// Fetch the exact published commit's checks through the typed `vcs-github` client.  The
     /// ordinary `gh run list --branch` surface is deliberately not used: it cannot prove that a
     /// workflow belongs to `head` rather than another push on the same branch.
@@ -2285,39 +2327,19 @@ impl HeadlessExternalPort {
         &self,
         head: &str,
         required_checks: &[String],
-    ) -> Result<GitHubCiPoll, HeadlessError> {
-        if !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    ) -> Result<CiPoll, HeadlessError> {
+        if !is_full_commit_id(head) {
             return Err(HeadlessError::Protocol(format!(
                 "CI_WATCH requires a full Git-compatible commit id, got {head:?}"
             )));
         }
         let endpoint = format!("repos/{{owner}}/{{repo}}/commits/{head}/check-runs?per_page=100");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                HeadlessError::Protocol(format!("create GitHub CI runtime: {error}"))
-            })?;
         let github = GitHub::new();
-        let request_timeout = self.config.ci_backoff.max(Duration::from_secs(30));
-        let body = runtime
-            .block_on(async {
-                tokio::time::timeout(request_timeout, github.api(&self.config.root, &endpoint))
-                    .await
-            })
-            .map_err(|_| {
-                HeadlessError::Protocol(format!(
-                    "typed GitHub CI request for {head} exceeded {}s",
-                    request_timeout.as_secs()
-                ))
-            })
-            .and_then(|result| {
-                result.map_err(|error| {
-                    HeadlessError::Protocol(format!(
-                        "typed GitHub CI request for {head} failed: {error}"
-                    ))
-                })
-            })?;
+        let body = self.forge_request(
+            Forge::GitHub,
+            head,
+            github.api(&self.config.root, &endpoint),
+        )?;
         let response: GitHubChecksResponse = serde_json::from_str(&body).map_err(|error| {
             HeadlessError::Protocol(format!(
                 "typed GitHub CI response for {head} is not a check-runs document: {error}"
@@ -2331,78 +2353,112 @@ impl HeadlessExternalPort {
         ))
     }
 
-    fn watch_github_ci(
+    /// Fetch the exact published commit's statuses through the typed `vcs-gitlab` client.
+    ///
+    /// The request is the commit-bound `repository/commits/<sha>/statuses` collection — a
+    /// GitLab pipeline's jobs and any external statuses for that one commit — rather than
+    /// `pipelines?ref=<branch>`, which cannot prove a pipeline belongs to the published commit
+    /// instead of a later push on the same branch. `glab api` expands `:fullpath` from the
+    /// repository the request runs in, so the project is resolved from the bound repository's
+    /// own remote.
+    fn gitlab_ci_poll(
         &self,
         head: &str,
         required_checks: &[String],
-    ) -> Result<CiOutcome, HeadlessError> {
-        debug_assert!(!required_checks.is_empty());
-        let deadline = Instant::now() + self.config.ci_deadline;
-        loop {
-            let pending_reason = match self.github_ci_poll(head, required_checks) {
-                Ok(GitHubCiPoll::Passing) => return Ok(CiOutcome::Passed),
-                Ok(GitHubCiPoll::Failing { signature, reason }) => {
-                    return Ok(CiOutcome::Failed { signature, reason });
-                }
-                Ok(GitHubCiPoll::Pending { reason }) => reason,
-                Err(_) => "the typed GitHub checks endpoint is unavailable".into(),
-            };
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(CiOutcome::RequiredUnconfirmed {
-                    reason: format!(
-                        "required checks for published commit {head} were not confirmed before the deadline while {pending_reason}"
-                    ),
-                });
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            thread::sleep(
-                self.config
-                    .ci_backoff
-                    .min(remaining)
-                    .max(Duration::from_millis(1)),
-            );
+    ) -> Result<CiPoll, HeadlessError> {
+        if !is_full_commit_id(head) {
+            return Err(HeadlessError::Protocol(format!(
+                "CI_WATCH requires a full Git-compatible commit id, got {head:?}"
+            )));
+        }
+        let endpoint = forge_ci::gitlab_statuses_endpoint(head);
+        let gitlab = GitLab::new();
+        let body = self.forge_request(
+            Forge::GitLab,
+            head,
+            gitlab.api(&self.config.root, &endpoint),
+        )?;
+        let statuses: Vec<GitLabCommitStatus> = serde_json::from_str(&body).map_err(|error| {
+            HeadlessError::Protocol(format!(
+                "typed GitLab CI response for {head} is not a commit-status list: {error}"
+            ))
+        })?;
+        Ok(forge_ci::classify_gitlab_statuses(
+            head,
+            &statuses,
+            required_checks,
+        ))
+    }
+
+    /// Fetch the exact published commit's combined status through the typed `vcs-gitea` client.
+    ///
+    /// `vcs-gitea` models no `api` method (the `tea` CLI is narrower than `gh`/`glab`, and the
+    /// crate deliberately exposes only what it can type), so the request goes through the
+    /// crate's documented dir-bound raw argv escape hatch. `tea api` expands `{owner}`/`{repo}`
+    /// from the bound repository and prefixes `/api/v1` itself. A `tea` without the `api`
+    /// subcommand simply fails the request, which the watch loop treats as an outage and
+    /// therefore never as a confirmed CI.
+    fn gitea_ci_poll(
+        &self,
+        head: &str,
+        required_checks: &[String],
+    ) -> Result<CiPoll, HeadlessError> {
+        if !is_full_commit_id(head) {
+            return Err(HeadlessError::Protocol(format!(
+                "CI_WATCH requires a full Git-compatible commit id, got {head:?}"
+            )));
+        }
+        let endpoint = forge_ci::gitea_status_endpoint(head);
+        let gitea = Gitea::new();
+        let body = self.forge_request(
+            Forge::Gitea,
+            head,
+            gitea.run_args_in(&self.config.root, &["api", endpoint.as_str()]),
+        )?;
+        let combined: GiteaCombinedStatus = serde_json::from_str(&body).map_err(|error| {
+            HeadlessError::Protocol(format!(
+                "typed Gitea CI response for {head} is not a combined-status document: {error}"
+            ))
+        })?;
+        Ok(forge_ci::classify_gitea_statuses(
+            head,
+            &combined,
+            required_checks,
+        ))
+    }
+
+    /// One commit-bound snapshot from whichever forge this run is configured for. The match is
+    /// total over [`Forge`], so adding a forge cannot silently keep polling GitHub.
+    fn forge_ci_poll(
+        &self,
+        head: &str,
+        required_checks: &[String],
+    ) -> Result<CiPoll, HeadlessError> {
+        match self.config.forge {
+            Forge::GitHub => self.github_ci_poll(head, required_checks),
+            Forge::GitLab => self.gitlab_ci_poll(head, required_checks),
+            Forge::Gitea => self.gitea_ci_poll(head, required_checks),
         }
     }
 
-    fn watch_github_ci_best_effort(&self, head: &str) -> Result<CiOutcome, HeadlessError> {
-        let deadline = Instant::now() + self.config.ci_deadline;
-        loop {
-            match self.github_ci_poll(head, &[]) {
-                Ok(GitHubCiPoll::Passing) => return Ok(CiOutcome::Passed),
-                Ok(GitHubCiPoll::Failing { .. }) => {
-                    return Ok(CiOutcome::BestEffortDegraded {
-                        reason: format!(
-                            "best-effort checks for published commit {head} did not pass; manual confirmation is recommended"
-                        ),
-                    });
-                }
-                Err(_) => {
-                    return Ok(CiOutcome::BestEffortDegraded {
-                        reason: format!(
-                            "best-effort checks for published commit {head} are unavailable; manual confirmation is recommended"
-                        ),
-                    });
-                }
-                Ok(GitHubCiPoll::Pending { .. }) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(CiOutcome::BestEffortDegraded {
-                            reason: format!(
-                                "best-effort checks for published commit {head} were not confirmed before the deadline; manual confirmation is recommended"
-                            ),
-                        });
-                    }
-                    let remaining = deadline.saturating_duration_since(now);
-                    thread::sleep(
-                        self.config
-                            .ci_backoff
-                            .min(remaining)
-                            .max(Duration::from_millis(1)),
-                    );
-                }
-            }
-        }
+    fn watch_forge_ci(&self, head: &str, required_checks: &[String]) -> CiOutcome {
+        debug_assert!(!required_checks.is_empty());
+        forge_ci::watch_required(
+            self.config.forge,
+            head,
+            self.config.ci_deadline,
+            self.config.ci_backoff,
+            || self.forge_ci_poll(head, required_checks).map_err(|_| ()),
+        )
+    }
+
+    fn watch_forge_ci_best_effort(&self, head: &str) -> CiOutcome {
+        forge_ci::watch_best_effort(
+            head,
+            self.config.ci_deadline,
+            self.config.ci_backoff,
+            || self.forge_ci_poll(head, &[]).map_err(|_| ()),
+        )
     }
 
     fn planner_prompt(&self, free_slots: usize) -> String {
@@ -3776,9 +3832,13 @@ impl ExternalPort for HeadlessExternalPort {
         let config = self.config.clone();
         let frozen_state = state.clone();
         let handovers = thread::scope(|scope| {
+            // Each worker reads its request through the shared borrow rather than owning a
+            // clone: `thread::scope` already guarantees `effects` outlives every spawned
+            // worker, and the request is only ever read. The per-worker `config`/`state`
+            // clones below are the ones that must stay clones — each worker owns its own
+            // adapter, containment group, and evidence map.
             let workers = effects
                 .iter()
-                .cloned()
                 .map(|request| {
                     let config = config.clone();
                     let state = frozen_state.clone();
@@ -3979,10 +4039,14 @@ impl ExternalPort for HeadlessExternalPort {
         if !self.config.ci_watch {
             return Ok(CiOutcome::Disabled);
         }
+        // The strict/best-effort split stays here, above the forge dispatch, so every forge
+        // answers the same question: a non-empty required set is a contract that must be
+        // positively confirmed, and an empty one is an advisory observation that can degrade
+        // but never gates publication.
         if required_checks.is_empty() {
-            return self.watch_github_ci_best_effort(head);
+            return Ok(self.watch_forge_ci_best_effort(head));
         }
-        self.watch_github_ci(head, required_checks)
+        Ok(self.watch_forge_ci(head, required_checks))
     }
 
     fn prepare_ci_fix(
@@ -4318,9 +4382,9 @@ fn classify_github_checks(
     total_count: usize,
     checks: &[GitHubCheckRun],
     required_checks: &[String],
-) -> GitHubCiPoll {
+) -> CiPoll {
     if total_count > checks.len() {
-        return GitHubCiPoll::Pending {
+        return CiPoll::Pending {
             reason: format!(
                 "GitHub reported {total_count} checks but only {} were returned; refusing a partial-page pass",
                 checks.len()
@@ -4328,7 +4392,7 @@ fn classify_github_checks(
         };
     }
     if checks.is_empty() {
-        return GitHubCiPoll::Pending {
+        return CiPoll::Pending {
             reason: "GitHub has not reported any checks for the published commit".into(),
         };
     }
@@ -4342,7 +4406,7 @@ fn classify_github_checks(
                 .filter(|check| check.name.trim() == required)
                 .max_by_key(|check| check.id)
             else {
-                return GitHubCiPoll::Pending {
+                return CiPoll::Pending {
                     reason: format!(
                         "required GitHub check {required:?} has not reported for the published commit"
                     ),
@@ -4360,7 +4424,7 @@ fn classify_github_checks(
         };
         let status = check.status.trim().to_ascii_lowercase();
         if status != "completed" {
-            return GitHubCiPoll::Pending {
+            return CiPoll::Pending {
                 reason: format!("check {name:?} is {status:?}"),
             };
         }
@@ -4375,7 +4439,7 @@ fn classify_github_checks(
             "failure" | "cancelled" | "timed_out" | "action_required" | "startup_failure"
             | "stale" => {
                 let reason = format!("GitHub check {name:?} concluded {conclusion:?}");
-                return GitHubCiPoll::Failing {
+                return CiPoll::Failing {
                     signature: AttemptSignature::of_finding(
                         "github commit check failed",
                         &format!("{head}:{name}:{conclusion}"),
@@ -4386,13 +4450,13 @@ fn classify_github_checks(
                 };
             }
             _ => {
-                return GitHubCiPoll::Pending {
+                return CiPoll::Pending {
                     reason: format!("check {name:?} has unknown conclusion {conclusion:?}"),
                 };
             }
         }
     }
-    GitHubCiPoll::Passing
+    CiPoll::Passing
 }
 
 fn safe_relative_path(path: &Path) -> bool {
@@ -7152,7 +7216,7 @@ mod tests {
                 }],
                 &[],
             ),
-            GitHubCiPoll::Passing
+            CiPoll::Passing
         );
         assert!(matches!(
             classify_github_checks(
@@ -7166,9 +7230,9 @@ mod tests {
                 }],
                 &[],
             ),
-            GitHubCiPoll::Pending { .. }
+            CiPoll::Pending { .. }
         ));
-        let GitHubCiPoll::Failing { signature, reason } = classify_github_checks(
+        let CiPoll::Failing { signature, reason } = classify_github_checks(
             head,
             1,
             &[GitHubCheckRun {
@@ -7195,7 +7259,7 @@ mod tests {
                 }],
                 &[],
             ),
-            GitHubCiPoll::Pending { .. }
+            CiPoll::Pending { .. }
         ));
         assert!(matches!(
             classify_github_checks(
@@ -7209,7 +7273,7 @@ mod tests {
                 }],
                 &[],
             ),
-            GitHubCiPoll::Pending { .. }
+            CiPoll::Pending { .. }
         ));
     }
 
@@ -7243,11 +7307,11 @@ mod tests {
                 ],
                 &required,
             ),
-            GitHubCiPoll::Passing
+            CiPoll::Passing
         );
         assert!(matches!(
             classify_github_checks(head, 1, &[], &required),
-            GitHubCiPoll::Pending { .. }
+            CiPoll::Pending { .. }
         ));
     }
 }

@@ -1916,6 +1916,7 @@ fn cmd_processor(args: &[String]) {
         external_config.knowledge_ttl_batches = config.knowledge_ttl_batches;
         external_config.knowledge_cap_per_area = config.knowledge_cap_per_area;
         external_config.ci_watch = config.ci_watch;
+        external_config.forge = config.forge;
         external_config.ci_deadline = Duration::from_secs(config.publish_ci_deadline_secs);
         external_config.ci_backoff = Duration::from_secs(config.publish_ci_backoff_secs);
         external_config.verification_mode = verification_mode;
