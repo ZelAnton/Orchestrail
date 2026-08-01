@@ -14,8 +14,6 @@
 //! to run under weaker containment than the gate it previews, which is why the two share
 //! `run_command_sequence` rather than each owning a copy.
 
-use std::fs::{self, OpenOptions};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,6 +25,7 @@ use crate::config::VerificationMode;
 use crate::processor::VerificationOutcome;
 use crate::resolvers::AttemptSignature;
 use crate::supervise::{self, CancellationProbe, Reason, SpawnSpec};
+use crate::work_fs;
 
 const MISSING_PROFILE_REASON: &str =
     "verification profile is required but VERIFICATION_COMMANDS and SMOKE_CMD are absent";
@@ -197,88 +196,11 @@ pub fn read_evidence(path: &Path) -> Result<VerificationEvidence, String> {
     })
 }
 
-/// Read a verification record through a checked handle.  The evidence file is a mutable
-/// control-plane input, so a pre-read `symlink_metadata` check alone would leave a rename race
-/// that could redirect the parser to an arbitrary file. This mirrors inbox control-plane reads.
+/// Read a verification record through the shared checked-handle primitive. The evidence file is
+/// a mutable control-plane input, so [`work_fs::read_plain_text`] verifies metadata before open,
+/// on the opened handle, and after the bounded read.
 fn read_plain_evidence_text(path: &Path) -> Result<String, std::io::Error> {
-    let before = fs::symlink_metadata(path)?;
-    assert_plain_evidence_file(path, &before)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    let opened = file.metadata()?;
-    assert_plain_evidence_file(path, &opened)?;
-    if opened.len() > MAX_EVIDENCE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "verification evidence exceeds the {MAX_EVIDENCE_BYTES}-byte limit: {}",
-                path.display()
-            ),
-        ));
-    }
-    let mut text = String::new();
-    (&mut file)
-        .take(MAX_EVIDENCE_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_EVIDENCE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "verification evidence grew beyond the {MAX_EVIDENCE_BYTES}-byte limit: {}",
-                path.display()
-            ),
-        ));
-    }
-    let after = fs::symlink_metadata(path)?;
-    assert_plain_evidence_file(path, &after)?;
-    Ok(text)
-}
-
-fn assert_plain_evidence_file(path: &Path, metadata: &fs::Metadata) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    let redirected = {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    };
-    #[cfg(not(windows))]
-    let redirected = metadata.file_type().is_symlink();
-    if !metadata.is_file() || redirected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "verification evidence is not a plain file: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
+    work_fs::read_plain_text(path, MAX_EVIDENCE_BYTES)
 }
 
 /// Prove that an evidence record is authoritative for the exact reducer outcome and immutable
