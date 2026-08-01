@@ -1418,4 +1418,186 @@ mod tests {
         assert!(screen.contains("processor"), "missing role");
         assert!(screen.contains("жива"), "missing liveness label");
     }
+
+    /// A brand-new `AppState` (no applied events, no status.md, no batch) still renders a
+    /// coherent Overview screen rather than an empty or panicking one — every panel falls back to
+    /// its own explanatory placeholder text.
+    #[test]
+    fn renders_empty_cold_start_headlessly() {
+        let app = AppState::new();
+        assert_eq!(app.screen, Screen::Overview);
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+
+        assert!(
+            screen.contains("Батч: ждём первое событие cohort.opened…"),
+            "missing cold-start batch placeholder"
+        );
+        assert!(
+            screen.contains("нет активных задач"),
+            "missing empty active-tasks placeholder"
+        );
+        assert!(
+            screen.contains("пока ничего не завершено"),
+            "missing empty recent placeholder"
+        );
+    }
+
+    /// The `Modal::EnterRejectReason` step: after arming a reject on a pending card and typing a
+    /// non-empty reason, the modal shows the reason-entry title, the typed text, a text cursor,
+    /// and the "далее"/"отмена" hints (§6.2 confirm gate, step 1 of 2).
+    #[test]
+    fn renders_reject_reason_entry_modal_headlessly() {
+        let mut app = AppState::new();
+        app.screen = Screen::DecisionInbox;
+        app.inbox.approvals = vec![crate::inbox::ApprovalCard {
+            backend: crate::inbox::ApprovalBackend::Legacy,
+            id: "apr-reject".to_string(),
+            subject: "task:T-250|batch:".to_string(),
+            task: Some("T-250".to_string()),
+            batch: None,
+            reason: "human-review".to_string(),
+            created_at: None,
+            deadline: Some("2099-01-01T00:00:00Z".to_string()),
+            fingerprint: Some("aa".to_string()),
+            policy_hash: Some("bb".to_string()),
+        }];
+        assert!(app.arm_reject());
+        for ch in "неверный scope".chars() {
+            app.push_rejection_char(ch);
+        }
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(screen.contains(" причина reject "), "missing modal title");
+        assert!(screen.contains("█"), "missing text cursor");
+        assert!(
+            screen.contains("неверный scope"),
+            "missing typed reject reason"
+        );
+        assert!(screen.contains("далее"), "missing next-step hint");
+        assert!(screen.contains("отмена"), "missing cancel hint");
+    }
+
+    /// The `Modal::ConfirmReject` step: after confirming a non-empty reject reason, the modal
+    /// shows the confirmation title, the previously entered reason, and the confirm/cancel hints
+    /// (§6.2 confirm gate, step 2 of 2).
+    #[test]
+    fn renders_reject_confirmation_modal_headlessly() {
+        let mut app = AppState::new();
+        app.screen = Screen::DecisionInbox;
+        app.inbox.approvals = vec![crate::inbox::ApprovalCard {
+            backend: crate::inbox::ApprovalBackend::Legacy,
+            id: "apr-reject".to_string(),
+            subject: "task:T-250|batch:".to_string(),
+            task: Some("T-250".to_string()),
+            batch: None,
+            reason: "human-review".to_string(),
+            created_at: None,
+            deadline: Some("2099-01-01T00:00:00Z".to_string()),
+            fingerprint: Some("aa".to_string()),
+            policy_hash: Some("bb".to_string()),
+        }];
+        assert!(app.arm_reject());
+        for ch in "неверный scope".chars() {
+            app.push_rejection_char(ch);
+        }
+        assert!(app.confirm_rejection_reason());
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            screen.contains(" подтверждение reject "),
+            "missing modal title"
+        );
+        assert!(
+            screen.contains("причина отказа: ") && screen.contains("неверный scope"),
+            "missing previously entered reject reason"
+        );
+        assert!(screen.contains("y / Enter"), "missing confirm hint");
+        assert!(screen.contains("подтвердить"), "missing confirm label");
+        assert!(screen.contains("отмена"), "missing cancel hint");
+    }
+
+    /// Decision Inbox with both a pending and an expired approval: the expired card is marked
+    /// "ПРОСРОЧЕНО" and shown alongside (not instead of) the still-pending card, and the panel
+    /// title counts both categories independently (§6.2 "pending/expired approvals").
+    #[test]
+    fn renders_decision_inbox_with_expired_approval_headlessly() {
+        let mut app = AppState::new();
+        app.screen = Screen::DecisionInbox;
+        app.inbox.approvals = vec![crate::inbox::ApprovalCard {
+            backend: crate::inbox::ApprovalBackend::Legacy,
+            id: "apr-pending".to_string(),
+            subject: "task:T-251|batch:".to_string(),
+            task: Some("T-251".to_string()),
+            batch: None,
+            reason: "human-review".to_string(),
+            created_at: None,
+            deadline: Some("2099-01-01T00:00:00Z".to_string()),
+            fingerprint: Some("aa".to_string()),
+            policy_hash: Some("bb".to_string()),
+        }];
+        app.inbox.expired_approvals = vec![crate::inbox::ApprovalCard {
+            backend: crate::inbox::ApprovalBackend::Legacy,
+            id: "apr-expired".to_string(),
+            subject: "task:T-252|batch:".to_string(),
+            task: Some("T-252".to_string()),
+            batch: None,
+            reason: "human-review".to_string(),
+            created_at: None,
+            deadline: Some("2020-01-01T00:00:00Z".to_string()),
+            fingerprint: Some("cc".to_string()),
+            policy_hash: Some("dd".to_string()),
+        }];
+
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(screen.contains("ПРОСРОЧЕНО"), "missing expired marker");
+        assert!(screen.contains("apr-expired"), "missing expired card id");
+        assert!(
+            screen.contains("task:T-252|batch:"),
+            "missing expired card subject"
+        );
+        assert!(
+            screen.contains("pending 1, expired 1)"),
+            "panel title should count pending and expired independently"
+        );
+        assert!(
+            screen.contains("apr-pending"),
+            "pending card must still be visible alongside the expired one"
+        );
+    }
 }
