@@ -25,33 +25,30 @@ pub fn task_leaf_outcome(verdict: &Verdict, report: &str, author: &str) -> LeafO
         Reason::Ok => match strict_outcome(report) {
             Some(outcome) if outcome.verdict == "готово" && valid_mode(outcome.field("режим")) =>
             {
-                match reported_risk(&outcome) {
-                    Ok(Some(risk)) => LeafOutcome::RiskElevated {
+                let risk = match reported_risk(&outcome) {
+                    Ok(risk) => risk,
+                    Err(reason) => return LeafOutcome::Escalated { reason },
+                };
+                // Risk elevation and Mode-2 won't-fix metadata describe independent facts about
+                // one successful round. Decode both before selecting the structured outcome so
+                // neither signal can suppress the other.
+                let wont_fixed = (outcome.field("режим") == Some("2"))
+                    .then(|| outcome.wont_fix())
+                    .filter(|entries| !entries.is_empty())
+                    .map(|entries| u32::try_from(entries.len()).unwrap_or(u32::MAX));
+                match (risk, wont_fixed) {
+                    (Some(risk), wont_fixed) => LeafOutcome::RiskElevated {
                         author: Some(author.to_string()),
                         risk,
+                        wont_fixed,
                     },
-                    // A fix round (`режим=2`, `agents/coder.md` "Режим 2") may additionally
-                    // declare `не исправлено` entries (task T-014). Risk elevation above takes
-                    // priority and is left untouched: a round that ALSO strictly raised the
-                    // task's blast-radius classification keeps the ordinary human-visible risk
-                    // path rather than the robotic empty-fixed-set escalation.
-                    Ok(None) if outcome.field("режим") == Some("2") => {
-                        let wont_fix = outcome.wont_fix();
-                        if wont_fix.is_empty() {
-                            LeafOutcome::Completed {
-                                author: Some(author.to_string()),
-                            }
-                        } else {
-                            LeafOutcome::CompletedWithWontFix {
-                                author: Some(author.to_string()),
-                                wont_fixed: u32::try_from(wont_fix.len()).unwrap_or(u32::MAX),
-                            }
-                        }
-                    }
-                    Ok(None) => LeafOutcome::Completed {
+                    (None, Some(wont_fixed)) => LeafOutcome::CompletedWithWontFix {
+                        author: Some(author.to_string()),
+                        wont_fixed,
+                    },
+                    (None, None) => LeafOutcome::Completed {
                         author: Some(author.to_string()),
                     },
-                    Err(reason) => LeafOutcome::Escalated { reason },
                 }
             }
             Some(outcome) if outcome.verdict == "эскалация" => LeafOutcome::Escalated {
@@ -496,6 +493,7 @@ mod tests {
             LeafOutcome::RiskElevated {
                 author: Some("coder".into()),
                 risk: Risk::High,
+                wont_fixed: None,
             }
         );
         assert!(matches!(
@@ -514,6 +512,22 @@ mod tests {
             ),
             LeafOutcome::Escalated { reason } if reason.contains("duplicate")
         ));
+    }
+
+    #[test]
+    fn fix_round_preserves_risk_elevation_and_wont_fix_count_together() {
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: x\nИТОГ: готово · режим=2 · риск=high · не исправлено=R-01=out of scope\n",
+                "coder",
+            ),
+            LeafOutcome::RiskElevated {
+                author: Some("coder".into()),
+                risk: Risk::High,
+                wont_fixed: Some(1),
+            }
+        );
     }
 
     #[test]

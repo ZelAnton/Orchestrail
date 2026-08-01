@@ -839,6 +839,9 @@ pub enum LeafOutcome {
     RiskElevated {
         author: Option<String>,
         risk: Risk,
+        /// Mode-2 findings explicitly left unfixed in the same successful report. Keeping this
+        /// payload optional lets risk elevation and empty-fixed-set detection remain independent.
+        wont_fixed: Option<u32>,
     },
     /// A successful FIX round (task T-014) that additionally declared `wont_fixed` findings it
     /// did NOT fix via the fixer's additive `не исправлено` outcome field
@@ -1042,10 +1045,16 @@ pub enum ArchivalPreparationOutcome {
 pub enum TaskLeafPreparationOutcome {
     Skipped,
     Completed,
+    /// Codex completed a fix round and explicitly left findings unfixed. This mirrors
+    /// [`LeafOutcome::CompletedWithWontFix`] across the preparation/replay boundary.
+    CompletedWithWontFix {
+        wont_fixed: u32,
+    },
     /// Codex completed a task and reported a strict risk elevation. The reducer records it
     /// before committing, exactly as it does for the ordinary Claude path.
     RiskElevated {
         risk: Risk,
+        wont_fixed: Option<u32>,
     },
     Fallback,
     SandboxDowngraded {
@@ -2726,7 +2735,11 @@ impl Processor {
                     task_id: task_id.into(),
                 }])
             }
-            LeafOutcome::RiskElevated { author, risk } => {
+            LeafOutcome::RiskElevated {
+                author,
+                risk,
+                wont_fixed,
+            } => {
                 if let Err(reason) = raise_task_risk(task, risk) {
                     task.phase = TaskPhase::Escalated;
                     task.reason = Some(reason.clone());
@@ -2734,6 +2747,25 @@ impl Processor {
                         task_id: task_id.into(),
                         reason,
                     }]);
+                }
+                if let Some(wont_fixed) = wont_fixed {
+                    if kind != LeafKind::Fix {
+                        return Err(ProcessorError::InvalidCommand(format!(
+                            "task {task_id} reported fix-cycle won't-fix metadata outside a fix leaf"
+                        )));
+                    }
+                    let open_findings = task.pending_fix_open_findings.take();
+                    if let Some(open_findings) = open_findings
+                        && let Some(reason) =
+                            empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
+                    {
+                        task.phase = TaskPhase::Escalated;
+                        task.reason = Some(reason.clone());
+                        return Ok(vec![Effect::EscalateTask {
+                            task_id: task_id.into(),
+                            reason,
+                        }]);
+                    }
                 }
                 if author.is_some() {
                     task.implementation_author = author;
@@ -2832,7 +2864,31 @@ impl Processor {
                     task_id: task_id.into(),
                 }])
             }
-            TaskLeafPreparationOutcome::RiskElevated { risk } => {
+            TaskLeafPreparationOutcome::CompletedWithWontFix { wont_fixed } => {
+                if kind != LeafKind::Fix {
+                    return Err(ProcessorError::InvalidCommand(format!(
+                        "task {task_id} reported fix-cycle won't-fix metadata outside a fix leaf"
+                    )));
+                }
+                let open_findings = task.pending_fix_open_findings.take();
+                if let Some(open_findings) = open_findings
+                    && let Some(reason) =
+                        empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
+                {
+                    task.phase = TaskPhase::Escalated;
+                    task.reason = Some(reason.clone());
+                    return Ok(vec![Effect::EscalateTask {
+                        task_id: task_id.into(),
+                        reason,
+                    }]);
+                }
+                task.implementation_author = Some("coder_codex".into());
+                task.phase = TaskPhase::Committing;
+                Ok(vec![Effect::CommitTask {
+                    task_id: task_id.into(),
+                }])
+            }
+            TaskLeafPreparationOutcome::RiskElevated { risk, wont_fixed } => {
                 if let Err(reason) = raise_task_risk(task, risk) {
                     task.phase = TaskPhase::Escalated;
                     task.reason = Some(reason.clone());
@@ -2840,6 +2896,25 @@ impl Processor {
                         task_id: task_id.into(),
                         reason,
                     }]);
+                }
+                if let Some(wont_fixed) = wont_fixed {
+                    if kind != LeafKind::Fix {
+                        return Err(ProcessorError::InvalidCommand(format!(
+                            "task {task_id} reported fix-cycle won't-fix metadata outside a fix leaf"
+                        )));
+                    }
+                    let open_findings = task.pending_fix_open_findings.take();
+                    if let Some(open_findings) = open_findings
+                        && let Some(reason) =
+                            empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
+                    {
+                        task.phase = TaskPhase::Escalated;
+                        task.reason = Some(reason.clone());
+                        return Ok(vec![Effect::EscalateTask {
+                            task_id: task_id.into(),
+                            reason,
+                        }]);
+                    }
                 }
                 task.implementation_author = Some("coder_codex".into());
                 task.phase = TaskPhase::Committing;
@@ -6033,6 +6108,7 @@ mod tests {
                 outcome: LeafOutcome::RiskElevated {
                     author: Some("coder".into()),
                     risk: Risk::High,
+                    wont_fixed: None,
                 },
             })
             .unwrap();
@@ -6069,6 +6145,7 @@ mod tests {
                 outcome: LeafOutcome::RiskElevated {
                     author: Some("coder".into()),
                     risk: Risk::Low,
+                    wont_fixed: None,
                 },
             })
             .unwrap();
@@ -6098,6 +6175,7 @@ mod tests {
                 outcome: LeafOutcome::RiskElevated {
                     author: Some("coder".into()),
                     risk: Risk::High,
+                    wont_fixed: None,
                 },
             })
             .unwrap();
@@ -6486,6 +6564,98 @@ mod tests {
             None,
             "the coordinate is consumed (cleared) once judged"
         );
+    }
+
+    #[test]
+    fn codex_preparation_preserves_wont_fix_and_escalates_the_same_round() {
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeafPrepared {
+            task_id: "T-1".into(),
+            outcome: TaskLeafPreparationOutcome::Completed,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("R-01 and R-02"),
+                open_findings: 2,
+            },
+        })
+        .unwrap();
+
+        let effects = p
+            .apply(ProcessorCommand::TaskLeafPrepared {
+                task_id: "T-1".into(),
+                outcome: TaskLeafPreparationOutcome::CompletedWithWontFix { wont_fixed: 2 },
+            })
+            .unwrap();
+
+        assert!(matches!(effects.last(), Some(Effect::EscalateTask { .. })));
+        assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Escalated);
+        assert_eq!(p.state().tasks["T-1"].pending_fix_open_findings, None);
+    }
+
+    #[test]
+    fn risk_elevation_does_not_suppress_empty_fixed_set_escalation() {
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-1".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("R-01"),
+                open_findings: 1,
+            },
+        })
+        .unwrap();
+
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::RiskElevated {
+                    author: Some("coder".into()),
+                    risk: Risk::High,
+                    wont_fixed: Some(1),
+                },
+            })
+            .unwrap();
+
+        assert!(matches!(effects.last(), Some(Effect::EscalateTask { .. })));
+        assert_eq!(p.state().tasks["T-1"].risk, Some(Risk::High));
+        assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Escalated);
     }
 
     #[test]

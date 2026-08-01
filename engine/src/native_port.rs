@@ -1908,18 +1908,29 @@ impl<E: ExternalPort> FileVcsPort<E> {
             | ReviewOutcome::FindingsRiskElevated { risk, .. } => Some(*risk),
             ReviewOutcome::Escalated { .. } | ReviewOutcome::Incomplete => return Ok(outcome),
         };
-        // The re-imposed engine finding is ALWAYS in the rebuilt round; a reviewer that already
-        // reported its own open findings (task T-014's `open_findings`) has that count preserved,
-        // otherwise (the reviewer thought the round clean) the engine's own re-imposed finding is
-        // the round's only open finding.
-        let open_findings = match &outcome {
+        // The rebuilt round is the union of the reviewer's findings and the engine's proved gate
+        // failure. A reviewer may retain the engine finding (in which case its parsed count already
+        // includes it) or replace the artifact with reviewer-only findings (in which case the
+        // restored/deferred gate finding must be added exactly once).
+        let reviewer_open_findings = match &outcome {
             ReviewOutcome::Findings { open_findings, .. }
             | ReviewOutcome::FindingsRiskElevated { open_findings, .. } => *open_findings,
-            _ => 1,
+            _ => 0,
         };
+        let gate_already_counted =
+            matches!(
+                outcome,
+                ReviewOutcome::Findings { .. } | ReviewOutcome::FindingsRiskElevated { .. }
+            ) && self.read_review_artifact(task_id)?.is_some_and(|artifact| {
+                crate::contract::parse_review(&artifact)
+                    .open_review_findings()
+                    .iter()
+                    .any(|finding| finding.title == REVIEW_CYCLE_FINDING_TITLE)
+            });
         if restore_finding {
             self.mix_review_cycle_finding(task_id, &failure.body)?;
         }
+        let open_findings = reviewer_open_findings.saturating_add(u32::from(!gate_already_counted));
         // Computed from the artifact minus the engine's own finding, so it does not depend on
         // whether this path restored it.
         let signature = self.review_cycle_round_signature(task_id, &failure.signature)?;
@@ -6526,9 +6537,17 @@ mod tests {
 
         // The engine proved this tip does not build. A reviewer report — however clean, and whether
         // or not it kept the engine's finding — cannot be the authority that closes the round.
-        let ReviewOutcome::Findings { signature, .. } = outcome else {
+        let ReviewOutcome::Findings {
+            signature,
+            open_findings,
+        } = outcome
+        else {
             panic!("a proved cycle failure must hold the round open: {outcome:?}");
         };
+        assert_eq!(
+            open_findings, 1,
+            "the gate failure is the only open finding"
+        );
         assert_eq!(
             signature.len(),
             16,
@@ -6558,6 +6577,56 @@ mod tests {
         assert!(
             descriptor.contains("Статус: на ревью"),
             "a broken build must not reach the merge queue: {descriptor}"
+        );
+    }
+
+    #[test]
+    fn restored_gate_finding_is_added_to_the_reviewer_open_count() {
+        let fixture = review_cycle_fixture();
+        let mut port = FileVcsPort::discover(
+            &fixture.work,
+            &fixture.root,
+            StubExternal { planned: false },
+        )
+        .unwrap()
+        .with_review_cycle_verification(Some(review_cycle_gate(&marker_command(false))));
+
+        dispatch_review_observing_artifact(&mut port, &fixture.work, &fixture.state);
+        let reviewer_only = concat!(
+            "# Ревью задачи T-1\n\n",
+            "### [R-01] Reviewer finding one — статус: новая\n\n",
+            "### [R-02] Reviewer finding two — статус: новая\n\n",
+            "ИТОГ: открытые находки · открытых=2\n",
+        );
+        fs::write(fixture.work.join("tasks/T-1/review.md"), reviewer_only).unwrap();
+        let head = fixture.state.tasks["T-1"].review_sha.as_deref().unwrap();
+
+        let outcome = port
+            .enforce_review_cycle_gate(
+                "T-1",
+                head,
+                ReviewOutcome::Findings {
+                    signature: "reviewer-signature".into(),
+                    open_findings: 2,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReviewOutcome::Findings {
+                open_findings: 3,
+                ..
+            }
+        ));
+        let artifact = fs::read_to_string(fixture.work.join("tasks/T-1/review.md")).unwrap();
+        assert_eq!(
+            crate::contract::parse_review(&artifact)
+                .open_review_findings()
+                .len(),
+            3,
+            "the restored gate finding joins both reviewer findings: {artifact}"
         );
     }
 

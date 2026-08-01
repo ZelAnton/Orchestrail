@@ -3153,6 +3153,7 @@ impl ExternalPort for HeadlessExternalPort {
                         matches!(
                             prepared,
                             TaskLeafPreparationOutcome::Completed
+                                | TaskLeafPreparationOutcome::CompletedWithWontFix { .. }
                                 | TaskLeafPreparationOutcome::RiskElevated { .. }
                         ),
                     ),
@@ -3160,6 +3161,7 @@ impl ExternalPort for HeadlessExternalPort {
             }
             match &prepared {
                 TaskLeafPreparationOutcome::Completed
+                | TaskLeafPreparationOutcome::CompletedWithWontFix { .. }
                 | TaskLeafPreparationOutcome::RiskElevated { .. } => {
                     self.task_evidence.insert(
                         task_id.into(),
@@ -3281,18 +3283,18 @@ impl ExternalPort for HeadlessExternalPort {
             );
         }
         let prepared = match &outcome {
-            // `TaskLeafPreparationOutcome::Completed` carries no fields, so a Codex fix round's
-            // `не исправлено` count (task T-014) does not survive this Codex-preparation
-            // indirection the way it does on the direct Claude `finish_task_leaf` path. This is a
-            // scoped, accepted gap: the empty-fixed-set early exit simply does not fire for a
-            // Codex-completed fix round — it still commits normally, and the unaffected
-            // `stagnation_decision` path remains the correctness backstop for that case.
-            LeafOutcome::Completed { .. } | LeafOutcome::CompletedWithWontFix { .. } => {
-                TaskLeafPreparationOutcome::Completed
+            LeafOutcome::Completed { .. } => TaskLeafPreparationOutcome::Completed,
+            LeafOutcome::CompletedWithWontFix { wont_fixed, .. } => {
+                TaskLeafPreparationOutcome::CompletedWithWontFix {
+                    wont_fixed: *wont_fixed,
+                }
             }
-            LeafOutcome::RiskElevated { risk, .. } => {
-                TaskLeafPreparationOutcome::RiskElevated { risk: *risk }
-            }
+            LeafOutcome::RiskElevated {
+                risk, wont_fixed, ..
+            } => TaskLeafPreparationOutcome::RiskElevated {
+                risk: *risk,
+                wont_fixed: *wont_fixed,
+            },
             LeafOutcome::Escalated { reason } | LeafOutcome::RetryableFailure { reason } => {
                 TaskLeafPreparationOutcome::Escalated {
                     reason: reason.clone(),
@@ -3320,6 +3322,7 @@ impl ExternalPort for HeadlessExternalPort {
                 matches!(
                     prepared,
                     TaskLeafPreparationOutcome::Completed
+                        | TaskLeafPreparationOutcome::CompletedWithWontFix { .. }
                         | TaskLeafPreparationOutcome::RiskElevated { .. }
                 ),
             ),
@@ -3330,10 +3333,15 @@ impl ExternalPort for HeadlessExternalPort {
                     .insert(task_id.into(), changed_paths.expect("validated above"));
                 Ok(TaskLeafPreparationOutcome::Completed)
             }
-            TaskLeafPreparationOutcome::RiskElevated { risk } => {
+            TaskLeafPreparationOutcome::CompletedWithWontFix { wont_fixed } => {
                 self.task_evidence
                     .insert(task_id.into(), changed_paths.expect("validated above"));
-                Ok(TaskLeafPreparationOutcome::RiskElevated { risk })
+                Ok(TaskLeafPreparationOutcome::CompletedWithWontFix { wont_fixed })
+            }
+            TaskLeafPreparationOutcome::RiskElevated { risk, wont_fixed } => {
+                self.task_evidence
+                    .insert(task_id.into(), changed_paths.expect("validated above"));
+                Ok(TaskLeafPreparationOutcome::RiskElevated { risk, wont_fixed })
             }
             TaskLeafPreparationOutcome::Escalated { reason } => {
                 Ok(TaskLeafPreparationOutcome::Escalated { reason })
@@ -3964,7 +3972,10 @@ impl ExternalPort for HeadlessExternalPort {
             task_leaf_outcome(&invocation.verdict, &invocation.report, "merger"),
             "integration fixer",
         );
-        if matches!(outcome, LeafOutcome::Completed { .. }) {
+        if matches!(
+            outcome,
+            LeafOutcome::Completed { .. } | LeafOutcome::CompletedWithWontFix { .. }
+        ) {
             self.integration_evidence = Some(Self::exact_changed_paths(&invocation.report)?);
         }
         Ok(outcome)
