@@ -3778,8 +3778,7 @@ impl ExternalPort for HeadlessExternalPort {
         let handovers = thread::scope(|scope| {
             let workers = effects
                 .iter()
-                .cloned()
-                .map(|request| {
+                .map(|request: &_| {
                     let config = config.clone();
                     let state = frozen_state.clone();
                     scope.spawn(move || -> TaskWorkerHandover {

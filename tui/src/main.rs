@@ -99,7 +99,7 @@ fn run(cfg: Config) -> io::Result<()> {
     let mut control_plane_cache = ControlPlaneCache::default();
     // Prime the projection with everything already in the journal (a cold observer of a
     // long-running orchestra) before drawing the first frame.
-    app.apply_all(&reader.poll()?);
+    app.apply_all(&reader.poll_all()?);
     app.status = status::load(&mut control_plane_cache.status, &status_path);
     app.replace_inbox(load_inbox(&cfg.work_dir, &mut control_plane_cache));
     refresh_batch_telemetry(&mut app, &cfg.work_dir);
