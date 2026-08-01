@@ -111,7 +111,7 @@ be mistaken for the published commit's result:
 | --- | --- | --- |
 | `github` | `vcs-github` (`gh`) | `repos/{owner}/{repo}/commits/<sha>/check-runs` |
 | `gitlab` | `vcs-gitlab` (`glab`) | `projects/:fullpath/repository/commits/<sha>/statuses` (newest first) |
-| `gitea` | `vcs-gitea` (`tea`) | `/repos/{owner}/{repo}/commits/<sha>/status` |
+| `gitea` | `vcs-gitea` (`tea`) | `/repos/{owner}/{repo}/commits/<sha>/status` (latest status per context, newest first) |
 
 The forge is a configuration decision, not an inference: the engine does not
 derive it from a remote URL, because a mis-derived forge would poll the wrong
@@ -148,6 +148,31 @@ method, so the adapter uses the crate's documented directory-bound raw argv
 escape hatch to invoke `tea api`. A `tea` build without that subcommand simply
 fails the request, which the watcher treats as an outage — never as a confirmed
 CI.
+
+**Gitea page completeness.** The three forges prove differently that the page
+they classified was the whole set, because they offer different evidence:
+GitHub reports a true `total_count`, GitLab has a fixed 100-entry page cap, and
+Gitea has neither — its `total_count` is the length of the page it just
+returned, and its page size is clamped to the instance's `[api]
+MAX_RESPONSE_ITEMS` setting (default 50). A page cut by that setting therefore
+looks complete in the body. Rather than assume a minimum server setting, the
+Gitea adapter asks for the page after the one it read: an empty next page proves
+completeness whatever the instance is configured to, and a non-empty one is
+reported as a possibly-truncated page and refused. The extra request is spent
+only on a snapshot that would otherwise pass — never while CI is pending, red,
+or unreachable — so a confirmed publication costs one additional call and a
+watch that never confirms costs none.
+
+The limit this leaves is explicit and fail-closed, and it matches GitLab's: a
+commit whose statuses do not fit one page — for Gitea more distinct check
+contexts than `min(50, MAX_RESPONSE_ITEMS)`, for GitLab more than 100 status
+entries — is never confirmed, and resolves as unconfirmed required checks or a
+degraded best-effort observation. Raising `MAX_RESPONSE_ITEMS` above the number
+of contexts a commit reports is what keeps such a Gitea repository confirmable.
+
+Unlike GitLab, no sort order is requested from Gitea: the combined-status route
+takes only `page` and `limit`, and the server already returns the newest status
+per context first, so a sort parameter would be silently ignored.
 
 ## Approval and quarantine
 

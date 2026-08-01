@@ -2390,7 +2390,8 @@ impl HeadlessExternalPort {
         ))
     }
 
-    /// Fetch the exact published commit's combined status through the typed `vcs-gitea` client.
+    /// Fetch one page of the exact published commit's combined status through the typed
+    /// `vcs-gitea` client.
     ///
     /// `vcs-gitea` models no `api` method (the `tea` CLI is narrower than `gh`/`glab`, and the
     /// crate deliberately exposes only what it can type), so the request goes through the
@@ -2398,6 +2399,34 @@ impl HeadlessExternalPort {
     /// from the bound repository and prefixes `/api/v1` itself. A `tea` without the `api`
     /// subcommand simply fails the request, which the watch loop treats as an outage and
     /// therefore never as a confirmed CI.
+    fn gitea_status_page(
+        &self,
+        head: &str,
+        page: usize,
+    ) -> Result<GiteaCombinedStatus, HeadlessError> {
+        let endpoint = forge_ci::gitea_status_endpoint(head, page);
+        let gitea = Gitea::new();
+        let body = self.forge_request(
+            Forge::Gitea,
+            head,
+            gitea.run_args_in(&self.config.root, &["api", endpoint.as_str()]),
+        )?;
+        forge_ci::parse_gitea_combined_status(&body).map_err(|error| {
+            HeadlessError::Protocol(format!(
+                "typed Gitea CI response for {head} is not a combined-status document: {error}"
+            ))
+        })
+    }
+
+    /// One Gitea snapshot of the published commit.
+    ///
+    /// Unlike the GitHub and GitLab polls this can issue a second request, because Gitea is the
+    /// only one of the three whose response cannot show that it is complete: its `total_count` is
+    /// the length of the returned page and its page size is an instance setting, so a page
+    /// clamped by `[api] MAX_RESPONSE_ITEMS` looks exactly like a whole one. The classifier
+    /// therefore takes the next-page fetch as an argument and spends it only on a snapshot that
+    /// would otherwise pass — one extra request per confirmed publication, none while CI is still
+    /// pending, red, or unreachable.
     fn gitea_ci_poll(
         &self,
         head: &str,
@@ -2408,23 +2437,10 @@ impl HeadlessExternalPort {
                 "CI_WATCH requires a full Git-compatible commit id, got {head:?}"
             )));
         }
-        let endpoint = forge_ci::gitea_status_endpoint(head);
-        let gitea = Gitea::new();
-        let body = self.forge_request(
-            Forge::Gitea,
-            head,
-            gitea.run_args_in(&self.config.root, &["api", endpoint.as_str()]),
-        )?;
-        let combined: GiteaCombinedStatus = serde_json::from_str(&body).map_err(|error| {
-            HeadlessError::Protocol(format!(
-                "typed Gitea CI response for {head} is not a combined-status document: {error}"
-            ))
-        })?;
-        Ok(forge_ci::classify_gitea_statuses(
-            head,
-            &combined,
-            required_checks,
-        ))
+        let combined = self.gitea_status_page(head, 1)?;
+        forge_ci::classify_gitea_statuses(head, &combined, required_checks, || {
+            self.gitea_status_page(head, forge_ci::GITEA_COMPLETENESS_PROBE_PAGE)
+        })
     }
 
     /// One commit-bound snapshot from whichever forge this run is configured for. The match is

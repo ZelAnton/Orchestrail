@@ -4,14 +4,19 @@
 //!
 //! The transport lives in [`crate::headless`] because it needs the real `vcs-github` /
 //! `vcs-gitlab` / `vcs-gitea` clients and a tokio runtime; everything here is a pure
-//! function of an already-decoded response plus a caller-supplied poll closure, so the
-//! whole gate — including outage and deadline behaviour — is exercised hermetically from
+//! function of an already-decoded response plus caller-supplied closures (the poll itself, and
+//! for Gitea the next-page fetch that proves the page was complete), so the whole gate —
+//! including truncation, outage, and deadline behaviour — is exercised hermetically from
 //! `engine/tests/` without a forge, a network, or a CLI on `PATH`.
 //!
 //! The gate is fail-closed by construction: [`CiPoll::Passing`] is returned only on a
 //! positive confirmation that every selected check reported a terminal success for the
 //! exact published commit. Partial pages, absent required checks, unknown states, an
 //! unavailable endpoint, and an exhausted deadline all resolve to a non-passing outcome.
+//! Each adapter proves page completeness the strongest way its forge allows, because a page
+//! believed complete when it is not is the one way this gate could fail *open*: GitHub reports a
+//! true `total_count`, GitLab has a forge-fixed page cap, and Gitea — whose page size is an
+//! instance setting and whose `total_count` is page-local — is proven by fetching the next page.
 
 use std::fmt;
 use std::thread;
@@ -27,10 +32,26 @@ use crate::resolvers::AttemptSignature;
 /// rather than mistaken for the complete set.
 pub const GITLAB_STATUS_PAGE_SIZE: usize = 100;
 
-/// Gitea clamps a list request to its `MAX_RESPONSE_ITEMS` setting (default 50) and reports
-/// `total_count` for the returned page rather than the true total, so the request asks for
-/// exactly that documented default and an exactly-full page is refused for the same reason.
+/// The `limit` the Gitea status request asks for. Unlike GitLab's cap this is only a *request*:
+/// Gitea clamps every list request to its own `[api] MAX_RESPONSE_ITEMS` setting (default 50,
+/// `convert.ToCorrectPageSize`) and then reports `total_count` as the length of the page it
+/// actually returned (`convert.ToCombinedStatus` sets `TotalCount: len(statuses)`; the true total
+/// goes only to the `X-Total-Count` header, which `tea api` does not print).
+///
+/// So on a server configured below this value a truncated page is indistinguishable from a
+/// complete one by the body alone: it is shorter than the requested limit *and* self-consistent.
+/// Page size is therefore **not** a completeness proof here — completeness is proven separately,
+/// by fetching [`GITEA_COMPLETENESS_PROBE_PAGE`].
 pub const GITEA_STATUS_PAGE_SIZE: usize = 50;
+
+/// The page fetched to prove the first one was not truncated.
+///
+/// Asking for the page *after* the first is the only completeness check that does not depend on a
+/// remotely configurable value: whatever size the server clamped the page to, an empty second page
+/// means the first page held every status, and a non-empty one means it did not. It costs one
+/// extra request, and only for a snapshot that would otherwise pass — a snapshot that is already
+/// fail-closed needs no proof of completeness.
+pub const GITEA_COMPLETENESS_PROBE_PAGE: usize = 2;
 
 /// The typed forge client the publication CI gate polls, selected by the `FORGE` key in
 /// `.work/config.md`.
@@ -138,13 +159,23 @@ pub fn gitlab_statuses_endpoint(head: &str) -> String {
     )
 }
 
-/// `tea api` endpoint for the exact published commit's combined status.
+/// `tea api` endpoint for one page of the exact published commit's combined status.
 ///
 /// `{owner}`/`{repo}` are expanded by `tea` from the repository the request runs in. The
 /// leading `/` keeps the argument from ever being read as a flag; `tea` prefixes `/api/v1`
 /// itself.
-pub fn gitea_status_endpoint(head: &str) -> String {
-    format!("/repos/{{owner}}/{{repo}}/commits/{head}/status?page=1&limit={GITEA_STATUS_PAGE_SIZE}")
+///
+/// No ordering parameter is sent, and that is a deliberate divergence from the
+/// `order_by=id&sort=desc` used for GitLab rather than an omission. This route (`.../status`,
+/// the combined document — unlike `.../statuses`, the raw list) accepts only `page` and `limit`,
+/// and the server always returns the newest status per context first: `GetLatestCommitStatus`
+/// groups by `context_hash` and orders by `max(index) desc`. A sort parameter the route ignores
+/// would only imply a guarantee the request does not actually obtain, and ordering is no longer
+/// what completeness rests on: [`GITEA_COMPLETENESS_PROBE_PAGE`] proves it directly.
+pub fn gitea_status_endpoint(head: &str, page: usize) -> String {
+    format!(
+        "/repos/{{owner}}/{{repo}}/commits/{head}/status?page={page}&limit={GITEA_STATUS_PAGE_SIZE}"
+    )
 }
 
 /// One entry of GitLab's `GET /projects/:id/repository/commits/:sha/statuses` array.
@@ -180,11 +211,37 @@ pub struct GiteaCombinedStatus {
     pub sha: String,
     /// Gitea reports the size of the returned page here rather than the true total (the true
     /// total goes to the `X-Total-Count` header). It is still cross-checked: a Forgejo or
-    /// future Gitea that reports a real total makes truncation directly detectable.
+    /// future Gitea that reports a real total makes truncation directly detectable. It cannot,
+    /// however, be relied on to detect it — see [`GITEA_STATUS_PAGE_SIZE`].
     #[serde(default)]
     pub total_count: usize,
-    #[serde(default)]
+    /// Gitea sends `"statuses": null`, not `[]`, whenever the page holds nothing: the Go field
+    /// carries no `omitempty` and the slice is left nil when no status was selected. An explicit
+    /// null must therefore decode as an empty page rather than as a malformed document — that
+    /// shape is not exotic, it is exactly what every page past the last one returns, which is
+    /// what the completeness probe reads.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub statuses: Vec<GiteaCommitStatus>,
+}
+
+/// Decode a field whose JSON value may be an explicit `null` as its default value.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Decode one `tea api .../commits/<sha>/status` body.
+///
+/// A whole-document `null` — what older Gitea releases returned for a commit with no statuses at
+/// all — decodes as an empty page rather than as a protocol error, so "nothing has reported yet"
+/// stays a classified pending snapshot instead of being reported as an endpoint outage. Both
+/// spellings are fail-closed; only the empty-page reading lets the completeness probe distinguish
+/// "there is no further page" from "the request failed".
+pub fn parse_gitea_combined_status(body: &str) -> serde_json::Result<GiteaCombinedStatus> {
+    Ok(serde_json::from_str::<Option<GiteaCombinedStatus>>(body)?.unwrap_or_default())
 }
 
 /// One entry of Gitea's combined status. Gitea calls the check name `context` and puts the
@@ -321,40 +378,49 @@ pub fn classify_gitlab_statuses(
 /// Classify Gitea's combined status document for the published commit `head`. Selection and
 /// fail-closed rules are identical to [`classify_gitlab_statuses`]; Gitea has no
 /// `allow_failure` concept, so every returned context is blocking.
-pub fn classify_gitea_statuses(
+///
+/// `next_page` fetches [`GITEA_COMPLETENESS_PROBE_PAGE`] and is the completeness proof this
+/// forge cannot get from the body: it is called — at most once, and only when the first page
+/// would otherwise pass — and a next page that is not empty turns that pass into `Pending`.
+/// Taking the probe as a mandatory argument is what keeps the fail-open out by construction: a
+/// caller cannot obtain [`CiPoll::Passing`] from a Gitea page without offering a way to prove the
+/// page was the whole set. Its failure is propagated, so a probe the endpoint cannot answer
+/// reaches the watch loop as an outage — never as a confirmed CI.
+///
+/// The requested page size is deliberately *not* consulted as a truncation signal (as it is for
+/// GitLab, whose 100-entry cap is fixed by the forge): Gitea's effective page size is an instance
+/// setting, so an exactly-full page proves nothing that the probe does not prove better, and
+/// refusing one would needlessly fail a commit that really does have that many green contexts.
+pub fn classify_gitea_statuses<N, E>(
     head: &str,
     combined: &GiteaCombinedStatus,
     required_checks: &[String],
-) -> CiPoll {
-    if combined.statuses.len() >= GITEA_STATUS_PAGE_SIZE {
-        return CiPoll::Pending {
-            reason: format!(
-                "Gitea returned a full page of {} commit statuses; refusing a possibly-truncated pass",
-                combined.statuses.len()
-            ),
-        };
-    }
+    next_page: N,
+) -> Result<CiPoll, E>
+where
+    N: FnOnce() -> Result<GiteaCombinedStatus, E>,
+{
     if combined.total_count != combined.statuses.len() {
-        return CiPoll::Pending {
+        return Ok(CiPoll::Pending {
             reason: format!(
                 "Gitea reported {} statuses but returned {}; refusing a partial-page pass",
                 combined.total_count,
                 combined.statuses.len()
             ),
-        };
+        });
     }
     if !combined.sha.is_empty() && !combined.sha.eq_ignore_ascii_case(head) {
-        return CiPoll::Pending {
+        return Ok(CiPoll::Pending {
             reason: format!(
                 "Gitea reported the combined status of commit {:?} while {head} was published",
                 combined.sha
             ),
-        };
+        });
     }
     if combined.statuses.is_empty() {
-        return CiPoll::Pending {
+        return Ok(CiPoll::Pending {
             reason: "Gitea has not reported any commit statuses for the published commit".into(),
-        };
+        });
     }
     let selected: Vec<&GiteaCommitStatus> = if required_checks.is_empty() {
         combined.statuses.iter().collect()
@@ -367,24 +433,39 @@ pub fn classify_gitea_statuses(
                 .filter(|status| status.context.trim() == required)
                 .max_by_key(|status| status.id)
             else {
-                return CiPoll::Pending {
+                return Ok(CiPoll::Pending {
                     reason: format!(
                         "required Gitea check {required:?} has not reported for the published commit"
                     ),
-                };
+                });
             };
             selected.push(status);
         }
         selected
     };
-    classify_selected(
+    let verdict = classify_selected(
         Forge::Gitea,
         head,
         selected
             .into_iter()
             .map(|status| (status.context.as_str(), status.status.as_str())),
         gitea_verdict,
-    )
+    );
+    if !matches!(verdict, CiPoll::Passing) {
+        return Ok(verdict);
+    }
+    if !next_page()?.statuses.is_empty() {
+        return Ok(CiPoll::Pending {
+            reason: format!(
+                "Gitea returned {} commit statuses for the published commit but page \
+                 {GITEA_COMPLETENESS_PROBE_PAGE} is not empty, so this page is not the whole set \
+                 (an instance whose `[api] MAX_RESPONSE_ITEMS` is below the requested \
+                 {GITEA_STATUS_PAGE_SIZE} silently clamps it); refusing a truncated-page pass",
+                combined.statuses.len()
+            ),
+        });
+    }
+    Ok(CiPoll::Passing)
 }
 
 /// Fold an already-selected set of `(name, state)` pairs into one poll classification.
@@ -539,6 +620,13 @@ mod tests {
         }
     }
 
+    /// A next-page fetch that must never run: a snapshot that is already fail-closed has nothing
+    /// to gain from a second request, so spending one would be a live-forge regression that no
+    /// assertion on the verdict alone would catch.
+    fn no_probe() -> Result<GiteaCombinedStatus, ()> {
+        panic!("a non-passing Gitea page must not spend a completeness probe");
+    }
+
     #[test]
     fn forge_values_round_trip_and_reject_unknown() {
         for forge in [Forge::GitHub, Forge::GitLab, Forge::Gitea] {
@@ -560,9 +648,30 @@ mod tests {
             !gitlab.contains(' '),
             "a line-continued endpoint must not carry whitespace"
         );
-        let gitea = gitea_status_endpoint(&head);
+        let gitea = gitea_status_endpoint(&head, 1);
         assert!(gitea.contains(&head) && gitea.starts_with("/repos/{owner}/{repo}/"));
+        assert!(gitea.contains("page=1"), "{gitea}");
+        // The completeness probe must address a different page than the one it is proving,
+        // otherwise it would re-read the same truncated set and call it proof.
+        let probe = gitea_status_endpoint(&head, GITEA_COMPLETENESS_PROBE_PAGE);
+        assert!(probe.contains("page=2") && probe != gitea, "{probe}");
         assert!(!gitlab.starts_with('-') && !gitea.starts_with('-'));
+    }
+
+    #[test]
+    fn gitea_reads_an_absent_page_as_empty_not_as_a_protocol_error() {
+        // Both spellings Gitea uses for "this page holds nothing": a document whose `statuses`
+        // is an explicit null (current releases) and a null document (older ones). Decoding
+        // either as an error would make every completeness probe look like an outage.
+        for body in [
+            r#"{"state":"pending","sha":"","total_count":0,"statuses":null}"#,
+            "null",
+        ] {
+            let parsed = parse_gitea_combined_status(body)
+                .unwrap_or_else(|error| panic!("{body} must decode as an empty page: {error}"));
+            assert!(parsed.statuses.is_empty(), "{body}");
+            assert_eq!(parsed.total_count, 0, "{body}");
+        }
     }
 
     #[test]
@@ -616,8 +725,8 @@ mod tests {
             }],
         };
         assert!(matches!(
-            classify_gitea_statuses(&head, &combined, &[]),
-            CiPoll::Failing { .. }
+            classify_gitea_statuses(&head, &combined, &[], no_probe),
+            Ok(CiPoll::Failing { .. })
         ));
     }
 
