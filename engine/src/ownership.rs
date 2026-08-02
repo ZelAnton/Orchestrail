@@ -35,6 +35,8 @@ const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSACTION_LOCK_RETRY: Duration = Duration::from_millis(50);
 static TRANSACTION_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TRANSACTION_STALE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TRANSACTION_STALE_BREAK_SERIALIZER: Mutex<()> = Mutex::new(());
 
 /// The interoperable lease document written by both control planes. Numeric time enters the
 /// native API explicitly and is rendered in the established UTC ISO form at the file boundary.
@@ -856,6 +858,13 @@ fn break_stale_transaction_lock(
     {
         return Ok(false);
     }
+    // `rename` is atomic, but it is not an identity-conditional operation: a delayed same-process
+    // contender could otherwise rename a fresh replacement at `path`. Serialize the final
+    // snapshot and rename so every contender revalidates after the preceding rename has finished.
+    // Poisoning cannot make filesystem recovery safer, so retain the mutex and revalidate.
+    let _break_guard = TRANSACTION_STALE_BREAK_SERIALIZER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let confirmed = match transaction_lock_snapshot(path) {
         Ok(snapshot) => snapshot,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
@@ -869,12 +878,35 @@ fn break_stale_transaction_lock(
     {
         return Ok(false);
     }
+
+    let mut stale_path = path.as_os_str().to_os_string();
+    stale_path.push(format!(
+        ".{}.{}.stale",
+        process::id(),
+        TRANSACTION_STALE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let stale_path = PathBuf::from(stale_path);
+    match fs::rename(path, &stale_path) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    }
+
+    // The canonical lock name is now free and this unique quarantine name is owned by the
+    // successful renamer, so cleanup cannot delete a replacement transaction lock.
     let removal = match confirmed.kind {
-        TransactionLockKind::File { .. } => fs::remove_file(path),
-        TransactionLockKind::EmptyDirectory => fs::remove_dir(path),
+        TransactionLockKind::File { .. } => fs::remove_file(&stale_path),
+        TransactionLockKind::EmptyDirectory => fs::remove_dir(&stale_path),
         TransactionLockKind::NonEmptyDirectory
         | TransactionLockKind::Redirected
-        | TransactionLockKind::Other => return Ok(false),
+        | TransactionLockKind::Other => unreachable!("unsupported lock kinds were rejected"),
     };
     match removal {
         Ok(()) => Ok(true),
@@ -978,7 +1010,8 @@ fn host_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1073,6 +1106,60 @@ mod tests {
             );
             let _ = fs::remove_dir_all(work);
         }
+    }
+
+    #[test]
+    fn concurrent_stale_lock_break_only_one_succeeds() {
+        let work = work("concurrent-stale-transaction-lock");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "crashed-pid").unwrap();
+        let stale_after = Duration::from_millis(50);
+        thread::sleep(Duration::from_millis(100));
+
+        let start = Arc::new(Barrier::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let owners = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let tx = tx.clone();
+                let start = Arc::clone(&start);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                handles.push(scope.spawn(move || {
+                    start.wait();
+                    let mut guard =
+                        acquire_transaction_lock(&tx, Duration::from_secs(2), stale_after).unwrap();
+                    let owner = guard.owner.clone();
+                    let entrants = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(entrants, Ordering::SeqCst);
+                    assert_eq!(entrants, 1, "transaction critical sections overlapped");
+                    assert_eq!(fs::read_to_string(&tx).unwrap(), owner);
+                    thread::sleep(Duration::from_millis(20));
+                    assert_eq!(
+                        fs::read_to_string(&tx).unwrap(),
+                        owner,
+                        "a concurrent stale breaker replaced the live lock"
+                    );
+                    assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    guard.release().unwrap();
+                    owner
+                }));
+            }
+            start.wait();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(owners.len(), 2);
+        assert_ne!(owners[0], owners[1]);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(!tx.exists());
+        let _ = fs::remove_dir_all(work);
     }
 
     #[test]
