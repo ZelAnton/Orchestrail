@@ -3,9 +3,11 @@
 //! Orchestra's historical control plane stores an `orchestra/lease@1` JSON record in that
 //! directory. During catch-up development Orchestrail must coexist with a running Orchestra
 //! process, so this implementation preserves the record shape and the same `state-tx.lock`
-//! CreateNew-file interlock. It also recognizes the directory lock written by older native builds.
-//! It does not invoke the PowerShell script and never recursively removes a lock directory: a
-//! foreign/corrupt lock remains an operator-visible refusal.
+//! CreateNew-file interlock. A persistent, kernel-locked lifecycle sidecar makes identity-check +
+//! create/rename/remove sequences indivisible across Orchestrail processes. It also recognizes the
+//! directory lock written by older native builds. It does not invoke the PowerShell script and
+//! never recursively removes a lock directory: a foreign/corrupt lock remains an operator-visible
+//! refusal.
 
 use std::env;
 use std::fmt;
@@ -30,13 +32,13 @@ const LOCK_DIRECTORY: &str = "orchestrator.lock";
 const LEASE_FILE: &str = "lease.json";
 const STAGING_FILE: &str = "lease.json.tmp";
 const TRANSACTION_LOCK: &str = "state-tx.lock";
+const TRANSACTION_LIFECYCLE_LOCK: &str = ".state-tx.lifecycle.lock";
 const MAX_LEASE_BYTES: u64 = 64 * 1024;
 const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSACTION_LOCK_RETRY: Duration = Duration::from_millis(50);
 static TRANSACTION_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_STALE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static TRANSACTION_STALE_BREAK_SERIALIZER: Mutex<()> = Mutex::new(());
 
 /// The interoperable lease document written by both control planes. Numeric time enters the
 /// native API explicitly and is rendered in the established UTC ISO form at the file boundary.
@@ -720,10 +722,111 @@ struct TransactionLockSnapshot {
     age_ms: Option<u128>,
 }
 
+impl TransactionLockSnapshot {
+    fn same_identity_as(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.stamp == other.stamp
+    }
+}
+
+/// Cross-process serialization for the complete `state-tx.lock` lifecycle.
+///
+/// The sidecar is persistent: Orchestrail never renames or removes it, so acquiring its operating
+/// system file lock cannot recurse into another stale-lock protocol. Every CreateNew, final stale
+/// identity check plus rename, and owner check plus removal requires this guard. `flock` and
+/// `LockFileEx` are released by the kernel when a process exits, which gives the whole lifecycle
+/// one filesystem-backed critical section shared by threads and independent processes.
+struct TransactionLifecycleGuard {
+    _file: fs::File,
+}
+
+fn try_acquire_transaction_lifecycle(
+    transaction_path: &Path,
+) -> io::Result<Option<TransactionLifecycleGuard>> {
+    let parent = transaction_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "state transaction lock has no parent: {}",
+                transaction_path.display()
+            ),
+        )
+    })?;
+    let lifecycle_path = parent.join(TRANSACTION_LIFECYCLE_LOCK);
+    let file = work_fs::open_plain_file_read_write(&lifecycle_path, true)?;
+    if try_lock_transaction_lifecycle_file(&file)? {
+        Ok(Some(TransactionLifecycleGuard { _file: file }))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_transaction_lifecycle_file(file: &fs::File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `file` owns a live descriptor for the duration of this call. `flock` neither takes
+    // ownership of it nor dereferences any Rust memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+    {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_transaction_lifecycle_file(file: &fs::File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: the `File` keeps its handle live, `overlapped` is a valid writable structure for the
+    // synchronous call, and LockFileEx borrows rather than owns both values.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_lock_transaction_lifecycle_file(_file: &fs::File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process transaction lifecycle locks are unavailable on this platform",
+    ))
+}
+
 struct TransactionLockGuard {
     path: PathBuf,
     owner: String,
     armed: bool,
+    lifecycle: Option<TransactionLifecycleGuard>,
 }
 
 impl TransactionLockGuard {
@@ -731,11 +834,15 @@ impl TransactionLockGuard {
         if !self.armed {
             return Ok(());
         }
+        let lifecycle = self.lifecycle.as_ref().ok_or_else(|| {
+            io::Error::other("armed state transaction lock has no lifecycle guard")
+        })?;
         let snapshot = transaction_lock_snapshot(&self.path)?;
         match snapshot.kind {
             TransactionLockKind::File { owner } if owner == self.owner => {
-                fs::remove_file(&self.path)?;
+                remove_owned_transaction_lock(&self.path, lifecycle)?;
                 self.armed = false;
+                self.lifecycle.take();
                 Ok(())
             }
             kind => Err(io::Error::new(
@@ -767,19 +874,59 @@ fn acquire_transaction_lock(
     );
     let deadline = Instant::now() + timeout;
     loop {
-        if create_transaction_lock(path, &owner)? {
+        let lifecycle = match try_acquire_transaction_lifecycle(path)? {
+            Some(lifecycle) => lifecycle,
+            None => {
+                if Instant::now() >= deadline {
+                    match transaction_lock_snapshot(path) {
+                        Ok(snapshot) => {
+                            return Err(LeaseError::Busy {
+                                age_ms: snapshot.age_ms,
+                                kind: snapshot.kind.describe(),
+                            });
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            // The releasing owner removes the canonical entry before dropping the
+                            // lifecycle guard. Report the still-held cross-process boundary rather
+                            // than misclassifying that bounded hand-off as an I/O failure.
+                            return Err(LeaseError::Busy {
+                                age_ms: None,
+                                kind: "cross-process lifecycle transition".into(),
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                thread::sleep(
+                    TRANSACTION_LOCK_RETRY.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                continue;
+            }
+        };
+        if create_transaction_lock(path, &owner, &lifecycle)? {
             return Ok(TransactionLockGuard {
                 path: path.to_path_buf(),
                 owner,
                 armed: true,
+                lifecycle: Some(lifecycle),
             });
         }
         let snapshot = match transaction_lock_snapshot(path) {
             Ok(snapshot) => snapshot,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if create_transaction_lock(path, &owner, &lifecycle)? {
+                    return Ok(TransactionLockGuard {
+                        path: path.to_path_buf(),
+                        owner,
+                        armed: true,
+                        lifecycle: Some(lifecycle),
+                    });
+                }
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
-        if break_stale_transaction_lock(path, &snapshot, stale_after)? {
+        if break_stale_transaction_lock(path, &snapshot, stale_after, &lifecycle)? {
             continue;
         }
         if Instant::now() >= deadline {
@@ -794,7 +941,11 @@ fn acquire_transaction_lock(
     }
 }
 
-fn create_transaction_lock(path: &Path, owner: &str) -> io::Result<bool> {
+fn create_transaction_lock(
+    path: &Path,
+    owner: &str,
+    _lifecycle: &TransactionLifecycleGuard,
+) -> io::Result<bool> {
     let mut file = match work_fs::create_new_plain_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
@@ -817,9 +968,23 @@ fn create_transaction_lock(path: &Path, owner: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+fn remove_owned_transaction_lock(
+    path: &Path,
+    _lifecycle: &TransactionLifecycleGuard,
+) -> io::Result<()> {
+    // The ownership read in `release` and this removal are one logical filesystem transaction:
+    // every code path capable of renaming, creating, or removing the canonical name needs the
+    // same cross-process lifecycle guard. There is no pathname lookup between a second ownership
+    // check and deletion that could accidentally authorize a replacement lock.
+    fs::remove_file(path)
+}
+
 fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot> {
     let metadata = fs::symlink_metadata(path)?;
-    let stamp = metadata.created().or_else(|_| metadata.modified()).ok();
+    // NTFS file-name tunneling may copy the previous occupant's creation time to a newly created
+    // lock at the same path. Last-write time belongs to the new contents and is the only safe age
+    // source for stale-lock recovery.
+    let stamp = metadata.modified().ok();
     let age_ms = stamp
         .and_then(|stamp| SystemTime::now().duration_since(stamp).ok())
         .map(|age| age.as_millis());
@@ -851,6 +1016,7 @@ fn break_stale_transaction_lock(
     path: &Path,
     decided: &TransactionLockSnapshot,
     stale_after: Duration,
+    _lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<bool> {
     if decided
         .age_ms
@@ -858,25 +1024,27 @@ fn break_stale_transaction_lock(
     {
         return Ok(false);
     }
-    // `rename` is atomic, but it is not an identity-conditional operation: a delayed same-process
-    // contender could otherwise rename a fresh replacement at `path`. Serialize the final
-    // snapshot and rename so every contender revalidates after the preceding rename has finished.
-    // Poisoning cannot make filesystem recovery safer, so retain the mutex and revalidate.
-    let _break_guard = TRANSACTION_STALE_BREAK_SERIALIZER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The lifecycle guard makes this final content/metadata check and the following atomic rename
+    // one identity-conditional operation with respect to every Orchestrail process. Create and
+    // release take the same OS file lock, so the canonical name cannot be replaced in this gap.
     let confirmed = match transaction_lock_snapshot(path) {
         Ok(snapshot) => snapshot,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error),
     };
-    if decided.kind != confirmed.kind
-        || decided.stamp != confirmed.stamp
+    if !decided.same_identity_as(&confirmed)
         || confirmed
             .age_ms
             .is_none_or(|age_ms| age_ms <= stale_after.as_millis())
     {
         return Ok(false);
+    }
+
+    match confirmed.kind {
+        TransactionLockKind::File { .. } | TransactionLockKind::EmptyDirectory => {}
+        TransactionLockKind::NonEmptyDirectory
+        | TransactionLockKind::Redirected
+        | TransactionLockKind::Other => return Ok(false),
     }
 
     let mut stale_path = path.as_os_str().to_os_string();
@@ -899,6 +1067,17 @@ fn break_stale_transaction_lock(
         Err(error) => return Err(error),
     }
 
+    let quarantined = transaction_lock_snapshot(&stale_path)?;
+    if !confirmed.same_identity_as(&quarantined) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "state transaction lock identity changed while quarantining {}",
+                path.display()
+            ),
+        ));
+    }
+
     // The canonical lock name is now free and this unique quarantine name is owned by the
     // successful renamer, so cleanup cannot delete a replacement transaction lock.
     let removal = match confirmed.kind {
@@ -906,7 +1085,7 @@ fn break_stale_transaction_lock(
         TransactionLockKind::EmptyDirectory => fs::remove_dir(&stale_path),
         TransactionLockKind::NonEmptyDirectory
         | TransactionLockKind::Redirected
-        | TransactionLockKind::Other => unreachable!("unsupported lock kinds were rejected"),
+        | TransactionLockKind::Other => return Ok(false),
     };
     match removal {
         Ok(()) => Ok(true),
@@ -1109,6 +1288,82 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_stale_lock_kind_is_not_renamed_or_panicked() {
+        let work = work("unsupported-stale-transaction-lock");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::create_dir(&tx).unwrap();
+        fs::write(tx.join("foreign-entry"), "do not move").unwrap();
+        thread::sleep(Duration::from_millis(2));
+
+        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+            .unwrap()
+            .expect("test owns lifecycle lock");
+        let decided = transaction_lock_snapshot(&tx).unwrap();
+        assert!(matches!(
+            decided.kind,
+            TransactionLockKind::NonEmptyDirectory
+        ));
+        assert!(!break_stale_transaction_lock(&tx, &decided, Duration::ZERO, &lifecycle).unwrap());
+        assert_eq!(
+            fs::read_to_string(tx.join("foreign-entry")).unwrap(),
+            "do not move"
+        );
+        assert!(
+            fs::read_dir(&work).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".stale")
+            }),
+            "unsupported lock must not be displaced into quarantine"
+        );
+        drop(lifecycle);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn old_creation_time_does_not_make_a_fresh_transaction_lock_stale() {
+        use std::os::windows::fs::FileTimesExt;
+
+        let work = work("ntfs-tunneled-transaction-lock");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "fresh-owner").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&tx).unwrap();
+        let now = SystemTime::now();
+        let old_creation = now - Duration::from_secs(10 * 60);
+        file.set_times(
+            fs::FileTimes::new()
+                .set_created(old_creation)
+                .set_modified(now),
+        )
+        .unwrap();
+
+        let snapshot = transaction_lock_snapshot(&tx).unwrap();
+        assert!(
+            snapshot.age_ms.is_some_and(|age| age < 60_000),
+            "staleness must use the fresh last-write time, not the tunneled creation time"
+        );
+        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+            .unwrap()
+            .expect("test owns lifecycle lock");
+        assert!(
+            !break_stale_transaction_lock(&tx, &snapshot, TRANSACTION_LOCK_STALE_AFTER, &lifecycle)
+                .unwrap()
+        );
+        assert_eq!(fs::read_to_string(&tx).unwrap(), "fresh-owner");
+        drop(lifecycle);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    // Deterministically scheduling the vulnerable rename/recreate window across two child
+    // processes is not a hermetic unit-test boundary. The production guard is nevertheless
+    // cross-process by construction: both this thread test and independent processes contend on
+    // the same kernel `flock`/`LockFileEx`, never on Rust process memory.
+    #[test]
     fn concurrent_stale_lock_break_only_one_succeeds() {
         let work = work("concurrent-stale-transaction-lock");
         fs::create_dir_all(&work).unwrap();
@@ -1172,6 +1427,11 @@ mod tests {
             path: tx.clone(),
             owner: "123:old".into(),
             armed: true,
+            lifecycle: Some(
+                try_acquire_transaction_lifecycle(&tx)
+                    .unwrap()
+                    .expect("test owns lifecycle lock"),
+            ),
         };
         fs::remove_file(&tx).unwrap();
         fs::write(&tx, "123:new").unwrap();
