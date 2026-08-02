@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Synthetic, filesystem-backed fixtures shared by the Criterion benches.
 //!
 //! Bench targets cannot import `engine/tests/support` as a crate, so the small generators live

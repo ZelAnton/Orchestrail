@@ -29,13 +29,15 @@ fn published_task(index: u64) -> TaskRuntime {
 }
 
 fn projector_fold(c: &mut Criterion) {
-    let mut before = ProcessorState::default();
-    before.tasks = (0..STREAM_TASK_COUNT)
-        .map(|index| {
-            let task = published_task(index);
-            (task.id.clone(), task)
-        })
-        .collect();
+    let before = ProcessorState {
+        tasks: (0..STREAM_TASK_COUNT)
+            .map(|index| {
+                let task = published_task(index);
+                (task.id.clone(), task)
+            })
+            .collect(),
+        ..Default::default()
+    };
     let mut after = before.clone();
     for task in after.tasks.values_mut() {
         task.phase = TaskPhase::Done;
