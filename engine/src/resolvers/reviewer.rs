@@ -124,6 +124,123 @@ pub fn reelect_reviewer(
     }
 }
 
+/// The stable name of the single review dimension the current whole-diff path runs: one reviewer
+/// that judges the entire range across every dimension at once (correctness, tests, readability,
+/// security, …). Until an upstream multi-dimension prompt roster exists (the reviewer prompts live
+/// in the orchestra checkout, not this repo — see task T-018), this is the only dimension there is,
+/// so a roster built here is always this one element and stays behavior-identical to the historical
+/// single [`ReviewerRoute`].
+pub const WHOLE_DIFF_DIMENSION: &str = "whole-diff";
+
+/// One review dimension of a parallel roster: a stable dimension name paired with the concrete
+/// [`ReviewerRoute`] that dispatches it. The name is an OPAQUE key (not a closed enum) precisely
+/// because the real dimension vocabulary — functionality/test/readability/structure/security/… —
+/// is owned by the upstream reviewer-prompt roster, not by this engine; the engine only needs a
+/// stable key to fan out on and to remember per dimension across rounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDimension {
+    pub name: String,
+    pub route: ReviewerRoute,
+}
+
+impl ReviewDimension {
+    pub fn new(name: impl Into<String>, route: ReviewerRoute) -> Self {
+        Self {
+            name: name.into(),
+            route,
+        }
+    }
+}
+
+/// A roster of review dimensions dispatched IN PARALLEL for one review cycle (orca's
+/// `ReviewerPrompts.all` run through one fan-out). It is the type this task asked for — "a set of
+/// parallel-dispatchable review dimensions" — added ALONGSIDE the widely-matched [`ReviewerRoute`]
+/// rather than by rewriting that enum in place (KB K-015: a new type is far cheaper than reshaping
+/// a type matched all over the review pipeline; `ReviewerRoute` keeps its `Copy` and every existing
+/// match site is untouched).
+///
+/// The current engine builds a ONE-element roster (`WHOLE_DIFF_DIMENSION`) whose sole route is
+/// exactly today's [`route_reviewer`] result, so default behavior is unchanged; the multi-element
+/// shape is the infrastructure a future upstream prompt roster plugs into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerRoster {
+    pub dimensions: Vec<ReviewDimension>,
+}
+
+impl ReviewerRoster {
+    /// The single whole-diff dimension carrying `route` — the regression-parity roster for the
+    /// current single-reviewer path.
+    pub fn single(route: ReviewerRoute) -> Self {
+        Self {
+            dimensions: vec![ReviewDimension::new(WHOLE_DIFF_DIMENSION, route)],
+        }
+    }
+
+    /// The dimension names, in dispatch order — the coordinate the durable per-dimension "reported
+    /// findings last round" set (`TaskRuntime::dimensions_with_findings_last_round`) is keyed on.
+    pub fn dimension_names(&self) -> impl Iterator<Item = &str> {
+        self.dimensions
+            .iter()
+            .map(|dimension| dimension.name.as_str())
+    }
+}
+
+/// Build the parallel review roster for one entry into review. It is a regression-parity identity
+/// with [`route_reviewer`]: today it wraps that single route as a one-element `whole-diff` roster,
+/// so `CODEX_REVIEWER=off` and every already-covered `fast`/`fast+std`/`deep` case dispatch exactly
+/// the same one reviewer they do now. When an upstream prompt roster arrives, this is the seam that
+/// grows more dimensions without touching [`ReviewerRoute`] or its match sites.
+pub fn route_reviewer_roster(inp: &ReviewerRouteInput) -> ReviewerRoster {
+    ReviewerRoster::single(route_reviewer(inp))
+}
+
+/// Re-elect the parallel review roster from the current `Реализовано:` history (phase 2.8) — the
+/// roster analog of [`reelect_reviewer`], and a regression-parity identity with it: it wraps
+/// `reelect_reviewer`'s single route as a one-element `whole-diff` roster.
+pub fn reelect_reviewer_roster(
+    codex_reviewer: CodexReviewer,
+    base: BaseReviewer,
+    level: Level,
+    impl_history: &[ImplBy],
+) -> ReviewerRoster {
+    ReviewerRoster::single(reelect_reviewer(codex_reviewer, base, level, impl_history))
+}
+
+/// Narrow a review roster to just the dimensions that reported findings last round — orca's
+/// `ReviewerSelector.onlyPreviouslyReporting` selective-repeat, which spends model calls only on
+/// dimensions still "talking" and skips the silent ones on a REPEAT round.
+///
+/// Two review-authority guards keep it fail-OPEN (an absent/empty signal must run MORE review, not
+/// silently skip it — a skipped review is an un-audited merge):
+/// * `previous_round` empty — no per-dimension finding signal at all, including a pre-T-018
+///   checkpoint whose `TaskRuntime::dimensions_with_findings_last_round` defaults to empty — runs
+///   the FULL roster.
+/// * every listed reporter filtered out (none is still an eligible dimension) — runs the FULL
+///   roster rather than an empty one (orca's "picker returned empty though eligible reviewers
+///   exist → run them all, don't skip review" defense).
+///
+/// The first round always runs the full roster; selective repeat applies from the second round on.
+pub fn narrow_roster_to_previously_reporting(
+    roster: &ReviewerRoster,
+    previous_round: &[String],
+) -> ReviewerRoster {
+    if previous_round.is_empty() {
+        return roster.clone();
+    }
+    let narrowed: Vec<ReviewDimension> = roster
+        .dimensions
+        .iter()
+        .filter(|dimension| previous_round.iter().any(|name| name == &dimension.name))
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        return roster.clone();
+    }
+    ReviewerRoster {
+        dimensions: narrowed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +411,124 @@ mod tests {
                 &[ImplBy::Claude]
             ),
             ReviewerRoute::Augment(BaseReviewer::Reviewer)
+        );
+    }
+
+    /// Regression parity (criterion 7b): the roster builder yields exactly ONE `whole-diff`
+    /// dimension whose route is the current `route_reviewer` value, in EVERY already-covered case
+    /// (flag × level × author). So swapping the single route for a roster cannot change which one
+    /// reviewer runs today.
+    #[test]
+    fn roster_is_the_single_route_in_every_covered_case() {
+        use BaseReviewer::*;
+        use CodexReviewer::*;
+        use ImplBy::*;
+        use Level::*;
+        let base_of = |l: Level| {
+            if l == CoderFast {
+                ReviewerStd
+            } else {
+                Reviewer
+            }
+        };
+        for flag in [Off, Fast, FastStd, Deep] {
+            for level in [CoderFast, Coder, CoderDeep] {
+                for author in [Claude, Codex] {
+                    let input = inp(flag, base_of(level), level, author);
+                    let roster = route_reviewer_roster(&input);
+                    assert_eq!(
+                        roster.dimensions.len(),
+                        1,
+                        "{flag:?} {} {author:?}",
+                        level.as_str()
+                    );
+                    let only = &roster.dimensions[0];
+                    assert_eq!(only.name, WHOLE_DIFF_DIMENSION);
+                    assert_eq!(
+                        only.route,
+                        route_reviewer(&input),
+                        "{flag:?} {} {author:?}",
+                        level.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The re-election roster is likewise a one-element `whole-diff` identity with `reelect_reviewer`
+    /// across the whole phase-2.8 history matrix, including the empty (independence-safe) history.
+    #[test]
+    fn reelect_roster_matches_single_reelect() {
+        use ImplBy::*;
+        let base = BaseReviewer::Reviewer;
+        let level = Level::Coder;
+        let flag = CodexReviewer::FastStd;
+        for history in [
+            Vec::new(),
+            vec![Claude],
+            vec![Codex],
+            vec![Claude, Codex],
+            vec![Claude, Codex, Claude],
+        ] {
+            let roster = reelect_reviewer_roster(flag, base, level, &history);
+            assert_eq!(roster.dimensions.len(), 1, "{history:?}");
+            assert_eq!(roster.dimensions[0].name, WHOLE_DIFF_DIMENSION);
+            assert_eq!(
+                roster.dimensions[0].route,
+                reelect_reviewer(flag, base, level, &history),
+                "{history:?}"
+            );
+        }
+    }
+
+    /// A synthetic multi-dimension roster, standing in for a future upstream prompt roster, so the
+    /// selective-repeat narrowing can be exercised beyond the current one-element case.
+    fn multi_dimension_roster() -> ReviewerRoster {
+        ReviewerRoster {
+            dimensions: vec![
+                ReviewDimension::new(
+                    "functionality",
+                    ReviewerRoute::Claude(BaseReviewer::Reviewer),
+                ),
+                ReviewDimension::new("security", ReviewerRoute::CodexFull),
+                ReviewDimension::new(
+                    "performance",
+                    ReviewerRoute::Augment(BaseReviewer::Reviewer),
+                ),
+            ],
+        }
+    }
+
+    /// A repeat round keeps only last round's reporters (orca `onlyPreviouslyReporting`), preserving
+    /// roster order and dropping the silent dimensions.
+    #[test]
+    fn selective_repeat_keeps_only_previous_reporters() {
+        let roster = multi_dimension_roster();
+        let previous = vec!["functionality".to_string(), "performance".to_string()];
+        let narrowed = narrow_roster_to_previously_reporting(&roster, &previous);
+        assert_eq!(
+            narrowed.dimension_names().collect::<Vec<_>>(),
+            ["functionality", "performance"]
+        );
+    }
+
+    /// No recorded per-dimension signal (empty set — including a pre-T-018 checkpoint's defaulted
+    /// field) fails OPEN to the FULL roster, never to an empty (skipped) review.
+    #[test]
+    fn empty_previous_round_runs_the_full_roster() {
+        let roster = multi_dimension_roster();
+        assert_eq!(narrow_roster_to_previously_reporting(&roster, &[]), roster);
+    }
+
+    /// When none of last round's reporters is still an eligible dimension, the guard runs the whole
+    /// roster rather than skipping review entirely.
+    #[test]
+    fn a_previous_set_that_filters_to_nothing_runs_the_full_roster() {
+        let roster = multi_dimension_roster();
+        let previous = vec!["readability".to_string(), "structure".to_string()];
+        assert_eq!(
+            narrow_roster_to_previously_reporting(&roster, &previous),
+            roster
         );
     }
 }

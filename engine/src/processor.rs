@@ -300,6 +300,22 @@ pub struct TaskRuntime {
     ///   nothing to validate against — it never fabricates membership.
     #[serde(default)]
     pub pending_fix_open_finding_ids: Option<Vec<String>>,
+    /// The review dimensions (`resolvers::reviewer::ReviewerRoster`) that reported at least one
+    /// finding in the MOST RECENT completed review round, by dimension name. It is the durable,
+    /// per-task coordinate for the selective-repeat optimization (orca's
+    /// `ReviewerSelector.onlyPreviouslyReporting`): a repeat round may narrow the roster to just
+    /// these still-"talking" dimensions via `reviewer::narrow_roster_to_previously_reporting`,
+    /// skipping the ones that were silent last time. It is additive per-task state, exactly like
+    /// `review_signatures` above.
+    ///
+    /// `#[serde(default)]` (empty) so a checkpoint written before this field — every pre-T-018
+    /// checkpoint — deserializes without panic and without fabricating a dimension. An empty set is
+    /// read as "no prior per-dimension finding signal recorded"; on the review-authority side that
+    /// degrades fail-OPEN — the narrow helper then runs the FULL eligible roster rather than
+    /// silently narrowing review to nothing (a skipped review is an un-audited merge), the same
+    /// safe-path degradation the adjacent `Option` fields take when their coordinate is absent.
+    #[serde(default)]
+    pub dimensions_with_findings_last_round: Vec<String>,
     pub implementation_author: Option<String>,
     /// The last committed tip that a reviewer completed before the current `review_sha` was
     /// created. `None` identifies the first full review from the immutable cohort base.  It is
@@ -342,6 +358,7 @@ impl TaskRuntime {
             review_signatures: Vec::new(),
             pending_fix_open_findings: None,
             pending_fix_open_finding_ids: None,
+            dimensions_with_findings_last_round: Vec::new(),
             implementation_author: None,
             previous_review_sha: None,
             review_sha: None,
@@ -7579,6 +7596,30 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_written_before_per_dimension_findings_still_loads() {
+        // The durable per-dimension "reported findings last round" set round-trips while present …
+        let mut current = TaskRuntime::new(&candidate("T-1", "engine/**"), 1);
+        current.dimensions_with_findings_last_round = vec!["security".into(), "performance".into()];
+        let json = serde_json::to_value(&current).unwrap();
+        let round_tripped: TaskRuntime = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            round_tripped.dimensions_with_findings_last_round,
+            vec!["security".to_string(), "performance".to_string()]
+        );
+
+        // … and a checkpoint written before the field (every pre-T-018 checkpoint) loads with an
+        // empty, fail-open default rather than panicking or fabricating a dimension.
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("dimensions_with_findings_last_round")
+            .expect("the field is serialized for a current task");
+        let task: TaskRuntime = serde_json::from_value(legacy).unwrap();
+        assert!(task.dimensions_with_findings_last_round.is_empty());
+    }
+
+    #[test]
     fn checkpoint_written_before_durable_sessions_still_loads() {
         // Exactly the shape an older engine persisted: every field it knew, and no
         // `leaf_sessions`. It must deserialize into "no known conversation", which is the
@@ -7873,6 +7914,7 @@ mod tests {
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
                 pending_fix_open_finding_ids: None,
+                dimensions_with_findings_last_round: Vec::new(),
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: None,

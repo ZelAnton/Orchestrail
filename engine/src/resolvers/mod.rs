@@ -58,7 +58,9 @@ pub use cycles::{
 };
 pub use gate::{ReviewGate, integration_gate, review_gate};
 pub use reviewer::{
-    CodexReviewer, ReviewerRoute, ReviewerRouteInput, reelect_reviewer, route_reviewer,
+    CodexReviewer, ReviewDimension, ReviewerRoster, ReviewerRoute, ReviewerRouteInput,
+    WHOLE_DIFF_DIMENSION, narrow_roster_to_previously_reporting, reelect_reviewer,
+    reelect_reviewer_roster, route_reviewer, route_reviewer_roster,
 };
-pub use tiering::base_reviewer;
+pub use tiering::{base_reviewer, base_reviewers_for_dimensions};
 pub use vocab::{BaseReviewer, ImplBy, Level, Risk, last_impl, parse_impl_history};

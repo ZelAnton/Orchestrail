@@ -592,6 +592,7 @@ pub fn import_closed_ready_cohort(
                 // `ReviewOutcome::Findings` -> `LeafOutcome::CompletedWithWontFix` pairing.
                 pending_fix_open_findings: None,
                 pending_fix_open_finding_ids: None,
+                dimensions_with_findings_last_round: Vec::new(),
                 implementation_author: descriptor.implementation_authors.last().cloned(),
                 previous_review_sha: None,
                 review_sha,
@@ -985,6 +986,7 @@ pub fn import_active_cohort(
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
                 pending_fix_open_finding_ids: None,
+                dimensions_with_findings_last_round: Vec::new(),
                 implementation_author,
                 previous_review_sha,
                 review_sha,
