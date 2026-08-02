@@ -1242,25 +1242,32 @@ fn map_plain_read_error(
     maximum_bytes: u64,
     error: io::Error,
 ) -> InboxError {
-    if error.kind() != io::ErrorKind::InvalidData {
-        return InboxError::Io(error);
-    }
-    let diagnostic = error.to_string();
-    if diagnostic.starts_with("control-plane artifact grew beyond") {
-        InboxError::Malformed(format!(
-            "{label} grew beyond the {maximum_bytes}-byte limit: {}",
-            path.display()
-        ))
-    } else if diagnostic.starts_with("control-plane artifact exceeds") {
-        InboxError::Malformed(format!(
+    match work_fs::plain_read_violation(&error) {
+        Some(work_fs::PlainReadViolation::GrewWhileReading { .. }) => {
+            InboxError::Malformed(format!(
+                "{label} grew beyond the {maximum_bytes}-byte limit: {}",
+                path.display()
+            ))
+        }
+        Some(work_fs::PlainReadViolation::Oversize { .. }) => InboxError::Malformed(format!(
             "{label} exceeds the {maximum_bytes}-byte limit: {}",
             path.display()
-        ))
-    } else {
-        InboxError::Malformed(format!(
+        )),
+        Some(work_fs::PlainReadViolation::NotPlain { .. }) => InboxError::Malformed(format!(
             "inbox path is not a plain file: {}",
             path.display()
-        ))
+        )),
+        Some(work_fs::PlainReadViolation::ParentNotPlain { path: directory }) => {
+            InboxError::Malformed(format!(
+                "inbox path is not a plain directory: {}",
+                directory.display()
+            ))
+        }
+        None if error.kind() == io::ErrorKind::InvalidData => InboxError::Malformed(format!(
+            "inbox path is not a plain file: {}",
+            path.display()
+        )),
+        None => InboxError::Io(error),
     }
 }
 
@@ -1476,10 +1483,13 @@ mod tests {
     impl Root {
         fn new() -> Self {
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "orchestrail-inbox-{}-{sequence}",
-                std::process::id()
-            ));
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target/test-temp")
+                .join(format!(
+                    "orchestrail-inbox-{}-{sequence}",
+                    std::process::id()
+                ));
             fs::create_dir_all(&path).unwrap();
             let path = crate::dependency_graph::canonical_project_root(&path).unwrap();
             Self { path }
@@ -1541,6 +1551,66 @@ mod tests {
                 .to_string(),
             );
         }
+    }
+
+    #[cfg(windows)]
+    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
+        use std::process::{Command, Stdio};
+
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(1_314) => {
+                let parent = target.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no parent")
+                })?;
+                let relative_link = link.strip_prefix(parent).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "test junction paths do not share a parent",
+                    )
+                })?;
+                let target_name = target.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no name")
+                })?;
+                let command = format!(
+                    "mklink /j {} {}",
+                    relative_link.to_string_lossy().replace('/', "\\"),
+                    target_name.to_string_lossy()
+                );
+                let output = Command::new("cmd.exe")
+                    .args(["/d", "/c", &command])
+                    .current_dir(parent)
+                    .stdin(Stdio::null())
+                    .output()?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "failed to create test junction {} -> {}: stdout={} stderr={}",
+                        link.display(),
+                        target.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(path: &Path) -> io::Result<()> {
+        fs::remove_dir(path)
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
     }
 
     #[test]
@@ -1659,10 +1729,120 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_redirected_inbox_is_not_silently_ignored() {
+    fn malformed_inbox_is_not_silently_ignored() {
         let root = Root::new();
         root.write(".inbox/messages/msg-00000001.json", "not json");
         assert!(matches!(inspect(&root.path), Err(InboxError::Malformed(_))));
+    }
+
+    #[test]
+    fn redirected_inbox_file_fails_closed_without_reading_the_target() {
+        let root = Root::new();
+        let id = "msg-00000001";
+        root.message(id, "new", "none", &[]);
+        let message = root.path.join(format!(".inbox/messages/{id}.json"));
+        fs::remove_file(&message).unwrap();
+        let external = root.path.with_extension("external-message");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, "external sentinel\n").unwrap();
+        symlink_directory(&external, &message).unwrap();
+
+        let error = inspect(&root.path).unwrap_err();
+        assert!(matches!(
+            &error,
+            InboxError::Malformed(diagnostic)
+                if diagnostic.contains("not a plain file") && diagnostic.contains(id)
+        ));
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "external sentinel\n"
+        );
+
+        remove_directory_link(&message).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn redirected_messages_directory_fails_closed_without_reading_the_target() {
+        let root = Root::new();
+        root.message("msg-00000001", "new", "none", &[]);
+        let messages = root.path.join(".inbox").join("messages");
+        fs::remove_dir_all(&messages).unwrap();
+        let external = root.path.with_extension("external-messages");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("msg-00000002.json");
+        fs::write(&sentinel, "external sentinel\n").unwrap();
+        symlink_directory(&external, &messages).unwrap();
+
+        let error = inspect(&root.path).unwrap_err();
+        let InboxError::Malformed(diagnostic) = error else {
+            panic!("redirected messages directory returned {error}")
+        };
+        assert!(
+            diagnostic.contains("not a plain directory")
+                && diagnostic.contains(&messages.display().to_string()),
+            "unexpected redirect diagnostic: {diagnostic}"
+        );
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "external sentinel\n"
+        );
+
+        remove_directory_link(&messages).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn redirected_work_root_fails_closed_without_reading_provenance() {
+        let root = Root::new();
+        root.message("msg-00000001", "queued", "none", &["T-1"]);
+        let work = root.path.join(".work");
+        let external = root.path.with_extension("external-work");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("Tasks_Done.md");
+        fs::write(&sentinel, "## [T-1] external\n").unwrap();
+        symlink_directory(&external, &work).unwrap();
+
+        let error = actionable(&root.path).unwrap_err();
+        assert!(matches!(
+            &error,
+            InboxError::Malformed(diagnostic)
+                if diagnostic.contains("not a plain directory")
+                    && diagnostic.contains(&work.display().to_string())
+        ));
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "## [T-1] external\n"
+        );
+
+        remove_directory_link(&work).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn plain_read_mapping_distinguishes_size_file_and_parent_violations() {
+        let root = Root::new();
+        let oversized = root.path.join("oversized.txt");
+        fs::write(&oversized, "12345").unwrap();
+        let error = read_inbox_text(&oversized, "test artifact", 4).unwrap_err();
+        assert!(matches!(
+            &error,
+            InboxError::Malformed(diagnostic)
+                if diagnostic.contains("test artifact exceeds the 4-byte limit")
+        ));
+
+        let parent = root.path.join("not-a-directory");
+        fs::write(&parent, "plain file\n").unwrap();
+        let leaf = parent.join("task.md");
+        let error = read_optional_inbox_text(&root.path, &leaf).unwrap_err();
+        assert!(matches!(
+            &error,
+            InboxError::Malformed(diagnostic)
+                if diagnostic.contains("not a plain directory")
+                    && diagnostic.contains(&parent.display().to_string())
+                    && !diagnostic.contains(&leaf.display().to_string())
+        ));
     }
 
     #[test]

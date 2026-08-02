@@ -486,16 +486,21 @@ fn read_approval_text(path: &Path, initial_len: u64) -> Result<String> {
         ));
     }
     let bytes = work_fs::read_plain_bytes(path, MAX_APPROVAL_BYTES).map_err(|error| {
-        if error.kind() != io::ErrorKind::InvalidData {
-            return ApprovalError::Io(error);
-        }
-        let diagnostic = error.to_string();
-        if diagnostic.starts_with("control-plane artifact grew beyond") {
-            ApprovalError::Corrupt("approval artifact grew oversized".into())
-        } else if diagnostic.starts_with("control-plane artifact exceeds") {
-            ApprovalError::Corrupt("approval artifact is invalid or oversized".into())
-        } else {
-            ApprovalError::Corrupt("approval artifact was replaced while reading".into())
+        match work_fs::plain_read_violation(&error) {
+            Some(work_fs::PlainReadViolation::GrewWhileReading { .. }) => {
+                ApprovalError::Corrupt("approval artifact grew oversized".into())
+            }
+            Some(work_fs::PlainReadViolation::Oversize { .. }) => {
+                ApprovalError::Corrupt("approval artifact is invalid or oversized".into())
+            }
+            Some(
+                work_fs::PlainReadViolation::NotPlain { .. }
+                | work_fs::PlainReadViolation::ParentNotPlain { .. },
+            ) => ApprovalError::Corrupt("approval artifact was replaced while reading".into()),
+            None if error.kind() == io::ErrorKind::InvalidData => {
+                ApprovalError::Corrupt("approval artifact was replaced while reading".into())
+            }
+            None => ApprovalError::Io(error),
         }
     })?;
     String::from_utf8(bytes).map_err(|_| {
@@ -830,6 +835,20 @@ mod tests {
         assert!(matches!(
             store.load(&record.id),
             Err(ApprovalError::Corrupt(_))
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn approval_read_maps_the_typed_oversize_violation() {
+        let work = work();
+        let path = work.join("oversized.json");
+        fs::write(&path, vec![b' '; MAX_APPROVAL_BYTES as usize + 1]).unwrap();
+
+        assert!(matches!(
+            read_approval_text(&path, MAX_APPROVAL_BYTES),
+            Err(ApprovalError::Corrupt(diagnostic))
+                if diagnostic == "approval artifact is invalid or oversized"
         ));
         let _ = fs::remove_dir_all(work);
     }

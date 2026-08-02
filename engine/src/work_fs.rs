@@ -6,6 +6,7 @@
 //! therefore revalidates confinement after rename but otherwise relies on its rename semantics.
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -20,6 +21,57 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// an independent, weaker read policy.
 pub const MAX_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONTROL_DIRECTORY_ENTRIES: usize = 100_000;
+
+/// Stable classifications for confinement and size failures raised by plain-file readers.
+///
+/// Callers may downcast an [`io::Error`] with [`plain_read_violation`] instead of coupling their
+/// domain diagnostics to this module's human-readable messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlainReadViolation {
+    Oversize { path: PathBuf, max_bytes: u64 },
+    GrewWhileReading { path: PathBuf, max_bytes: u64 },
+    NotPlain { path: PathBuf },
+    ParentNotPlain { path: PathBuf },
+}
+
+impl fmt::Display for PlainReadViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Oversize { path, max_bytes } => write!(
+                formatter,
+                "control-plane artifact exceeds {max_bytes} bytes: {}",
+                path.display()
+            ),
+            Self::GrewWhileReading { path, max_bytes } => write!(
+                formatter,
+                "control-plane artifact grew beyond {max_bytes} bytes: {}",
+                path.display()
+            ),
+            Self::NotPlain { path } => write!(
+                formatter,
+                "control-plane path is not a plain regular file: {}",
+                path.display()
+            ),
+            Self::ParentNotPlain { path } => write!(
+                formatter,
+                "control-plane path is not a plain directory: {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlainReadViolation {}
+
+fn plain_read_error(violation: PlainReadViolation) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, violation)
+}
+
+pub(crate) fn plain_read_violation(error: &io::Error) -> Option<&PlainReadViolation> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<PlainReadViolation>())
+}
 
 /// Metadata used to invalidate a parsed control-plane artifact without reading it again.
 ///
@@ -91,13 +143,9 @@ pub(crate) fn require_plain_directory(path: &Path) -> io::Result<()> {
     if metadata.is_dir() && !redirected(&metadata) {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane path is not a plain directory: {}",
-                path.display()
-            ),
-        ))
+        Err(plain_read_error(PlainReadViolation::ParentNotPlain {
+            path: path.to_path_buf(),
+        }))
     }
 }
 
@@ -105,13 +153,9 @@ pub(crate) fn require_plain_file(path: &Path, metadata: &fs::Metadata) -> io::Re
     if metadata.is_file() && !redirected(metadata) {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane path is not a plain regular file: {}",
-                path.display()
-            ),
-        ))
+        Err(plain_read_error(PlainReadViolation::NotPlain {
+            path: path.to_path_buf(),
+        }))
     }
 }
 
@@ -198,24 +242,18 @@ pub(crate) fn create_new_plain_file(path: &Path) -> io::Result<File> {
 pub(crate) fn read_plain_bytes(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let mut file = open_existing_plain_file(path)?;
     if file.metadata()?.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane artifact exceeds {max_bytes} bytes: {}",
-                path.display()
-            ),
-        ));
+        return Err(plain_read_error(PlainReadViolation::Oversize {
+            path: path.to_path_buf(),
+            max_bytes,
+        }));
     }
     let mut bytes = Vec::new();
     (&mut file).take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane artifact grew beyond {max_bytes} bytes: {}",
-                path.display()
-            ),
-        ));
+        return Err(plain_read_error(PlainReadViolation::GrewWhileReading {
+            path: path.to_path_buf(),
+            max_bytes,
+        }));
     }
     require_plain_file(path, &fs::symlink_metadata(path)?)?;
     Ok(bytes)
@@ -383,13 +421,10 @@ pub fn optional_plain_file_stamp(
     };
     require_plain_file(path, &metadata)?;
     if metadata.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "control-plane artifact exceeds {max_bytes} bytes: {}",
-                path.display()
-            ),
-        ));
+        return Err(plain_read_error(PlainReadViolation::Oversize {
+            path: path.to_path_buf(),
+            max_bytes,
+        }));
     }
     let stamp = PlainFileStamp {
         len: metadata.len(),
@@ -597,7 +632,14 @@ mod tests {
             .expect("plain file has a cache stamp");
         assert_eq!(stamp.len(), 6);
         assert!(!stamp.is_empty());
-        assert!(read_optional_text(&work, &path, 4).is_err());
+        let error = read_optional_text(&work, &path, 4).unwrap_err();
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::Oversize {
+                path: violation_path,
+                max_bytes: 4
+            }) if violation_path == &path
+        ));
         assert!(optional_plain_file_stamp(&work, &path, 4).is_err());
         assert!(replace_file(&work, &path, b"too large", 4).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "state\n");
@@ -635,6 +677,10 @@ mod tests {
         let error = read_optional_text(&work, &directory, 32).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("plain regular file"));
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::NotPlain { path }) if path == &directory
+        ));
 
         let binary = directory.join("binary.md");
         fs::write(&binary, [0xff_u8, 0xfe]).unwrap();
@@ -648,6 +694,10 @@ mod tests {
         let error = read_optional_text(&work, &binary.join("leaf.md"), 32).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("plain directory"));
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::ParentNotPlain { path }) if path == &binary
+        ));
 
         let external = outside.join("outside.md");
         fs::write(&external, "outside\n").unwrap();
