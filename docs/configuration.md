@@ -93,11 +93,86 @@ disabled mode to `auto`, but never overrides an explicit
 | Key | Type and accepted forms | Default when absent | Meaning | Invalid or special behavior |
 | --- | --- | --- | --- | --- |
 | `PUSH` | `true/false` or `on/off` | `true` | Requests remote publication. `false` suppresses only the remote push; the local fast-forward of the selected primary branch still occurs and still passes path and branch policy. | Invalid boolean text rejects the configuration. A requested push becomes local-only when no publication remote is configured. |
-| `CI_WATCH` | `true/false` or `on/off` | `true` | Enables the post-push forge watcher. With required CI names, those exact contexts gate completion; without them, watching is best-effort. | Invalid boolean text rejects the configuration. No watcher runs for local-only publication. |
+| `CI_WATCH` | `true/false` or `on/off` | `true` | Enables the post-push forge watcher. With required CI names, those exact contexts gate completion; without them, watching is best-effort. The watcher polls whichever forge `FORGE` names. | Invalid boolean text rejects the configuration. No watcher runs for local-only publication. |
+| `FORGE` | `github`, `gitlab`, or `gitea` | `github` | Selects the typed forge client the CI watcher polls for the exact published commit. See [Forge selection](#forge-selection). | Any other value, including a differently cased spelling, rejects the configuration. The forge is never guessed from a remote URL. |
 | `PUBLISH_LINEAR_HISTORY` | `true/false` or `on/off` | `false` | Declares that publication must use a byte-identical, merge-free history. | **Current implementation divergence:** the parser recognizes `true`, but the native engine has no crash-safe typed linearizer and rejects the processor run before repository discovery or lease acquisition. `false` is the only runnable value today. |
 | `PUBLISH_CI_DEADLINE_SEC` | Positive unsigned integer, seconds | `1800` | Overall deadline supplied to published-CI watching. | Zero or malformed text rejects the configuration. |
 | `PUBLISH_CI_BACKOFF_SEC` | Positive unsigned integer, seconds | `30` | Delay between CI polling attempts. | Zero or malformed text rejects the configuration. |
 | `MAIN_BRANCH` | Optional non-empty string | Unset | Overrides the primary/base branch when no explicit CLI `--base` is supplied. Without either override, the typed VCS layer detects the trunk. | Empty is treated as unset. A value starting with `-` or containing NUL/CR/LF is rejected here; the typed VCS layer may apply stricter ref validation later. |
+
+### Forge selection
+
+`FORGE` names the typed client used to observe CI for the exact commit that was
+published. Every supported value polls a commit-SHA-bound endpoint, never a
+"latest run on the branch" listing, so a later push on the same branch can never
+be mistaken for the published commit's result:
+
+| `FORGE` | Client | Endpoint polled |
+| --- | --- | --- |
+| `github` | `vcs-github` (`gh`) | `repos/{owner}/{repo}/commits/<sha>/check-runs` |
+| `gitlab` | `vcs-gitlab` (`glab`) | `projects/:fullpath/repository/commits/<sha>/statuses` (newest first) |
+| `gitea` | `vcs-gitea` (`tea`) | `/repos/{owner}/{repo}/commits/<sha>/status` (latest status per context, newest first) |
+
+The forge is a configuration decision, not an inference: the engine does not
+derive it from a remote URL, because a mis-derived forge would poll the wrong
+API and surface only as a deadline-shaped degradation after publication was
+already attempted. An unrecognized `FORGE` rejects the run outright. Each
+request runs in the repository directory, so the client resolves the project
+from that repository's own remote, and each request is bounded by
+`PUBLISH_CI_BACKOFF_SEC` (never under 30 seconds).
+
+All three forges share one contract. A pass requires a positive terminal
+success for every selected check on the published commit. A response that could
+be a truncated page, a response describing a different commit, an absent
+required check, a state the engine does not recognize, an unavailable endpoint,
+and an exhausted `PUBLISH_CI_DEADLINE_SEC` are all fail-closed: with required
+check names they report unconfirmed required checks (which never dispatches a CI
+repair), and without them they degrade the best-effort observation. Only a
+proven red check reports a CI failure.
+
+Two forge-specific rules follow the forge's own semantics rather than inventing
+stricter ones:
+
+- **GitLab `allow_failure`.** A job GitLab itself treats as non-blocking is
+  ignored during best-effort watching, exactly as GitLab's pipeline status
+  ignores it. Naming that job in the required CI checks is an explicit operator
+  contract that overrides the hint, and a red result then fails the gate.
+- **GitLab `manual`.** A job waiting for a human is reported as pending, not as
+  a failure. It is not a red check any CI repair could fix, so it must not
+  dispatch one; the deadline turns it into an unconfirmed result instead. (This
+  differs from GitHub's `action_required`, which the GitHub adapter treats as a
+  failure.)
+
+Gitea's client (`tea`) is narrower than `gh`/`glab` and models no typed `api`
+method, so the adapter uses the crate's documented directory-bound raw argv
+escape hatch to invoke `tea api`. A `tea` build without that subcommand simply
+fails the request, which the watcher treats as an outage — never as a confirmed
+CI.
+
+**Gitea page completeness.** The three forges prove differently that the page
+they classified was the whole set, because they offer different evidence:
+GitHub reports a true `total_count`, GitLab has a fixed 100-entry page cap, and
+Gitea has neither — its `total_count` is the length of the page it just
+returned, and its page size is clamped to the instance's `[api]
+MAX_RESPONSE_ITEMS` setting (default 50). A page cut by that setting therefore
+looks complete in the body. Rather than assume a minimum server setting, the
+Gitea adapter asks for the page after the one it read: an empty next page proves
+completeness whatever the instance is configured to, and a non-empty one is
+reported as a possibly-truncated page and refused. The extra request is spent
+only on a snapshot that would otherwise pass — never while CI is pending, red,
+or unreachable — so a confirmed publication costs one additional call and a
+watch that never confirms costs none.
+
+The limit this leaves is explicit and fail-closed, and it matches GitLab's: a
+commit whose statuses do not fit one page — for Gitea more distinct check
+contexts than `min(50, MAX_RESPONSE_ITEMS)`, for GitLab more than 100 status
+entries — is never confirmed, and resolves as unconfirmed required checks or a
+degraded best-effort observation. Raising `MAX_RESPONSE_ITEMS` above the number
+of contexts a commit reports is what keeps such a Gitea repository confirmable.
+
+Unlike GitLab, no sort order is requested from Gitea: the combined-status route
+takes only `page` and `limit`, and the server already returns the newest status
+per context first, so a sort parameter would be silently ignored.
 
 ## Approval and quarantine
 

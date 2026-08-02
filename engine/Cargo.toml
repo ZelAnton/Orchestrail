@@ -36,6 +36,10 @@ vcs-git.workspace = true
 vcs-jj.workspace = true
 # Typed `gh api` client for commit-SHA-bound GitHub CI polling.
 vcs-github.workspace = true
+# Typed `glab api` / `tea api` clients for the commit-SHA-bound GitLab and Gitea CI polling
+# that the same publication gate performs when `FORGE` names one of them.
+vcs-gitlab.workspace = true
+vcs-gitea.workspace = true
 # A fresh v4 owner UUID prevents PID reuse from sharing authority with an interrupted lease;
 # deterministic event identities use the legacy contract's standard URL-namespace UUIDv5.
 uuid = { version = "1", features = ["v4", "v5"] }

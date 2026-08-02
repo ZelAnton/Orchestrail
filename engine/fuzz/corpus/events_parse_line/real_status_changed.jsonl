@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"evt-20260708T122747Z-30924","occurred_at":"2026-07-08T12:27:47Z","type":"task.status_changed","batch_id":"B-20260708T121913Z","task_id":"T-042","actor":{"kind":"agent","name":"processor"},"payload":{"from":"в работе","to":"на ревью"}}

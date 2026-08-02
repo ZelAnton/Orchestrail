@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","model":"sonnet","session_id":"11111111-2222-3333-4444-555555555555"}
+{"type":"assistant","message":{"type":"message","role":"assistant"}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":5,"result":"done: implemented T-1","session_id":"11111111-2222-3333-4444-555555555555","usage":{"input_tokens":1200,"output_tokens":450,"cache_read_input_tokens":300}}

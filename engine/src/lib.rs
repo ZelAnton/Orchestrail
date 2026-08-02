@@ -46,7 +46,10 @@
 //! checkpoint/effect ledger, control-plane transitions, typed VCS actions and ProcessKit-contained
 //! model leaves without invoking legacy scripts. It also has a durable local verification gate
 //! for the final reviewed integration tip immediately before publication. It is intentionally fail-closed for integrations
-//! that do not yet have a native port (for example non-GitHub forge CI polling).
+//! that do not yet have a native port. Publication CI polling itself is now typed for the three
+//! forges of the `vcs-*` family — GitHub, GitLab, and Gitea, selected by the `FORGE` key and
+//! polled SHA-bound through [`forge_ci`] — while any other `FORGE` value is rejected outright
+//! rather than published without an observed CI.
 //!
 //! [`run`] is the first module that *composes* all the layers above into a real control loop —
 //! but ONLY over a hermetic **sandbox** `.work` handed in as `--work <dir>` (task T-109): it takes
@@ -69,6 +72,7 @@ pub mod control;
 pub mod dependency_graph;
 pub mod events;
 pub mod execution;
+pub mod forge_ci;
 pub mod headless;
 pub mod inbox;
 pub mod jsonline;

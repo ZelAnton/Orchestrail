@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"usage-1","occurred_at":"2026-07-25T12:00:00Z","type":"usage.recorded","batch_id":"B-1","task_id":"_integration","actor":{"kind":"tool","name":"claude"},"payload":{"usage_availability":"unavailable"}}

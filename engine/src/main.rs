@@ -790,7 +790,12 @@ fn cmd_events(args: &[String]) {
     let mut reader = TailReader::new(&path);
     let poll_interval = Duration::from_millis(200);
     loop {
-        match reader.poll() {
+        let events = if follow {
+            reader.poll()
+        } else {
+            reader.poll_all()
+        };
+        match events {
             Ok(events) => {
                 for ev in events {
                     println!("{}", ev.to_json_line());
@@ -1916,6 +1921,7 @@ fn cmd_processor(args: &[String]) {
         external_config.knowledge_ttl_batches = config.knowledge_ttl_batches;
         external_config.knowledge_cap_per_area = config.knowledge_cap_per_area;
         external_config.ci_watch = config.ci_watch;
+        external_config.forge = config.forge;
         external_config.ci_deadline = Duration::from_secs(config.publish_ci_deadline_secs);
         external_config.ci_backoff = Duration::from_secs(config.publish_ci_backoff_secs);
         external_config.verification_mode = verification_mode;

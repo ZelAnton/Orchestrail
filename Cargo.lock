@@ -460,7 +460,9 @@ dependencies = [
  "vcs-core",
  "vcs-diff",
  "vcs-git",
+ "vcs-gitea",
  "vcs-github",
+ "vcs-gitlab",
  "vcs-jj",
 ]
 
@@ -1027,10 +1029,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "vcs-gitea"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "543e91db52b5a7722082fc30384c637f0db990001e5df6a92f276354da29f501"
+dependencies = [
+ "async-trait",
+ "processkit",
+ "serde",
+ "serde_json",
+ "vcs-cli-support",
+ "vcs-diff",
+]
+
+[[package]]
 name = "vcs-github"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20d71699addda8c70d0144e67b81b1a2f05113950a859fefda7a8ae90740b39b"
+dependencies = [
+ "async-trait",
+ "processkit",
+ "serde",
+ "serde_json",
+ "vcs-cli-support",
+ "vcs-diff",
+]
+
+[[package]]
+name = "vcs-gitlab"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e318bca0234a71ae4ca50612779a228525a9e726460f641a73a99b174d9712a"
 dependencies = [
  "async-trait",
  "processkit",

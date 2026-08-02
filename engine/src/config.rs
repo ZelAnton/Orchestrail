@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::codex::Sandbox;
 use crate::command_line::{parse_typed_argv, validate_direct_program};
+use crate::forge_ci::Forge;
 use crate::processor::{ProcessorConfig, ProcessorError};
 use crate::resolvers::{CodexCoder, CodexReviewer};
 use crate::telemetry::{DEFAULT_PRICING_EFFECTIVE_DATE, ModelPricing, PricingTable, UsdPerMillion};
@@ -27,6 +28,11 @@ pub struct EngineConfig {
     pub knowledge_cap_per_area: usize,
     pub push: bool,
     pub ci_watch: bool,
+    /// Which typed forge client the publication CI gate polls. Absent means `github`, which is
+    /// the forge the gate has always polled, so an existing `config.md` keeps its behaviour.
+    /// A value outside the three typed forges rejects the configuration instead of letting a
+    /// forge this engine cannot poll reach the publication gate.
+    pub forge: Forge,
     /// Require a byte-identical, merge-free publication history.  The current native port must
     /// recognise this legacy key even while its typed VCS surface cannot yet perform the required
     /// crash-safe rewrite; callers reject `true` before taking an owner lease rather than silently
@@ -146,6 +152,7 @@ impl Default for EngineConfig {
             knowledge_cap_per_area: 12,
             push: true,
             ci_watch: true,
+            forge: Forge::default(),
             publish_linear_history: false,
             main_branch: None,
             verification_mode: VerificationMode::Disabled,
@@ -287,6 +294,18 @@ fn parse_with_environment(
     .map_err(|_| invalid("KB_CAP is too large"))?;
     config.push = optional_bool(&fields, "PUSH")?.unwrap_or(config.push);
     config.ci_watch = optional_bool(&fields, "CI_WATCH")?.unwrap_or(config.ci_watch);
+    // Fail closed on an unrecognised forge rather than falling back to the GitHub client: a
+    // silent fallback would poll the wrong API for the published commit and only surface as a
+    // deadline-shaped degradation long after publication had already been attempted.
+    config.forge = match configured_value(&fields, "FORGE") {
+        None => config.forge,
+        Some(value) => Forge::parse(value).ok_or_else(|| {
+            invalid(format!(
+                "FORGE must be one of {}; got {value:?}",
+                Forge::supported_config_values().join(", ")
+            ))
+        })?,
+    };
     config.publish_linear_history =
         optional_bool(&fields, "PUBLISH_LINEAR_HISTORY")?.unwrap_or(config.publish_linear_history);
     config.call_deadline_secs =
@@ -880,6 +899,25 @@ mod tests {
         assert_eq!(parsed.processor.cohort_budget_secs, None);
         assert_eq!(parsed.processor.cohort_token_budget, None);
         assert!(!parsed.processor.events_outbox_enabled);
+    }
+
+    #[test]
+    fn forge_defaults_to_github_and_an_unsupported_value_rejects_the_configuration() {
+        // An existing config.md with no FORGE key keeps polling the forge the publication gate
+        // has always polled, so adding the key changes nothing for current operators.
+        assert_eq!(parse("CI_WATCH: true\n").unwrap().forge, Forge::GitHub);
+        assert_eq!(parse("FORGE: gitlab\n").unwrap().forge, Forge::GitLab);
+        assert_eq!(parse("FORGE: gitea\n").unwrap().forge, Forge::Gitea);
+        assert_eq!(parse("FORGE: github\n").unwrap().forge, Forge::GitHub);
+        // Fail closed rather than falling back to GitHub: the whole run stops before it could
+        // publish a commit whose CI this engine has no client to observe.
+        let error = parse("FORGE: bitbucket\n").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("FORGE") && message.contains("github, gitlab, gitea"),
+            "{message}"
+        );
+        assert!(parse("FORGE: GitLab\n").is_err());
     }
 
     #[test]

@@ -22,8 +22,12 @@ vcs-diff = "0.7"
 # Typed backend-specific operations where the common facade intentionally has no mutation form.
 vcs-git = "0.11"
 vcs-jj = "0.11"
-# Typed GitHub Actions/check-runs client used by the native CI publication gate.
+# Typed forge clients used by the native CI publication gate. `vcs-github` carries the
+# GitHub Actions/check-runs surface; the GitLab and Gitea siblings carry the commit-status
+# surfaces of the same vcs-toolkit family (their own release train, hence the 0.7 line).
 vcs-github = "0.11"
+vcs-gitlab = "0.7"
+vcs-gitea = "0.7"
 
 [profile.release]
 opt-level = 2
