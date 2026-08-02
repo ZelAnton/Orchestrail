@@ -36,6 +36,13 @@ cargo fmt --check
 cargo deny check advisories bans
 ```
 
+## Fuzzing untrusted-input parsers
+
+`engine/fuzz/` (a separate `cargo-fuzz` crate, deliberately outside this repo's Cargo
+workspace) fuzzes the parsers that consume bytes the engine does not control (leaf-agent
+transcripts, `events.jsonl`, the Markdown control plane, `config.md`). See
+[`engine/fuzz/README.md`](engine/fuzz/README.md) for setup and how to run a target locally.
+
 ## Conventions
 
 - **Formatting** is governed by `rustfmt` (run `cargo fmt`); non-Rust files

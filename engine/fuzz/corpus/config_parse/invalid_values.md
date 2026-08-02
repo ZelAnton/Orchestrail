@@ -1,0 +1,4 @@
+MAX_PARALLEL: nope
+PUSH: maybe
+KB_TTL: -1
+CALL_DEADLINE_SEC: overflow

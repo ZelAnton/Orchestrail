@@ -3855,7 +3855,7 @@ impl ExternalPort for HeadlessExternalPort {
             // adapter, containment group, and evidence map.
             let workers = effects
                 .iter()
-                .map(|request| {
+                .map(|request: &_| {
                     let config = config.clone();
                     let state = frozen_state.clone();
                     scope.spawn(move || -> TaskWorkerHandover {

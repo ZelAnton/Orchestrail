@@ -82,6 +82,43 @@ fn events_tail_prints_deduped_committed_events_only() {
 }
 
 #[test]
+fn events_tail_without_follow_reads_to_current_eof() {
+    const EVENT_COUNT: usize = 512;
+    let padding = "x".repeat(2_048);
+    let mut journal = String::with_capacity(EVENT_COUNT * (padding.len() + 192));
+    for event in 0..EVENT_COUNT {
+        journal.push_str(&format!(
+            r#"{{"schema_version":1,"event_id":"evt-large-{event}","occurred_at":"2026-07-08T12:24:10Z","type":"task.captured","batch_id":"B-1","task_id":"T-1","actor":{{"kind":"agent","name":"processor"}},"payload":{{"padding":"{padding}"}}}}"#
+        ));
+        journal.push('\n');
+    }
+    let fixture = temp_fixture(&journal);
+    let out = Command::new(BIN)
+        .arg("events")
+        .arg("tail")
+        .arg(&fixture)
+        .output()
+        .expect("spawn events tail");
+    let _ = fs::remove_file(&fixture);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "events tail exited nonzero: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        EVENT_COUNT,
+        "non-follow mode must read past one poll window to current EOF"
+    );
+    assert!(
+        stdout.contains("\"event_id\":\"evt-large-511\""),
+        "the final event past the one-megabyte poll bound must be printed"
+    );
+}
+
+#[test]
 fn events_tail_missing_file_errors() {
     let missing = std::env::temp_dir().join("orchestra-events-absent-xyz.jsonl");
     let out = Command::new(BIN)

@@ -790,7 +790,12 @@ fn cmd_events(args: &[String]) {
     let mut reader = TailReader::new(&path);
     let poll_interval = Duration::from_millis(200);
     loop {
-        match reader.poll() {
+        let events = if follow {
+            reader.poll()
+        } else {
+            reader.poll_all()
+        };
+        match events {
             Ok(events) => {
                 for ev in events {
                     println!("{}", ev.to_json_line());
