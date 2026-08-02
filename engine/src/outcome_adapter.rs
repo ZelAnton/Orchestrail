@@ -22,8 +22,10 @@ use crate::supervise::{Reason, Verdict};
 /// only a distinct id that is ALSO a member of this set counts, so a fixer that mentions a
 /// duplicate, stale, or otherwise unrelated finding id it never worked this round cannot inflate
 /// `wont_fixed` past the round's real open-finding count and trigger a false empty-fixed-set
-/// escalation (R-06). `None` (unknown open-finding set) degrades to the pre-R-06 behaviour of
-/// deduplicating only — never fabricated membership.
+/// escalation (R-06). `None` — the set is not merely empty but ABSENT (see the two variants of that
+/// on `TaskRuntime::pending_fix_open_finding_ids`) — degrades to the pre-R-06 behaviour of
+/// deduplicating only, never fabricated membership; `Some(&[])` is a known set like any other and
+/// admits nothing (R-08).
 pub fn task_leaf_outcome(
     verdict: &Verdict,
     report: &str,
@@ -89,7 +91,9 @@ pub fn task_leaf_outcome(
 /// finding this round was never dispatched to address (a duplicate, stale, or otherwise
 /// unrelated `R-`/`F-` the fixer merely mentioned) can inflate the count past the round's real
 /// open-finding total. `open_finding_ids: None` — the set is simply unknown for this leaf role or
-/// checkpoint — degrades to deduplication alone, never a fabricated membership proof.
+/// checkpoint — degrades to deduplication alone, never a fabricated membership proof. An empty but
+/// KNOWN set (`Some(&[])`) is not that case and keeps filtering everything out (R-08): a round
+/// whose open ids are all accounted for admits no won't-fix entry at all.
 fn validated_wont_fix_count(
     outcome: &contract::Outcome,
     open_finding_ids: Option<&[String]>,
@@ -521,6 +525,37 @@ mod tests {
                 wont_fixed: 1,
             },
             "R-06 is a real member of this round and must still count; the stale R-03 must not"
+        );
+    }
+
+    #[test]
+    fn an_empty_known_id_set_admits_nothing_while_an_absent_one_still_degrades() {
+        // R-08: the two are deliberately NOT the same input.
+        //   * `Some(&[])` — the round reported its open set and it is empty. Like any known set it
+        //     is authoritative, so no `не исправлено=` entry is a member and none counts. The
+        //     round decodes as an ordinary `Completed`, and `empty_fixed_set_decision` cannot
+        //     escalate it on the strength of an id the round never opened.
+        //   * `None` — there is no such set to check against (a pre-R-06 checkpoint, a leaf role
+        //     with no fix cycle), so the count degrades to deduplication alone rather than
+        //     fabricating membership.
+        // Reading emptiness as absence would collapse the first case into the second and re-open
+        // R-06's false terminal escalation on the one live route that produces an empty set.
+        let report = "Изменённые файлы: review.md\nИТОГ: готово \u{00B7} режим=2 \u{00B7} \
+не исправлено=R-03=устарело\n";
+        assert_eq!(
+            task_leaf_outcome(&verdict(Reason::Ok), report, "coder", Some(&[])),
+            LeafOutcome::Completed {
+                author: Some("coder".into())
+            },
+            "a known-empty open set admits no won't-fix entry at all"
+        );
+        assert_eq!(
+            task_leaf_outcome(&verdict(Reason::Ok), report, "coder", None),
+            LeafOutcome::CompletedWithWontFix {
+                author: Some("coder".into()),
+                wont_fixed: 1,
+            },
+            "an ABSENT set keeps the documented pre-R-06 degradation: deduplicated, unvalidated"
         );
     }
 

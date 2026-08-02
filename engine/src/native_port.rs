@@ -1883,7 +1883,12 @@ impl<E: ExternalPort> FileVcsPort<E> {
     /// * the round signature is re-derived from the *stable* gate signature plus the reviewer's own
     ///   findings, excluding the engine's finding. Its `R-` id necessarily changes whenever a fixer
     ///   claims the previous one fixed, and signing that id would make every repetition of one
-    ///   unfixed breakage look like progress to the stagnation detector.
+    ///   unfixed breakage look like progress to the stagnation detector;
+    /// * `open_findings` counts the engine's finding, so `open_finding_ids` names it too — on the
+    ///   deferred route by the id [`Self::restore_review_cycle_finding_before_fix`] is about to
+    ///   allocate for it. The reducer must never be handed an open COUNT without the matching id
+    ///   set: `outcome_adapter::validated_wont_fix_count` would then have nothing to validate a
+    ///   fixer's `не исправлено=` entries against (R-08).
     ///
     /// `Escalated` and `Incomplete` are left alone: the first is already terminal, and the second
     /// repeats the same round (where the gate result still applies) rather than concluding it.
@@ -1926,31 +1931,33 @@ impl<E: ExternalPort> FileVcsPort<E> {
             } => open_finding_ids.clone(),
             _ => Vec::new(),
         };
-        let gate_already_counted =
-            matches!(
-                outcome,
-                ReviewOutcome::Findings { .. } | ReviewOutcome::FindingsRiskElevated { .. }
-            ) && self.read_review_artifact(task_id)?.is_some_and(|artifact| {
-                crate::contract::parse_review(&artifact)
-                    .open_review_findings()
-                    .iter()
-                    .any(|finding| finding.title == REVIEW_CYCLE_FINDING_TITLE)
-            });
+        // Parsed once, BEFORE this call may amend the file, because it answers two questions about
+        // the same bytes: whether the reviewer kept the engine's own finding, and — on the route
+        // that defers writing it — which id that finding is going to be given.
+        let parsed = crate::contract::parse_review(
+            self.read_review_artifact(task_id)?.as_deref().unwrap_or(""),
+        );
+        let artifact_carries_gate_finding = parsed
+            .open_review_findings()
+            .iter()
+            .any(|finding| finding.title == REVIEW_CYCLE_FINDING_TITLE);
+        let gate_already_counted = matches!(
+            outcome,
+            ReviewOutcome::Findings { .. } | ReviewOutcome::FindingsRiskElevated { .. }
+        ) && artifact_carries_gate_finding;
         if restore_finding {
             self.mix_review_cycle_finding(task_id, &failure.body)?;
         }
         let open_findings = reviewer_open_findings.saturating_add(u32::from(!gate_already_counted));
-        // Best-effort id set (R-06): when this call just wrote the engine's own gate finding
-        // above, re-read the artifact so its freshly assigned id is included in the set a fixer's
-        // `не исправлено` entries get validated against. Otherwise the reviewer's own ids are
-        // already the complete answer — either the gate finding needed no addition, or
-        // `gate_already_counted` already proved the reviewer retained it. The one path this does
-        // NOT cover exactly (`!restore_finding && !gate_already_counted`, a preparation-only pass
-        // that adjusts the virtual count without writing anything) simply omits that one
-        // not-yet-materialized id — `open_finding_ids.len()` may then be one short of
-        // `open_findings`, which only makes id-membership validation slightly more conservative,
-        // never wrongly permissive.
+        // The EXACT id set behind `open_findings` (R-06/R-08): every id a fixer of this round may
+        // legitimately name in `не исправлено=`. It must stay complete, because the consumer
+        // (`outcome_adapter::validated_wont_fix_count`) treats a known set as authoritative — an id
+        // wrongly missing here silently disables the won't-fix signal for that finding, and a
+        // wrongly ABSENT set (`None` at the reducer) disables membership checking altogether,
+        // which is the R-06 false-escalation vector.
         let open_finding_ids = if restore_finding {
+            // This call just materialized the engine's finding, so the artifact is now the whole
+            // answer, freshly assigned id included.
             self.read_review_artifact(task_id)?
                 .map(|artifact| {
                     crate::contract::parse_review(&artifact)
@@ -1961,7 +1968,24 @@ impl<E: ExternalPort> FileVcsPort<E> {
                 })
                 .unwrap_or_default()
         } else {
-            reviewer_open_finding_ids
+            // Preparation-only route: a finalized Codex review binds these exact bytes, so the
+            // gate finding is deliberately not written here — `restore_review_cycle_finding_before_fix`
+            // puts it in front of the fixer instead. Its id is nevertheless known already and NOT a
+            // guess: that call allocates it with `next_review_finding_id` from this same artifact,
+            // which is not rewritten in between (only a reviewer authors `review.md`, and this
+            // round's reviewer has finished). Naming it keeps the set complete — including on the
+            // route where the reviewer returned a clean pass and the gate finding is the round's
+            // ONLY open finding, which would otherwise hand the reducer an empty set for
+            // `open_findings = 1`. An artifact that still CARRIES the finding gets nothing added:
+            // either the reviewer's own ids already name it (`gate_already_counted`, so the count
+            // was not raised either), or the verdict was a clean pass over an artifact that has an
+            // open finding — a shape no reviewer adapter can produce, left deliberately
+            // conservative rather than guessing which id the count refers to.
+            let mut ids = reviewer_open_finding_ids;
+            if !artifact_carries_gate_finding {
+                ids.push(next_review_finding_id(&parsed));
+            }
+            ids
         };
         // Computed from the artifact minus the engine's own finding, so it does not depend on
         // whether this path restored it.
@@ -6652,13 +6676,21 @@ mod tests {
             )
             .unwrap();
 
-        assert!(matches!(
-            outcome,
-            ReviewOutcome::Findings {
-                open_findings: 3,
-                ..
-            }
-        ));
+        let ReviewOutcome::Findings {
+            open_findings,
+            open_finding_ids,
+            ..
+        } = outcome
+        else {
+            panic!("a proved cycle failure holds the round open: {outcome:?}");
+        };
+        assert_eq!(open_findings, 3);
+        assert_eq!(
+            open_finding_ids,
+            vec!["R-01".to_string(), "R-02".to_string(), "R-03".to_string()],
+            "the count is reported together with the exact ids behind it, the engine's own \
+             freshly written finding included (R-06/R-08)"
+        );
         let artifact = fs::read_to_string(fixture.work.join("tasks/T-1/review.md")).unwrap();
         assert_eq!(
             crate::contract::parse_review(&artifact)
@@ -6667,6 +6699,89 @@ mod tests {
             3,
             "the restored gate finding joins both reviewer findings: {artifact}"
         );
+    }
+
+    #[test]
+    fn a_deferred_gate_finding_is_still_named_in_the_rounds_open_finding_ids() {
+        // R-08. The Codex-preparation route binds the reviewer's exact artifact bytes, so it must
+        // NOT write the gate finding — but it still counts it in `open_findings`. The id set has to
+        // follow, or the reducer is handed "1 open finding, no ids": `validated_wont_fix_count`
+        // would then have nothing to validate a fixer's `не исправлено=` entries against and would
+        // count an arbitrary stale id, escalating a successful fix round — the exact R-06 vector.
+        // A reviewer that returned a CLEAN pass is the live producer of that shape, because then
+        // the gate finding is the round's only open finding.
+        let fixture = review_cycle_fixture();
+        let mut port = FileVcsPort::discover(
+            &fixture.work,
+            &fixture.root,
+            StubExternal { planned: false },
+        )
+        .unwrap()
+        .with_review_cycle_verification(Some(review_cycle_gate(&marker_command(false))));
+        let artifact_path = fixture.work.join("tasks/T-1/review.md");
+
+        // Prove the failure (this records the gate), then model what a finalized Codex review
+        // leaves behind: its own clean artifact, the engine's finding replaced away, and two
+        // already-closed findings that make the next free id a non-trivial one.
+        dispatch_review_observing_artifact(&mut port, &fixture.work, &fixture.state);
+        let reviewer_clean = concat!(
+            "# Ревью задачи T-1\n\n",
+            "### [R-01] Earlier finding — статус: исправлено\n\n",
+            "### [R-02] Earlier finding — статус: отклонено\n\n",
+            "### [SUMMARY-R-2099-01-01T00:00:00Z] Итог ревью задачи — статус: готово к слиянию\n\n",
+            "ИТОГ: готово к слиянию · открытых=0\n",
+        );
+        fs::write(&artifact_path, reviewer_clean).unwrap();
+        let head = fixture.state.tasks["T-1"]
+            .review_sha
+            .clone()
+            .expect("the fixture task has a committed tip");
+
+        let outcome = port
+            .enforce_review_cycle_gate_on_preparation(
+                "T-1",
+                &head,
+                TaskReviewPreparationOutcome::Completed(ReviewOutcome::Clean {
+                    review_sha: head.clone(),
+                }),
+            )
+            .unwrap();
+
+        let TaskReviewPreparationOutcome::Completed(ReviewOutcome::Findings {
+            open_findings,
+            open_finding_ids,
+            ..
+        }) = outcome
+        else {
+            panic!("a proved cycle failure holds the prepared round open: {outcome:?}");
+        };
+        assert_eq!(
+            open_findings, 1,
+            "the deferred gate finding is this round's only open finding"
+        );
+        assert_eq!(
+            open_finding_ids,
+            vec!["R-03".to_string()],
+            "an open COUNT is never handed to the reducer without the id behind it"
+        );
+        assert_eq!(
+            fs::read_to_string(&artifact_path).unwrap(),
+            reviewer_clean,
+            "naming the id must not amend the bytes the durable preparation receipt binds"
+        );
+
+        // And the named id is not a guess: it is the one this same round's fixer actually reads,
+        // because `restore_review_cycle_finding_before_fix` allocates it from the same artifact.
+        ProcessorPort::prepare_task_leaf(&mut port, "T-1", LeafKind::Fix, &fixture.state).unwrap();
+        let artifact = fs::read_to_string(&artifact_path).unwrap();
+        let parsed = crate::contract::parse_review(&artifact);
+        let open = parsed.open_review_findings();
+        assert_eq!(open.len(), 1, "{artifact}");
+        assert_eq!(
+            open[0].id, "R-03",
+            "the fixer reads exactly the id the round declared open: {artifact}"
+        );
+        assert_eq!(open[0].title, REVIEW_CYCLE_FINDING_TITLE);
     }
 
     #[test]

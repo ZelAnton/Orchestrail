@@ -284,11 +284,20 @@ pub struct TaskRuntime {
     pub pending_fix_open_findings: Option<u32>,
     /// The exact ids (`ReviewOutcome::Findings::open_finding_ids`) counted in
     /// `pending_fix_open_findings` for the same round (R-06). Consumed (cleared) alongside it the
-    /// moment the fix leaf returns. `None` — a checkpoint predating R-06, or the count-only
-    /// `#[serde(default)]` degradation described on `pending_fix_open_findings` — means the
-    /// id-membership check simply cannot be judged this round; the adapter that computes
-    /// `wont_fixed` falls back to an unvalidated (but still deduplicated) count rather than
-    /// fabricating membership.
+    /// moment the fix leaf returns.
+    ///
+    /// `Some` vs `None` is the ABSENCE of the coordinate, never its emptiness (R-08):
+    /// * `Some(ids)` — this round reported its open set, and it is authoritative. `Some(vec![])` is
+    ///   a legitimate value of that kind ("this round has nothing a fixer may decline"), and it
+    ///   validates STRICTLY like any other known set: no `не исправлено=` entry can be a member of
+    ///   it, so none is counted. Emptiness must NOT be re-read as "unknown" — that would restore
+    ///   exactly the unbounded count R-06 was filed against, on the one route that can produce it
+    ///   (`native_port::enforce_review_cycle_gate` over a reviewer's clean pass).
+    /// * `None` — no such coordinate exists at all: a checkpoint written before R-06, the
+    ///   count-only `#[serde(default)]` degradation described on `pending_fix_open_findings`, or a
+    ///   leaf role that never runs a task fix cycle. Only then does the adapter that computes
+    ///   `wont_fixed` fall back to an unvalidated (but still deduplicated) count, because there is
+    ///   nothing to validate against — it never fabricates membership.
     #[serde(default)]
     pub pending_fix_open_finding_ids: Option<Vec<String>>,
     pub implementation_author: Option<String>,
@@ -2775,8 +2784,11 @@ impl Processor {
                 }
                 let open_findings = task.pending_fix_open_findings.take();
                 // Cleared alongside the count it was captured with (R-06) — see
-                // `TaskRuntime::pending_fix_open_finding_ids`. Its value was already consumed
-                // by the adapter that computed this `wont_fixed`, not by this reducer.
+                // `TaskRuntime::pending_fix_open_finding_ids`. This reducer never reads its value:
+                // when the round did report won't-fix entries, the adapter that produced
+                // `wont_fixed` had already consumed it; when it did not (`wont_fixed: None` — an
+                // ordinary risk elevation), there was nothing to validate. Either way the round
+                // this coordinate belonged to ends here, so it must not outlive it (R-07).
                 task.pending_fix_open_finding_ids = None;
                 if let Some(wont_fixed) = wont_fixed {
                     if kind != LeafKind::Fix {
@@ -3155,10 +3167,12 @@ impl Processor {
                 }
                 // Durable coordinate for T-014's empty-fixed-set early exit: correlated against
                 // the fixer's own `не исправлено` count the moment this fix round returns (see
-                // `task_leaf`'s `LeafOutcome::CompletedWithWontFix` arm).
+                // `task_leaf`'s `LeafOutcome::CompletedWithWontFix` arm). The id set is recorded
+                // exactly as the round reported it, INCLUDING an empty one: emptiness here is a
+                // known fact about this round ("nothing a fixer may decline"), never the absence of
+                // the coordinate — see `TaskRuntime::pending_fix_open_finding_ids` (R-08).
                 task.pending_fix_open_findings = Some(open_findings);
-                task.pending_fix_open_finding_ids =
-                    Some(open_finding_ids).filter(|ids| !ids.is_empty());
+                task.pending_fix_open_finding_ids = Some(open_finding_ids);
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -3201,9 +3215,10 @@ impl Processor {
                         reason,
                     }]);
                 }
+                // Same durable coordinates, and the same "empty is known, not unknown" rule as the
+                // plain `Findings` arm above (R-08).
                 task.pending_fix_open_findings = Some(open_findings);
-                task.pending_fix_open_finding_ids =
-                    Some(open_finding_ids).filter(|ids| !ids.is_empty());
+                task.pending_fix_open_finding_ids = Some(open_finding_ids);
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -6797,6 +6812,274 @@ mod tests {
             .unwrap();
         assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
         assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Committing);
+    }
+
+    // -- Durable round coordinates: recorded, then consumed exactly once (R-07/R-08) ----------
+
+    /// One task driven into `Fixing` by a review round that opened `R-05` and `R-06`, i.e. with
+    /// both durable won't-fix coordinates populated. The caller concludes that fix round its own
+    /// way and asserts what survives.
+    fn task_in_a_fix_round() -> Processor {
+        drive_into_a_fix_round(processor())
+    }
+
+    fn drive_into_a_fix_round(mut p: Processor) -> Processor {
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-1".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("R-05 and R-06"),
+                open_findings: 2,
+                open_finding_ids: vec!["R-05".into(), "R-06".into()],
+            },
+        })
+        .unwrap();
+        assert_eq!(p.state().tasks["T-1"].phase, TaskPhase::Fixing);
+        assert_eq!(p.state().tasks["T-1"].pending_fix_open_findings, Some(2));
+        assert_eq!(
+            p.state().tasks["T-1"]
+                .pending_fix_open_finding_ids
+                .as_deref(),
+            Some(["R-05".to_string(), "R-06".to_string()].as_slice()),
+            "the round records the exact ids the fixer is dispatched to address (R-06)"
+        );
+        p
+    }
+
+    /// Both round coordinates must be gone. They are durable, and a value that outlived its own
+    /// round would be correlated against a LATER, unrelated fixer report — the false terminal
+    /// escalation R-07 was filed against.
+    fn assert_round_coordinates_consumed(p: &Processor) {
+        assert_eq!(
+            p.state().tasks["T-1"].pending_fix_open_findings,
+            None,
+            "the round's open-finding count must not outlive the round that captured it"
+        );
+        assert_eq!(
+            p.state().tasks["T-1"].pending_fix_open_finding_ids,
+            None,
+            "neither must its id set (R-07): a stale set would validate a later round's \
+             `не исправлено` entries against findings that round never saw"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_fix_round_completion_consumes_both_round_coordinates() {
+        // R-07. The fixer reported no `не исправлено` at all, so nothing correlates the round —
+        // but the coordinates still belong to a round that is now over.
+        let mut p = task_in_a_fix_round();
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::Completed {
+                    author: Some("coder".into()),
+                },
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
+        assert_round_coordinates_consumed(&p);
+    }
+
+    #[test]
+    fn a_committing_risk_elevation_consumes_both_round_coordinates() {
+        // R-07, the arm where the clearing had to be lifted OUT of `if let Some(wont_fixed)`:
+        // an ordinary risk elevation carries no won't-fix metadata at all, yet still concludes
+        // the fix round with a commit.
+        let mut p = task_in_a_fix_round();
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::RiskElevated {
+                    author: Some("coder".into()),
+                    risk: Risk::High,
+                    wont_fixed: None,
+                },
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
+        assert_eq!(p.state().tasks["T-1"].risk, Some(Risk::High));
+        assert_round_coordinates_consumed(&p);
+    }
+
+    #[test]
+    fn a_codex_prepared_fix_round_consumes_both_round_coordinates() {
+        // R-07 for the Codex preparation path, whose four arms are the same reducer decision
+        // reached through a different backend.
+        let mut p = task_in_a_fix_round();
+        let effects = p
+            .apply(ProcessorCommand::TaskLeafPrepared {
+                task_id: "T-1".into(),
+                outcome: TaskLeafPreparationOutcome::Completed,
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
+        assert_round_coordinates_consumed(&p);
+
+        let mut p = task_in_a_fix_round();
+        let effects = p
+            .apply(ProcessorCommand::TaskLeafPrepared {
+                task_id: "T-1".into(),
+                outcome: TaskLeafPreparationOutcome::RiskElevated {
+                    risk: Risk::High,
+                    wont_fixed: None,
+                },
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::CommitTask { .. })));
+        assert_eq!(p.state().tasks["T-1"].risk, Some(Risk::High));
+        assert_round_coordinates_consumed(&p);
+    }
+
+    #[test]
+    fn a_retryable_fix_failure_keeps_the_round_coordinates_for_the_repeat() {
+        // The negative control for the three tests above: a retry is the SAME round continuing,
+        // so clearing here would silently disable the empty-fixed-set signal for every fix leaf
+        // that ever timed out or crashed once.
+        // The shared `processor()` config, with room for the retry this test is about.
+        let mut p = drive_into_a_fix_round(
+            Processor::new(ProcessorConfig {
+                max_parallel: 2,
+                cohort_size: 3,
+                review_loop_max: 2,
+                integration_loop_max: 2,
+                ci_fix_max: 2,
+                stagnation_limit: 2,
+                leaf_max_attempts: 2,
+                ..ProcessorConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let effects = p
+            .apply(ProcessorCommand::TaskLeaf {
+                task_id: "T-1".into(),
+                outcome: LeafOutcome::RetryableFailure {
+                    reason: "supervisor timeout".into(),
+                },
+            })
+            .unwrap();
+
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::PrepareTaskLeaf {
+                kind: LeafKind::Fix,
+                ..
+            })
+        ));
+        assert_eq!(p.state().tasks["T-1"].pending_fix_open_findings, Some(2));
+        assert_eq!(
+            p.state().tasks["T-1"]
+                .pending_fix_open_finding_ids
+                .as_deref(),
+            Some(["R-05".to_string(), "R-06".to_string()].as_slice()),
+            "the repeat of this same round must keep its coordinate"
+        );
+    }
+
+    #[test]
+    fn an_empty_open_finding_id_set_is_recorded_as_known_empty_not_as_unknown() {
+        // R-08. `None` and `Some(vec![])` are NOT interchangeable downstream: `None` makes
+        // `outcome_adapter::validated_wont_fix_count` skip membership validation entirely (the
+        // pre-R-06 unbounded count), while a known-empty set filters every `не исправлено=` entry
+        // out. So the reducer must record what the round reported and never re-read emptiness as
+        // "unknown" — a round that reports an open COUNT with no ids behind it must be able to
+        // say so without silently disabling the check that stops a stale id from escalating a
+        // successful fix round.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-1", "engine/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-1".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-1".into(),
+            commit: "a1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-1".into(),
+            outcome: ReviewOutcome::Findings {
+                signature: signature("one finding whose id the round did not name"),
+                open_findings: 1,
+                open_finding_ids: Vec::new(),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(p.state().tasks["T-1"].pending_fix_open_findings, Some(1));
+        assert_eq!(
+            p.state().tasks["T-1"].pending_fix_open_finding_ids,
+            Some(Vec::new()),
+            "an empty set is a KNOWN set: it must reach the adapter as `Some(&[])`, which admits \
+             no won't-fix entry, not as `None`, which admits every one of them unvalidated"
+        );
+
+        // The same rule on the risk-elevated twin of that arm.
+        let mut p = processor();
+        open(&mut p);
+        p.apply(ProcessorCommand::Admit {
+            candidates: vec![candidate("T-2", "tui/**")],
+            now_secs: 101,
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::WorkspaceReady {
+            task_id: "T-2".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskLeaf {
+            task_id: "T-2".into(),
+            outcome: LeafOutcome::Completed { author: None },
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskCommitted {
+            task_id: "T-2".into(),
+            commit: "b1".into(),
+        })
+        .unwrap();
+        p.apply(ProcessorCommand::TaskReview {
+            task_id: "T-2".into(),
+            outcome: ReviewOutcome::FindingsRiskElevated {
+                signature: signature("risk elevated, ids not named"),
+                risk: Risk::High,
+                open_findings: 1,
+                open_finding_ids: Vec::new(),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            p.state().tasks["T-2"].pending_fix_open_finding_ids,
+            Some(Vec::new())
+        );
     }
 
     #[test]
