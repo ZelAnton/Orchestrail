@@ -33,15 +33,21 @@ pub const CHECKOUT_IDENTITY_MARKERS: [&str; 3] = [
 /// Orchestra checkout whose `tools/<name>.ps1` may be trusted. Missing even one marker yields
 /// `false` (route to the mirror), which is the whole point: a lone `tools/` folder is not proof.
 pub fn is_orchestra_checkout(root: &Path) -> bool {
+    has_checkout_identity(root, Path::exists)
+}
+
+/// Check the checkout identity with an injected existence probe. Keeping this core public lets
+/// read-only diagnostics report the same trusted-root decision without a second marker list.
+pub fn has_checkout_identity(root: &Path, exists: impl Fn(&Path) -> bool) -> bool {
     CHECKOUT_IDENTITY_MARKERS
         .iter()
-        .all(|marker| root.join(marker).exists())
+        .all(|marker| exists(&root.join(marker)))
 }
 
 /// The cc-sync mirror directory (`~/.claude/scripts`) where `tools/sync-runtime.ps1` mirrors the
 /// whole `tools/*.ps1` set for any project that uses Orchestra without being its checkout (T-115).
 /// `None` when neither `HOME` nor `USERPROFILE` is set (then there is no mirror to fall back to).
-fn cc_sync_mirror_dir() -> Option<PathBuf> {
+pub fn cc_sync_mirror_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)?;

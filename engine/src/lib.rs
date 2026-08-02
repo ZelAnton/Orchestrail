@@ -70,6 +70,7 @@ pub mod config_discovery;
 pub mod contract;
 pub mod control;
 pub mod dependency_graph;
+pub mod doctor;
 pub mod events;
 pub mod execution;
 pub mod forge_ci;
