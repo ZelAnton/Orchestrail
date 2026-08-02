@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"evt-20260708T122410Z-15286","occurred_at":"2026-07-08T12:24:10Z","type":"cohort.opened","batch_id":"B-20260708T121913Z","actor":{"kind":"agent","name":"processor"},"payload":{"base":"0c55b21a","wave":1,"tasks":["T-039"],"max_parallel":5}}

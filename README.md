@@ -9,7 +9,8 @@ The workspace contains two private crates:
 - `engine/` — headless orchestration state, decision resolvers, event readers,
   and supervised external-tool integration.
 - `tui/` — the ratatui operator console over the engine's state and event
-  contracts.
+  contracts. See the [TUI operator guide](docs/tui-guide.md) for running,
+  navigation, and command safety semantics.
 
 The intended architecture and staged migration are recorded in
 [`plans/DETERMINISTIC_ORCHESTRATOR_INTENT.md`](plans/DETERMINISTIC_ORCHESTRATOR_INTENT.md).

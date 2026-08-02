@@ -1,0 +1,54 @@
+name: Fuzz
+
+# Scheduled, short-budget coverage-guided fuzzing of the untrusted-input parsers in
+# `engine/fuzz/`. Deliberately NOT part of `ci.yml`: it needs a nightly toolchain and pulls
+# `cargo-fuzz` from the network, and a short run finding nothing is not itself a pass/fail signal
+# worth blocking a PR on. `workflow_dispatch` allows an on-demand run.
+on:
+  schedule:
+    - cron: '17 4 * * *' # daily, off-peak UTC
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - claude_parse_transcript
+          - contract_parse_outcome
+          - contract_parse_review
+          - contract_detect_sentinel
+          - contract_parse_changed_files
+          - events_parse_line
+          - state_parse_queue
+          - state_parse_descriptor
+          - state_parse_batch
+          - state_parse_cohort
+          - state_parse_integration
+          - config_parse
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening), same as `ci.yml`.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (nightly; 2026-07-16)
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: engine/fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }} for 60s
+        working-directory: engine/fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: engine/fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

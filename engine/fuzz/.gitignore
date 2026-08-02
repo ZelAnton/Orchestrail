@@ -1,0 +1,6 @@
+target
+# The curated seed corpus under `corpus/<target>/` IS tracked (it is fixture data, not fuzzer
+# session output) — see `README.md`. `cargo fuzz run` grows each target's corpus in place with
+# new inputs it discovers; do not commit those unless deliberately promoting one to a seed.
+artifacts
+coverage

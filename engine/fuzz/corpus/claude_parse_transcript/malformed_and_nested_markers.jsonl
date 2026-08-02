@@ -1,0 +1,3 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"ok"}
+{"message":{"type":"result"},"result":"nested"}
+{"type":"result","subtype":"broken","result":"trailing"} garbage

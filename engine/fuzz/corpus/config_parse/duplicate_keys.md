@@ -1,0 +1,4 @@
+MAX_PARALLEL: 2
+PUSH: true
+MAX_PARALLEL: 3
+PUSH: false
