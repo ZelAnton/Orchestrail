@@ -1,4 +1,4 @@
-//! Render the main overview screen (plan §6.1) from [`AppState`].
+//! Render the overview, Decision Inbox, and Event Log screens from [`AppState`].
 //!
 //! Layout intent (§6.1): *deviations and actions first, green normal work collapsed*. So the
 //! left column leads with an "attention" panel (escalated / conflict / blocked tasks) and only
@@ -14,7 +14,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{AppState, CohortPhase, InboxPanel, Modal, RecentKind, Screen, TaskState};
+use crate::app::{
+    AppState, CohortPhase, EventLogFilterField, InboxPanel, Modal, RecentKind, Screen, TaskState,
+};
 use crate::commands::LeaseStatus;
 use crate::inbox::{BlockedCard, DecisionInbox, EscalatedCard, QuarantineCard};
 
@@ -31,6 +33,7 @@ pub fn render(f: &mut Frame, app: &AppState) {
     match app.screen {
         Screen::Overview => render_overview(f, app),
         Screen::DecisionInbox => render_decision_inbox(f, app),
+        Screen::EventLog => render_event_log(f, app),
     }
     // Overlays, drawn over whichever screen is active. The destructive force-lock modal is drawn
     // last so it sits on top of everything, including an open lease-status popup.
@@ -366,7 +369,153 @@ fn render_footer(f: &mut Frame, area: Rect, app: &AppState) {
     );
 }
 
-/// The §5/§6.2 command-key hints shared by both screens' footers: pause / resume / lease-status,
+// ---- read-only Event Log screen ------------------------------------------------------------
+
+fn render_event_log(f: &mut Frame, app: &AppState) {
+    let root = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .split(f.area());
+
+    let filtered = app.get_filtered_events();
+    render_event_log_header(f, root[0], app, filtered.len());
+
+    let lines = if filtered.is_empty() {
+        vec![Line::from(Span::styled(
+            if app.event_log.is_empty() {
+                "журнал пока пуст — ожидаются события events.jsonl"
+            } else {
+                "нет событий, соответствующих активным фильтрам"
+            },
+            Style::default().fg(DIM),
+        ))]
+    } else {
+        filtered.into_iter().map(event_log_line).collect()
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block("Последние события (новые сверху)"))
+            .scroll((app.event_log_scroll, 0)),
+        root[1],
+    );
+
+    render_event_log_footer(f, root[2], app);
+}
+
+fn render_event_log_header(f: &mut Frame, area: Rect, app: &AppState, filtered_count: usize) {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Event Log",
+            Style::default().add_modifier(Modifier::BOLD).fg(CYAN),
+        ),
+        Span::raw("   показано "),
+        Span::styled(
+            format!("{filtered_count} / {}", app.event_log.len()),
+            Style::default().fg(DIM),
+        ),
+    ])];
+    lines.push(Line::from(vec![
+        Span::raw("T-ID "),
+        filter_value(&app.event_log_filter_task_id),
+        Span::raw("   тип "),
+        filter_value(&app.event_log_filter_event_type),
+        Span::raw("   когорта "),
+        filter_value(&app.event_log_filter_cohort),
+    ]));
+    if let Some(field) = app.event_log_filter_input {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("ввод {}: ", event_log_filter_label(field)),
+                Style::default().fg(YELLOW),
+            ),
+            Span::raw(app.event_log_filter_buffer.clone()),
+            Span::styled("█", Style::default().fg(YELLOW)),
+            Span::styled("   Enter применить · Esc отмена", Style::default().fg(DIM)),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(Span::styled(
+            " events.jsonl · read-only ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        area,
+    );
+}
+
+fn event_log_line(event: &orchestrail_engine::events::Event) -> Line<'static> {
+    let type_color = if event.event_type.is_cohort() {
+        CYAN
+    } else if event.event_type.is_task() {
+        GREEN
+    } else {
+        YELLOW
+    };
+    let mut coordinates = Vec::new();
+    if let Some(task_id) = &event.task_id {
+        coordinates.push(format!("task={task_id}"));
+    }
+    if let Some(batch_id) = &event.batch_id {
+        coordinates.push(format!("batch={batch_id}"));
+    }
+    if let Some(cohort_id) = AppState::event_cohort_id(event)
+        && event.batch_id.as_deref() != Some(cohort_id)
+    {
+        coordinates.push(format!("cohort={cohort_id}"));
+    }
+    if coordinates.is_empty() {
+        coordinates.push("без координат".to_string());
+    }
+
+    Line::from(vec![
+        Span::styled(
+            format!("{:<23}", human_event_time(&event.occurred_at)),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            format!("{:<25}", event.event_type.as_str()),
+            Style::default().fg(type_color),
+        ),
+        Span::raw(coordinates.join("  ")),
+    ])
+}
+
+fn filter_value(value: &str) -> Span<'static> {
+    if value.is_empty() {
+        Span::styled("<все>", Style::default().fg(DIM))
+    } else {
+        Span::styled(value.to_string(), Style::default().fg(YELLOW))
+    }
+}
+
+fn event_log_filter_label(field: EventLogFilterField) -> &'static str {
+    match field {
+        EventLogFilterField::TaskId => "T-ID",
+        EventLogFilterField::EventType => "типа события",
+        EventLogFilterField::Cohort => "когорты",
+    }
+}
+
+fn render_event_log_footer(f: &mut Frame, area: Rect, app: &AppState) {
+    let first = Line::from(vec![
+        Span::styled(" q/Esc ", Style::default().fg(CYAN)),
+        Span::raw("выход  "),
+        Span::styled(" Tab ", Style::default().fg(CYAN)),
+        Span::raw("обзор  "),
+        Span::styled(" ↑/↓ j/k PgUp/PgDn ", Style::default().fg(CYAN)),
+        Span::raw("прокрутка  "),
+        Span::styled(" t/y/c ", Style::default().fg(CYAN)),
+        Span::raw("фильтры  "),
+        Span::styled(" Ctrl-u/y/c ", Style::default().fg(CYAN)),
+        Span::raw("сброс"),
+    ]);
+    let mut second = command_hint_spans();
+    second.extend(notice_spans(app));
+    f.render_widget(Paragraph::new(vec![first, Line::from(second)]), area);
+}
+
+/// The §5/§6.2 command-key hints shared by all screens' footers: pause / resume / lease-status,
 /// and the destructive force-lock (in red — it opens a confirmation modal, `main.rs`).
 fn command_hint_spans() -> Vec<Span<'static>> {
     vec![
@@ -1039,6 +1188,18 @@ fn short_time(iso: &str) -> String {
     }
 }
 
+/// Render the validated UTC event timestamp as a compact, human-readable value.
+fn human_event_time(iso: &str) -> String {
+    let Some((date, clock)) = iso.split_once('T') else {
+        return iso.to_string();
+    };
+    let Some(clock) = clock.strip_suffix('Z') else {
+        return iso.to_string();
+    };
+    let clock = clock.split('.').next().unwrap_or(clock);
+    format!("{date} {clock} UTC")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,6 +1214,15 @@ mod tests {
         assert_eq!(short_time("2026-07-11T11:39:48Z"), "11:39:48");
         assert_eq!(short_time("2026-07-11T11:39:48.783Z"), "11:39:48");
         assert_eq!(short_time("garbage"), "garbage");
+    }
+
+    #[test]
+    fn human_event_time_formats_validated_utc_timestamp() {
+        assert_eq!(
+            human_event_time("2026-07-11T11:39:48.783Z"),
+            "2026-07-11 11:39:48 UTC"
+        );
+        assert_eq!(human_event_time("garbage"), "garbage");
     }
 
     #[test]
@@ -1269,13 +1439,45 @@ mod tests {
     }
 
     #[test]
-    fn toggle_screen_switches_between_overview_and_inbox() {
+    fn toggle_screen_cycles_through_all_three_screens() {
         let mut app = AppState::new();
         assert_eq!(app.screen, Screen::Overview);
         app.toggle_screen();
         assert_eq!(app.screen, Screen::DecisionInbox);
         app.toggle_screen();
+        assert_eq!(app.screen, Screen::EventLog);
+        app.toggle_screen();
         assert_eq!(app.screen, Screen::Overview);
+    }
+
+    #[test]
+    fn renders_filtered_event_log_headlessly() {
+        let mut app = AppState::new();
+        app.apply_all(&[
+            parse_line(r#"{"schema_version":1,"event_id":"event-open","occurred_at":"2026-07-11T11:46:29Z","type":"cohort.opened","batch_id":"B-9","actor":{"kind":"agent","name":"processor"},"payload":{"wave":1}}"#).unwrap(),
+            parse_line(r#"{"schema_version":1,"event_id":"event-task","occurred_at":"2026-07-11T11:47:00Z","type":"task.captured","batch_id":"B-9","task_id":"T-77","actor":{"kind":"agent","name":"processor"},"payload":{"level":"coder"}}"#).unwrap(),
+        ]);
+        app.screen = Screen::EventLog;
+        app.event_log_filter_task_id = "T-77".into();
+
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(screen.contains("Event Log"));
+        assert!(screen.contains("2026-07-11 11:47:00 UTC"));
+        assert!(screen.contains("task.captured"));
+        assert!(screen.contains("task=T-77"));
+        assert!(screen.contains("batch=B-9"));
+        assert!(!screen.contains("cohort.opened"));
+        assert!(screen.contains("Ctrl-u/y/c"));
     }
 
     #[test]
