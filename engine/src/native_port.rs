@@ -1917,6 +1917,15 @@ impl<E: ExternalPort> FileVcsPort<E> {
             | ReviewOutcome::FindingsRiskElevated { open_findings, .. } => *open_findings,
             _ => 0,
         };
+        let reviewer_open_finding_ids = match &outcome {
+            ReviewOutcome::Findings {
+                open_finding_ids, ..
+            }
+            | ReviewOutcome::FindingsRiskElevated {
+                open_finding_ids, ..
+            } => open_finding_ids.clone(),
+            _ => Vec::new(),
+        };
         let gate_already_counted =
             matches!(
                 outcome,
@@ -1931,6 +1940,29 @@ impl<E: ExternalPort> FileVcsPort<E> {
             self.mix_review_cycle_finding(task_id, &failure.body)?;
         }
         let open_findings = reviewer_open_findings.saturating_add(u32::from(!gate_already_counted));
+        // Best-effort id set (R-06): when this call just wrote the engine's own gate finding
+        // above, re-read the artifact so its freshly assigned id is included in the set a fixer's
+        // `не исправлено` entries get validated against. Otherwise the reviewer's own ids are
+        // already the complete answer — either the gate finding needed no addition, or
+        // `gate_already_counted` already proved the reviewer retained it. The one path this does
+        // NOT cover exactly (`!restore_finding && !gate_already_counted`, a preparation-only pass
+        // that adjusts the virtual count without writing anything) simply omits that one
+        // not-yet-materialized id — `open_finding_ids.len()` may then be one short of
+        // `open_findings`, which only makes id-membership validation slightly more conservative,
+        // never wrongly permissive.
+        let open_finding_ids = if restore_finding {
+            self.read_review_artifact(task_id)?
+                .map(|artifact| {
+                    crate::contract::parse_review(&artifact)
+                        .open_review_findings()
+                        .iter()
+                        .map(|finding| finding.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            reviewer_open_finding_ids
+        };
         // Computed from the artifact minus the engine's own finding, so it does not depend on
         // whether this path restored it.
         let signature = self.review_cycle_round_signature(task_id, &failure.signature)?;
@@ -1939,10 +1971,12 @@ impl<E: ExternalPort> FileVcsPort<E> {
                 signature,
                 risk,
                 open_findings,
+                open_finding_ids,
             },
             None => ReviewOutcome::Findings {
                 signature,
                 open_findings,
+                open_finding_ids,
             },
         })
     }
@@ -4327,6 +4361,7 @@ mod tests {
             review_cycles: 0,
             review_signatures: Vec::new(),
             pending_fix_open_findings: None,
+            pending_fix_open_finding_ids: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: review_sha.map(str::to_owned),
@@ -6117,6 +6152,7 @@ mod tests {
                     review_cycles: 0,
                     review_signatures: Vec::new(),
                     pending_fix_open_findings: None,
+                    pending_fix_open_finding_ids: None,
                     implementation_author: Some("coder".into()),
                     previous_review_sha: None,
                     review_sha: Some(head.clone()),
@@ -6311,6 +6347,7 @@ mod tests {
                     review_cycles: 1,
                     review_signatures: Vec::new(),
                     pending_fix_open_findings: None,
+                    pending_fix_open_finding_ids: None,
                     implementation_author: Some("coder".into()),
                     previous_review_sha: None,
                     review_sha: Some(head),
@@ -6540,6 +6577,7 @@ mod tests {
         let ReviewOutcome::Findings {
             signature,
             open_findings,
+            ..
         } = outcome
         else {
             panic!("a proved cycle failure must hold the round open: {outcome:?}");
@@ -6608,6 +6646,7 @@ mod tests {
                 ReviewOutcome::Findings {
                     signature: "reviewer-signature".into(),
                     open_findings: 2,
+                    open_finding_ids: vec!["R-01".into(), "R-02".into()],
                 },
                 true,
             )

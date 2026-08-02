@@ -1067,7 +1067,12 @@ impl HeadlessExternalPort {
         let coordinates =
             self.claude_task_usage_coordinates(state, task_id, "coder", mode, attempt)?;
         self.record_usage(state, coordinates, &invocation)?;
-        let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "coder");
+        let outcome = task_leaf_outcome(
+            &invocation.verdict,
+            &invocation.report,
+            "coder",
+            task.pending_fix_open_finding_ids.as_deref(),
+        );
         // Classify the whole result — verdict, outcome, and the mandatory changed-path evidence —
         // before deciding the conversation's fate. A report that claims completion without that
         // evidence is exactly as unusable as an escalation, and a resumed conversation that
@@ -2739,6 +2744,7 @@ impl ExternalPort for HeadlessExternalPort {
             &invocation.verdict,
             &invocation.report,
             "inbox_curator",
+            None,
         ))
     }
 
@@ -2805,6 +2811,7 @@ impl ExternalPort for HeadlessExternalPort {
             &invocation.verdict,
             &invocation.report,
             "dependency_curator",
+            None,
         ))
     }
 
@@ -2853,7 +2860,12 @@ impl ExternalPort for HeadlessExternalPort {
             },
             &invocation,
         )?;
-        let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "release_notes");
+        let outcome = task_leaf_outcome(
+            &invocation.verdict,
+            &invocation.report,
+            "release_notes",
+            None,
+        );
         if matches!(outcome, LeafOutcome::Completed { .. }) {
             release::record_composed_notes(
                 work,
@@ -2982,7 +2994,7 @@ impl ExternalPort for HeadlessExternalPort {
             &invocation,
         )?;
         let outcome = reject_non_task_risk_elevation(
-            task_leaf_outcome(&invocation.verdict, &invocation.report, "merger"),
+            task_leaf_outcome(&invocation.verdict, &invocation.report, "merger", None),
             "merger conflict resolution",
         );
         if matches!(outcome, LeafOutcome::Completed { .. }) {
@@ -3219,7 +3231,16 @@ impl ExternalPort for HeadlessExternalPort {
             self.record_usage(state, usage_coordinates, &invocation)?;
             return Ok(prepared);
         }
-        let outcome = task_leaf_outcome(&invocation.verdict, &invocation.report, "coder_codex");
+        let open_finding_ids = self
+            .task(state, task_id)?
+            .pending_fix_open_finding_ids
+            .clone();
+        let outcome = task_leaf_outcome(
+            &invocation.verdict,
+            &invocation.report,
+            "coder_codex",
+            open_finding_ids.as_deref(),
+        );
         // Same rule as the Claude leaf: only a result the engine can actually accept — completion
         // plus its mandatory changed-path evidence — makes this conversation worth continuing.
         let parsed_paths =
@@ -3969,7 +3990,7 @@ impl ExternalPort for HeadlessExternalPort {
             &invocation,
         )?;
         let outcome = reject_non_task_risk_elevation(
-            task_leaf_outcome(&invocation.verdict, &invocation.report, "merger"),
+            task_leaf_outcome(&invocation.verdict, &invocation.report, "merger", None),
             "integration fixer",
         );
         if matches!(
@@ -4042,7 +4063,7 @@ impl ExternalPort for HeadlessExternalPort {
             }
             return Ok(CiFixPreparationOutcome::Fallback);
         }
-        match task_leaf_outcome(&invocation.verdict, &invocation.report, "coder_codex") {
+        match task_leaf_outcome(&invocation.verdict, &invocation.report, "coder_codex", None) {
             LeafOutcome::Completed { .. } => {
                 self.ci_evidence = Some(Self::exact_changed_paths(&invocation.report)?);
                 Ok(CiFixPreparationOutcome::Completed)
@@ -4083,7 +4104,7 @@ impl ExternalPort for HeadlessExternalPort {
             &invocation,
         )?;
         let outcome = reject_non_task_risk_elevation(
-            task_leaf_outcome(&invocation.verdict, &invocation.report, "coder"),
+            task_leaf_outcome(&invocation.verdict, &invocation.report, "coder", None),
             "CI fixer",
         );
         if matches!(outcome, LeafOutcome::Completed { .. }) {
@@ -4121,6 +4142,7 @@ impl ExternalPort for HeadlessExternalPort {
             &invocation.verdict,
             &invocation.report,
             "knowledge_curator",
+            None,
         ))
     }
 }
@@ -5693,6 +5715,7 @@ mod tests {
             review_cycles: 1,
             review_signatures: Vec::new(),
             pending_fix_open_findings: None,
+            pending_fix_open_finding_ids: None,
             implementation_author: Some("coder".into()),
             previous_review_sha: None,
             review_sha: Some("head".into()),
@@ -5990,6 +6013,7 @@ mod tests {
                 review_cycles: 0,
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: None,
@@ -6388,6 +6412,7 @@ mod tests {
                 review_cycles: 0,
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: Some("head".into()),
@@ -6882,6 +6907,7 @@ mod tests {
                 review_cycles: 0,
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author: Some("coder".into()),
                 previous_review_sha: None,
                 review_sha: Some("head".into()),
@@ -6989,6 +7015,7 @@ mod tests {
                 review_cycles: 0,
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author: Some("coder".into()),
                 previous_review_sha: None,
                 review_sha: Some("head".into()),

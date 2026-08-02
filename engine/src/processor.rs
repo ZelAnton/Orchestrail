@@ -282,6 +282,15 @@ pub struct TaskRuntime {
     /// the unaffected `stagnation_decision` path.
     #[serde(default)]
     pub pending_fix_open_findings: Option<u32>,
+    /// The exact ids (`ReviewOutcome::Findings::open_finding_ids`) counted in
+    /// `pending_fix_open_findings` for the same round (R-06). Consumed (cleared) alongside it the
+    /// moment the fix leaf returns. `None` — a checkpoint predating R-06, or the count-only
+    /// `#[serde(default)]` degradation described on `pending_fix_open_findings` — means the
+    /// id-membership check simply cannot be judged this round; the adapter that computes
+    /// `wont_fixed` falls back to an unvalidated (but still deduplicated) count rather than
+    /// fabricating membership.
+    #[serde(default)]
+    pub pending_fix_open_finding_ids: Option<Vec<String>>,
     pub implementation_author: Option<String>,
     /// The last committed tip that a reviewer completed before the current `review_sha` was
     /// created. `None` identifies the first full review from the immutable cohort base.  It is
@@ -323,6 +332,7 @@ impl TaskRuntime {
             review_cycles: 0,
             review_signatures: Vec::new(),
             pending_fix_open_findings: None,
+            pending_fix_open_finding_ids: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: None,
@@ -890,6 +900,15 @@ pub enum ReviewOutcome {
         /// unaffected `stagnation_decision` path rather than failing to load.
         #[serde(default)]
         open_findings: u32,
+        /// The exact `R-`/`F-` ids counted in `open_findings` this round (R-06). Additive sibling
+        /// of the bare count: it lets the per-task fix path (`TaskRuntime::pending_fix_open_finding_ids`)
+        /// validate that a fixer's `не исправлено` entries actually name findings THIS round was
+        /// dispatched to address, rather than trusting an unverified id it may have copied from a
+        /// stale/unrelated prior finding. `#[serde(default)]` (empty) for the same replay-compat
+        /// reason as `open_findings`: an old durable receipt without this field simply degrades the
+        /// one round's id-membership check to "unknown", not a load failure.
+        #[serde(default)]
+        open_finding_ids: Vec<String>,
     },
     /// An open R-finding concurrently records a strict risk elevation. It follows the ordinary
     /// repair loop and never introduces a separate human gate.
@@ -900,6 +919,10 @@ pub enum ReviewOutcome {
         /// [`ReviewOutcome::Findings::open_findings`] (task T-014).
         #[serde(default)]
         open_findings: u32,
+        /// Same meaning and compatibility rationale as [`ReviewOutcome::Findings::open_finding_ids`]
+        /// (R-06).
+        #[serde(default)]
+        open_finding_ids: Vec<String>,
     },
     Incomplete,
     Escalated {
@@ -2755,6 +2778,10 @@ impl Processor {
                         )));
                     }
                     let open_findings = task.pending_fix_open_findings.take();
+                    // Cleared alongside the count it was captured with (R-06) — see
+                    // `TaskRuntime::pending_fix_open_finding_ids`. Its value was already consumed
+                    // by the adapter that computed this `wont_fixed`, not by this reducer.
+                    task.pending_fix_open_finding_ids = None;
                     if let Some(open_findings) = open_findings
                         && let Some(reason) =
                             empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
@@ -2787,6 +2814,7 @@ impl Processor {
                 // judged this round, so it is skipped and the ordinary path (below,
                 // `stagnation_decision` on the NEXT review pass) remains the sole backstop.
                 let open_findings = task.pending_fix_open_findings.take();
+                task.pending_fix_open_finding_ids = None;
                 if let Some(open_findings) = open_findings
                     && let Some(reason) =
                         empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
@@ -2871,6 +2899,7 @@ impl Processor {
                     )));
                 }
                 let open_findings = task.pending_fix_open_findings.take();
+                task.pending_fix_open_finding_ids = None;
                 if let Some(open_findings) = open_findings
                     && let Some(reason) =
                         empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
@@ -2904,6 +2933,7 @@ impl Processor {
                         )));
                     }
                     let open_findings = task.pending_fix_open_findings.take();
+                    task.pending_fix_open_finding_ids = None;
                     if let Some(open_findings) = open_findings
                         && let Some(reason) =
                             empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
@@ -3096,6 +3126,7 @@ impl Processor {
             ReviewOutcome::Findings {
                 signature,
                 open_findings,
+                open_finding_ids,
             } => {
                 validate_signature(&signature)?;
                 task.review_cycles = task.review_cycles.saturating_add(1);
@@ -3122,6 +3153,7 @@ impl Processor {
                 // the fixer's own `не исправлено` count the moment this fix round returns (see
                 // `task_leaf`'s `LeafOutcome::CompletedWithWontFix` arm).
                 task.pending_fix_open_findings = Some(open_findings);
+                task.pending_fix_open_finding_ids = Some(open_finding_ids);
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -3133,6 +3165,7 @@ impl Processor {
                 signature,
                 risk,
                 open_findings,
+                open_finding_ids,
             } => {
                 validate_signature(&signature)?;
                 if let Err(reason) = raise_task_risk(task, risk) {
@@ -3164,6 +3197,7 @@ impl Processor {
                     }]);
                 }
                 task.pending_fix_open_findings = Some(open_findings);
+                task.pending_fix_open_finding_ids = Some(open_finding_ids);
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -3559,6 +3593,7 @@ impl Processor {
             ReviewOutcome::Findings {
                 signature,
                 open_findings: _,
+                open_finding_ids: _,
             } => {
                 validate_signature(&signature)?;
                 self.state.integration.verification_head = None;
@@ -6050,6 +6085,7 @@ mod tests {
                 outcome: ReviewOutcome::Findings {
                     signature: signature("R-01 missing error path"),
                     open_findings: 1,
+                    open_finding_ids: vec!["R-01".into()],
                 },
             })
             .unwrap();
@@ -6466,6 +6502,7 @@ mod tests {
             outcome: ReviewOutcome::Findings {
                 signature: sig.clone(),
                 open_findings: 1,
+                open_finding_ids: vec!["R-01".into()],
             },
         })
         .unwrap();
@@ -6485,6 +6522,7 @@ mod tests {
                 outcome: ReviewOutcome::Findings {
                     signature: sig,
                     open_findings: 1,
+                    open_finding_ids: vec!["R-01".into()],
                 },
             })
             .unwrap();
@@ -6528,6 +6566,7 @@ mod tests {
             outcome: ReviewOutcome::Findings {
                 signature: signature("R-05 wording A"),
                 open_findings: 2,
+                open_finding_ids: vec!["R-05".into(), "R-06".into()],
             },
         })
         .unwrap();
@@ -6594,6 +6633,7 @@ mod tests {
             outcome: ReviewOutcome::Findings {
                 signature: signature("R-01 and R-02"),
                 open_findings: 2,
+                open_finding_ids: vec!["R-01".into(), "R-02".into()],
             },
         })
         .unwrap();
@@ -6638,6 +6678,7 @@ mod tests {
             outcome: ReviewOutcome::Findings {
                 signature: signature("R-01"),
                 open_findings: 1,
+                open_finding_ids: vec!["R-01".into()],
             },
         })
         .unwrap();
@@ -6688,6 +6729,7 @@ mod tests {
             outcome: ReviewOutcome::Findings {
                 signature: signature("R-05, R-06, R-07"),
                 open_findings: 3,
+                open_finding_ids: vec!["R-05".into(), "R-06".into(), "R-07".into()],
             },
         })
         .unwrap();
@@ -6735,6 +6777,7 @@ mod tests {
             outcome: ReviewOutcome::Findings {
                 signature: signature("R-05 out of scope"),
                 open_findings: 1,
+                open_finding_ids: vec!["R-05".into()],
             },
         })
         .unwrap();
@@ -7540,6 +7583,7 @@ mod tests {
                 review_cycles: 0,
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author: None,
                 previous_review_sha: None,
                 review_sha: None,
@@ -7564,6 +7608,7 @@ mod tests {
                 outcome: ReviewOutcome::Findings {
                     signature: signature("F-01 missing integration guard"),
                     open_findings: 1,
+                    open_finding_ids: vec!["F-01".into()],
                 },
             })
             .unwrap();
@@ -8538,6 +8583,7 @@ mod tests {
                 outcome: ReviewOutcome::Findings {
                     signature: signature("F-01 irreparable"),
                     open_findings: 1,
+                    open_finding_ids: vec!["F-01".into()],
                 },
             })
             .unwrap();

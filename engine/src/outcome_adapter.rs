@@ -14,7 +14,22 @@ use crate::supervise::{Reason, Verdict};
 /// A timeout/crash may use the reducer's bounded retry budget; all other supervision or protocol
 /// failures are terminal escalations. `author` is selected by the engine's routing decision, not
 /// copied from untrusted output.
-pub fn task_leaf_outcome(verdict: &Verdict, report: &str, author: &str) -> LeafOutcome {
+///
+/// `open_finding_ids` is the exact set of `R-`/`F-` ids the round being judged was DISPATCHED to
+/// address (`TaskRuntime::pending_fix_open_finding_ids`, R-06) — `None` for every leaf role that
+/// never runs a task fix cycle (merger, curators, CI fix, ...) or for a checkpoint predating R-06.
+/// It bounds which `не исправлено=<id>` entries `Outcome::wont_fix` may count toward `wont_fixed`:
+/// only a distinct id that is ALSO a member of this set counts, so a fixer that mentions a
+/// duplicate, stale, or otherwise unrelated finding id it never worked this round cannot inflate
+/// `wont_fixed` past the round's real open-finding count and trigger a false empty-fixed-set
+/// escalation (R-06). `None` (unknown open-finding set) degrades to the pre-R-06 behaviour of
+/// deduplicating only — never fabricated membership.
+pub fn task_leaf_outcome(
+    verdict: &Verdict,
+    report: &str,
+    author: &str,
+    open_finding_ids: Option<&[String]>,
+) -> LeafOutcome {
     match verdict.reason {
         Reason::Timeout | Reason::Crash => LeafOutcome::RetryableFailure {
             reason: supervisor_reason(verdict),
@@ -33,9 +48,8 @@ pub fn task_leaf_outcome(verdict: &Verdict, report: &str, author: &str) -> LeafO
                 // one successful round. Decode both before selecting the structured outcome so
                 // neither signal can suppress the other.
                 let wont_fixed = (outcome.field("режим") == Some("2"))
-                    .then(|| outcome.wont_fix())
-                    .filter(|entries| !entries.is_empty())
-                    .map(|entries| u32::try_from(entries.len()).unwrap_or(u32::MAX));
+                    .then(|| validated_wont_fix_count(&outcome, open_finding_ids))
+                    .filter(|&count| count > 0);
                 match (risk, wont_fixed) {
                     (Some(risk), wont_fixed) => LeafOutcome::RiskElevated {
                         author: Some(author.to_string()),
@@ -67,6 +81,28 @@ pub fn task_leaf_outcome(verdict: &Verdict, report: &str, author: &str) -> LeafO
             },
         },
     }
+}
+
+/// The count `empty_fixed_set_decision` (R-06) may trust: DISTINCT `не исправлено=<id>` entries,
+/// further bounded to ids that are members of `open_finding_ids` when that set is known. Neither a
+/// repeated id (task T-014's original count was a bare `entries.len()`) nor an id naming a
+/// finding this round was never dispatched to address (a duplicate, stale, or otherwise
+/// unrelated `R-`/`F-` the fixer merely mentioned) can inflate the count past the round's real
+/// open-finding total. `open_finding_ids: None` — the set is simply unknown for this leaf role or
+/// checkpoint — degrades to deduplication alone, never a fabricated membership proof.
+fn validated_wont_fix_count(
+    outcome: &contract::Outcome,
+    open_finding_ids: Option<&[String]>,
+) -> u32 {
+    let entries = outcome.wont_fix();
+    let mut ids: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.finding_id.as_str())
+        .filter(|id| open_finding_ids.is_none_or(|open| open.iter().any(|open_id| open_id == id)))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    u32::try_from(ids.len()).unwrap_or(u32::MAX)
 }
 
 /// A coder risk is an optional, exact protocol token. Explanatory descriptor prose belongs to
@@ -127,16 +163,19 @@ pub fn task_review_outcome(
         },
         "открытые находки" if !open.is_empty() => {
             let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
+            let open_finding_ids = open.iter().map(|finding| finding.id.clone()).collect();
             let signature = finding_signature(open.into_iter());
             match risk {
                 Some(risk) => ReviewOutcome::FindingsRiskElevated {
                     signature,
                     risk,
                     open_findings,
+                    open_finding_ids,
                 },
                 None => ReviewOutcome::Findings {
                     signature,
                     open_findings,
+                    open_finding_ids,
                 },
             }
         }
@@ -153,16 +192,19 @@ pub fn task_review_outcome(
         // there the reviewer claims a clean gate it never proved during this invocation.
         "готово к слиянию" if !open.is_empty() => {
             let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
+            let open_finding_ids = open.iter().map(|finding| finding.id.clone()).collect();
             let signature = finding_signature(open.into_iter());
             match risk {
                 Some(risk) => ReviewOutcome::FindingsRiskElevated {
                     signature,
                     risk,
                     open_findings,
+                    open_finding_ids,
                 },
                 None => ReviewOutcome::Findings {
                     signature,
                     open_findings,
+                    open_finding_ids,
                 },
             }
         }
@@ -231,6 +273,7 @@ pub fn integration_review_outcome(
         }
         "открытые находки" if !open.is_empty() => ReviewOutcome::Findings {
             open_findings: u32::try_from(open.len()).unwrap_or(u32::MAX),
+            open_finding_ids: open.iter().map(|finding| finding.id.clone()).collect(),
             signature: finding_signature(open.into_iter()),
         },
         "готово к публикации" => review_protocol_error(
@@ -397,18 +440,19 @@ mod tests {
             task_leaf_outcome(
                 &verdict(Reason::Ok),
                 "Изменённые файлы: x\nИТОГ: готово · режим=3\n",
-                "coder_codex"
+                "coder_codex",
+                None,
             ),
             LeafOutcome::Completed {
                 author: Some("coder_codex".into())
             }
         );
         assert!(matches!(
-            task_leaf_outcome(&verdict(Reason::Ok), "ИТОГ: готово\n", "coder"),
+            task_leaf_outcome(&verdict(Reason::Ok), "ИТОГ: готово\n", "coder", None),
             LeafOutcome::Escalated { .. }
         ));
         assert!(matches!(
-            task_leaf_outcome(&verdict(Reason::Timeout), "", "coder"),
+            task_leaf_outcome(&verdict(Reason::Timeout), "", "coder", None),
             LeafOutcome::RetryableFailure { .. }
         ));
     }
@@ -423,10 +467,79 @@ mod tests {
                 "Изменённые файлы: review.md\nИТОГ: готово \u{00B7} режим=2 \u{00B7} \
 не исправлено=R-05=вне скоупа \u{00B7} не исправлено=R-07=false positive\n",
                 "coder",
+                None,
             ),
             LeafOutcome::CompletedWithWontFix {
                 author: Some("coder".into()),
                 wont_fixed: 2,
+            }
+        );
+    }
+
+    // -- Won't-fix id validation (R-06) ------------------------------------------------------
+
+    #[test]
+    fn wont_fix_entry_naming_a_stale_unrelated_finding_does_not_count_toward_wont_fixed() {
+        // Exactly the R-06 scenario: the fixer genuinely fixed the round's ONLY open finding
+        // (R-05, absent from не исправлено=) but the report ALSO cites a stale/unrelated id
+        // (R-03, closed in an earlier cycle and not a member of this round's open-finding set).
+        // Before R-06 this inflated `wont_fixed` to 1 — equal to `open_findings`, wrongly
+        // triggering `empty_fixed_set_decision`'s terminal escalation over a round that actually
+        // made full progress. With the round's real open-finding ids supplied, the stale id is
+        // filtered out and the round decodes as an ordinary `Completed`, never `CompletedWithWontFix`.
+        let open_finding_ids = vec!["R-05".to_string()];
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: review.md\nИТОГ: готово \u{00B7} режим=2 \u{00B7} \
+не исправлено=R-03=устарело\n",
+                "coder",
+                Some(&open_finding_ids),
+            ),
+            LeafOutcome::Completed {
+                author: Some("coder".into())
+            },
+            "a stale id absent from this round's open findings must not manufacture a wont-fix round"
+        );
+    }
+
+    #[test]
+    fn wont_fix_entry_naming_an_open_finding_still_counts_when_ids_are_known() {
+        // The membership filter is not a blanket suppression: an entry that DOES name one of the
+        // round's own open findings still counts, alongside a stale one that does not.
+        let open_finding_ids = vec!["R-05".to_string(), "R-06".to_string()];
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: review.md\nИТОГ: готово \u{00B7} режим=2 \u{00B7} \
+не исправлено=R-06=вне скоупа \u{00B7} не исправлено=R-03=устарело\n",
+                "coder",
+                Some(&open_finding_ids),
+            ),
+            LeafOutcome::CompletedWithWontFix {
+                author: Some("coder".into()),
+                wont_fixed: 1,
+            },
+            "R-06 is a real member of this round and must still count; the stale R-03 must not"
+        );
+    }
+
+    #[test]
+    fn wont_fix_duplicate_entries_are_deduplicated_before_counting() {
+        // task T-014's original count was a bare `entries.len()`; a fixer that repeats the same
+        // id (deliberately or not) must not inflate the count past the number of DISTINCT
+        // findings actually declined, matching `empty_fixed_set_decision`'s documented contract.
+        assert_eq!(
+            task_leaf_outcome(
+                &verdict(Reason::Ok),
+                "Изменённые файлы: review.md\nИТОГ: готово \u{00B7} режим=2 \u{00B7} \
+не исправлено=R-05=вне скоупа \u{00B7} не исправлено=R-05=вне скоупа\n",
+                "coder",
+                None,
+            ),
+            LeafOutcome::CompletedWithWontFix {
+                author: Some("coder".into()),
+                wont_fixed: 1,
             }
         );
     }
@@ -439,6 +552,7 @@ mod tests {
                 &verdict(Reason::Ok),
                 "Изменённые файлы: x\nИТОГ: готово \u{00B7} режим=2\n",
                 "coder",
+                None,
             ),
             LeafOutcome::Completed {
                 author: Some("coder".into())
@@ -455,6 +569,7 @@ mod tests {
                 &verdict(Reason::Ok),
                 "Изменённые файлы: x\nИТОГ: готово \u{00B7} режим=1 \u{00B7} не исправлено=R-05=x\n",
                 "coder",
+                None,
             ),
             LeafOutcome::Completed {
                 author: Some("coder".into())
@@ -488,7 +603,8 @@ mod tests {
             task_leaf_outcome(
                 &verdict(Reason::Ok),
                 "Изменённые файлы: x\nИТОГ: готово · режим=2 · риск=high\n",
-                "coder"
+                "coder",
+                None,
             ),
             LeafOutcome::RiskElevated {
                 author: Some("coder".into()),
@@ -500,7 +616,8 @@ mod tests {
             task_leaf_outcome(
                 &verdict(Reason::Ok),
                 "ИТОГ: готово · режим=2 · риск=high — public API\n",
-                "coder"
+                "coder",
+                None,
             ),
             LeafOutcome::Escalated { reason } if reason.contains("invalid coder риск")
         ));
@@ -508,7 +625,8 @@ mod tests {
             task_leaf_outcome(
                 &verdict(Reason::Ok),
                 "ИТОГ: готово · режим=2 · риск=high · риск=low\n",
-                "coder"
+                "coder",
+                None,
             ),
             LeafOutcome::Escalated { reason } if reason.contains("duplicate")
         ));
@@ -521,6 +639,7 @@ mod tests {
                 &verdict(Reason::Ok),
                 "Изменённые файлы: x\nИТОГ: готово · режим=2 · риск=high · не исправлено=R-01=out of scope\n",
                 "coder",
+                None,
             ),
             LeafOutcome::RiskElevated {
                 author: Some("coder".into()),
@@ -600,6 +719,7 @@ mod tests {
         let ReviewOutcome::Findings {
             signature,
             open_findings,
+            open_finding_ids,
         } = outcome
         else {
             panic!("a ready claim over an open finding must reduce to Findings: {outcome:?}");
@@ -615,7 +735,8 @@ mod tests {
             declared_open,
             ReviewOutcome::Findings {
                 signature,
-                open_findings
+                open_findings,
+                open_finding_ids,
             },
             "the same open findings sign the round the same way whichever tail the reviewer wrote"
         );

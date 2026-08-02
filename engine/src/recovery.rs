@@ -591,6 +591,7 @@ pub fn import_closed_ready_cohort(
                 // ever set (and consumed the same round) by the native reducer's own
                 // `ReviewOutcome::Findings` -> `LeafOutcome::CompletedWithWontFix` pairing.
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author: descriptor.implementation_authors.last().cloned(),
                 previous_review_sha: None,
                 review_sha,
@@ -983,6 +984,7 @@ pub fn import_active_cohort(
                 review_cycles,
                 review_signatures: Vec::new(),
                 pending_fix_open_findings: None,
+                pending_fix_open_finding_ids: None,
                 implementation_author,
                 previous_review_sha,
                 review_sha,

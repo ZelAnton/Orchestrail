@@ -778,6 +778,7 @@ mod tests {
                 outcome: ReviewOutcome::Findings {
                     signature: "0123456789abcdef".into(),
                     open_findings: 1,
+                    open_finding_ids: vec!["R-01".into()],
                 },
             },
         );
@@ -889,6 +890,7 @@ mod tests {
                 outcome: ReviewOutcome::Findings {
                     signature: "0123456789abcdef".into(),
                     open_findings: 1,
+                    open_finding_ids: vec!["R-01".into()],
                 },
             },
         ));
@@ -935,6 +937,7 @@ mod tests {
             review_cycles: 0,
             review_signatures: Vec::new(),
             pending_fix_open_findings: None,
+            pending_fix_open_finding_ids: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: None,
@@ -1060,6 +1063,7 @@ mod tests {
             review_cycles: 0,
             review_signatures: Vec::new(),
             pending_fix_open_findings: None,
+            pending_fix_open_finding_ids: None,
             implementation_author: None,
             previous_review_sha: None,
             review_sha: Some("reviewed1".into()),

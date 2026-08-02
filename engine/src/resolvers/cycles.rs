@@ -325,9 +325,15 @@ pub enum EmptyFixedSetDecision {
     /// all of the round's open findings — real progress (or at least not PROVABLY zero progress).
     Progressing,
     /// The fixer's won't-fix count accounts for every finding this round was dispatched to
-    /// address: the fixed set was empty. `wont_fixed` may exceed `open_findings` (a fixer that
-    /// over-reports, e.g. duplicate entries) — that is still proof of zero progress, not a reason
-    /// to keep going.
+    /// address: the fixed set was empty. The caller (`crate::outcome_adapter::task_leaf_outcome`,
+    /// R-06) already validates `wont_fixed` before it reaches this decision — deduplicated, and,
+    /// whenever the round's open-finding ids are known, bounded to ids that are actually members
+    /// of THIS round's open-finding set — so in the common case `wont_fixed` can never exceed
+    /// `open_findings` here. The one remaining exception is the additive/legacy degradation where
+    /// that id set is unknown (a checkpoint predating R-06, or a leaf role that never runs a task
+    /// fix cycle): there `wont_fixed` is deduplicated but unvalidated for membership, and MAY still
+    /// exceed `open_findings` — that over-report is still treated as proof of zero progress, not a
+    /// reason to keep going.
     Empty { wont_fixed: u32, open_findings: u32 },
 }
 
@@ -356,9 +362,11 @@ impl EmptyFixedSetDecision {
 }
 
 /// Decide whether a single fix round left an EMPTY fixed set. `wont_fixed` is the count of
-/// distinct findings the fixer's `не исправлено` field named this round; `open_findings` is the
-/// count of findings (`ReviewOutcome::Findings`'s own count) the round was dispatched to address.
-/// `open_findings == 0` never escalates (there was nothing to fix in the first place, a
+/// DISTINCT findings the fixer's `не исправлено` field named THIS round — validated by the caller
+/// (R-06) against the round's actual open-finding ids whenever that set is known, so a stale,
+/// duplicate, or otherwise unrelated id the fixer merely mentioned cannot inflate it; `open_findings`
+/// is the count of findings (`ReviewOutcome::Findings`'s own count) the round was dispatched to
+/// address. `open_findings == 0` never escalates (there was nothing to fix in the first place, a
 /// structurally impossible but defensively-handled case) — nor does `wont_fixed == 0` (no
 /// won't-fix field reported at all, the ordinary/legacy case this stays additive over).
 pub fn empty_fixed_set_decision(wont_fixed: u32, open_findings: u32) -> EmptyFixedSetDecision {
