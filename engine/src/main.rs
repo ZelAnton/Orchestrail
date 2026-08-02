@@ -118,6 +118,7 @@ use orchestrail_engine::codex::{CodexCall, Sandbox};
 use orchestrail_engine::config_discovery::{self, DiscoveryEnvironment};
 use orchestrail_engine::control::{ControlPlane, entry_exists as control_entry_exists};
 use orchestrail_engine::dependency_graph;
+use orchestrail_engine::doctor;
 use orchestrail_engine::events::TailReader;
 use orchestrail_engine::headless::{HeadlessConfig, HeadlessExternalPort};
 use orchestrail_engine::inbox;
@@ -162,6 +163,7 @@ fn main() {
         "events" => cmd_events(&args),
         "state" => cmd_state(&args),
         "plan" => cmd_plan(&args),
+        "doctor" => cmd_doctor(&args),
         "config" => cmd_config(&args),
         "approval" => cmd_approval(&args),
         "inbox" => cmd_inbox(&args),
@@ -176,12 +178,80 @@ fn main() {
         "version" | "--version" => println!("orchestrail-engine 0.0.1"),
         _ => {
             eprintln!(
-                "usage: orchestrail-engine <selfcheck|argv|claude|codex|events|state|plan|config|approval|inbox|lease|processor|release-sync|run|version>\n\
+                "usage: orchestrail-engine <selfcheck|argv|claude|codex|events|state|plan|doctor|config|approval|inbox|lease|processor|release-sync|run|version>\n\
                  (see src/main.rs; every real model call, including `config discover`, requires --live)"
             );
             exit(2);
         }
     }
+}
+
+/// `doctor [--work <.work>] [--root <repo>] [--json]` checks local prerequisites without
+/// modifying project state. The only child processes are ProcessKit-contained `--version` calls.
+fn cmd_doctor(args: &[String]) {
+    let (root, work, json) = match parse_doctor_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => doctor_usage(&error),
+    };
+    let report = doctor::collect(root, work);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("doctor report is serializable")
+        );
+    } else {
+        print!("{}", report.to_human());
+    }
+    if report.has_failures() {
+        exit(1);
+    }
+}
+
+fn parse_doctor_args(args: &[String]) -> Result<(PathBuf, PathBuf, bool), String> {
+    let mut root = None;
+    let mut work = None;
+    let mut json = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                if json {
+                    return Err("--json may be specified only once".into());
+                }
+                json = true;
+                index += 1;
+            }
+            "--root" | "--work" => {
+                let option = args[index].as_str();
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{option} requires a path"))?;
+                if value.starts_with("--") {
+                    return Err(format!("{option} requires a path"));
+                }
+                let slot = if option == "--root" {
+                    &mut root
+                } else {
+                    &mut work
+                };
+                if slot.replace(PathBuf::from(value)).is_some() {
+                    return Err(format!("{option} may be specified only once"));
+                }
+                index += 2;
+            }
+            option => return Err(format!("unknown argument {option:?}")),
+        }
+    }
+    let root = root.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let work = work.unwrap_or_else(|| root.join(".work"));
+    Ok((root, work, json))
+}
+
+fn doctor_usage(error: &str) -> ! {
+    eprintln!(
+        "usage: orchestrail-engine doctor [--work <.work>] [--root <repository-root>] [--json]: {error}"
+    );
+    exit(2)
 }
 
 fn cmd_config(args: &[String]) {

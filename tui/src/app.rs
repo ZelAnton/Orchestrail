@@ -9,7 +9,8 @@
 //! **Read-only by construction (this module).** Nothing in *this* module writes a file, takes a
 //! lock, or emits an event: it only *consumes* the typed [`Event`] values handed over by the engine
 //! crate's cursor reader, plus a little UI state (screen, inbox focus, the force-lock confirmation
-//! modal, the last command notice). The one place the crate may write is the deliberately narrow
+//! modal, Event Log filters/scroll, the last command notice). The one place the crate may write is
+//! the deliberately narrow
 //! §5/§6.2 command channel in [`crate::commands`] (pause / resume / lease-status / force-lock /
 //! approval decisions),
 //! driven only by an explicit keystroke. The events are the source of truth for the
@@ -25,12 +26,21 @@ use serde_json::{Map, Value};
 use crate::commands::{ApprovalDecision, LeaseStatus};
 use crate::inbox::{ApprovalBackend, ApprovalCard, DecisionInbox};
 
-/// Which of the two screens (§6.1 overview / §6.2 Decision Inbox) is currently drawn.
+/// Which operator screen is currently drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
     #[default]
     Overview,
     DecisionInbox,
+    EventLog,
+}
+
+/// Event Log filter whose value is currently being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLogFilterField {
+    TaskId,
+    EventType,
+    Cohort,
 }
 
 /// Which Decision Inbox panel currently holds focus: pending approvals plus the existing
@@ -192,6 +202,7 @@ pub struct RecentItem {
 }
 
 const RECENT_CAP: usize = 40;
+const EVENT_LOG_CAP: usize = 500;
 
 /// The full display state, folded from the event stream (+ status.md overlay).
 #[derive(Debug, Default)]
@@ -200,6 +211,18 @@ pub struct AppState {
     tasks: BTreeMap<String, TaskState>,
     /// Newest-first feed of notable transitions; survives cohort resets, bounded to `RECENT_CAP`.
     pub recent: Vec<RecentItem>,
+    /// Newest-first read-only event window; survives cohort resets and is bounded independently
+    /// from the smaller notable-transition feed.
+    pub event_log: Vec<Event>,
+    /// Exact-match Event Log filters. Empty values match every event.
+    pub event_log_filter_task_id: String,
+    pub event_log_filter_event_type: String,
+    pub event_log_filter_cohort: String,
+    /// Event Log viewport offset in rendered event rows.
+    pub event_log_scroll: u16,
+    /// Active filter editor and its uncommitted buffer. Editing affects only in-memory UI state.
+    pub event_log_filter_input: Option<EventLogFilterField>,
+    pub event_log_filter_buffer: String,
     /// Overlay parsed from `.work/status.md` (task names, orchestrator context).
     pub status: Option<crate::status::StatusSnapshot>,
     /// Total events consumed (for the header).
@@ -257,6 +280,10 @@ impl AppState {
     pub fn apply(&mut self, ev: &Event) {
         self.events_seen += 1;
         self.last_event_at = Some(ev.occurred_at.clone());
+        self.event_log.insert(0, ev.clone());
+        if self.event_log.len() > EVENT_LOG_CAP {
+            self.event_log.truncate(EVENT_LOG_CAP);
+        }
         match ev.event_type {
             EventType::CohortOpened => self.on_cohort_opened(ev),
             EventType::CohortRoundStarted => self.set_phase(CohortPhase::RoundStarted, ev),
@@ -499,11 +526,116 @@ impl AppState {
             .or_else(|| self.last_event_at.clone())
     }
 
-    /// Switch between the §6.1 overview and the §6.2 Decision Inbox screen.
+    /// Whether `event` passes the active T-ID filter.
+    pub fn filter_by_task_id(&self, event: &Event) -> bool {
+        filter_matches(&self.event_log_filter_task_id, event.task_id.as_deref())
+    }
+
+    /// Whether `event` passes the active event-type filter.
+    pub fn filter_by_event_type(&self, event: &Event) -> bool {
+        let filter = self.event_log_filter_event_type.trim();
+        filter.is_empty() || event.event_type.as_str().eq_ignore_ascii_case(filter)
+    }
+
+    /// Whether `event` passes the active cohort filter. The v1 envelope uses `batch_id` as the
+    /// durable cohort coordinate; payload fallbacks keep the viewer useful for imported events.
+    pub fn filter_by_cohort(&self, event: &Event) -> bool {
+        filter_matches(&self.event_log_filter_cohort, Self::event_cohort_id(event))
+    }
+
+    /// Events passing all active filters, retaining the newest-first journal-window order.
+    pub fn get_filtered_events(&self) -> Vec<&Event> {
+        self.event_log
+            .iter()
+            .filter(|event| {
+                self.filter_by_task_id(event)
+                    && self.filter_by_event_type(event)
+                    && self.filter_by_cohort(event)
+            })
+            .collect()
+    }
+
+    /// Resolve the event's cohort coordinate from the envelope, then known payload aliases.
+    pub fn event_cohort_id(event: &Event) -> Option<&str> {
+        event.batch_id.as_deref().or_else(|| {
+            ["cohort_id", "cohort", "batch_id"]
+                .into_iter()
+                .find_map(|key| event.payload.get(key).and_then(Value::as_str))
+        })
+    }
+
+    /// Begin editing one Event Log filter. Cohort editing starts from the current cohort when no
+    /// cohort filter is active, making `c`, Enter a quick "current cohort" action.
+    pub fn begin_event_log_filter(&mut self, field: EventLogFilterField) {
+        self.event_log_filter_buffer = match field {
+            EventLogFilterField::TaskId => self.event_log_filter_task_id.clone(),
+            EventLogFilterField::EventType => self.event_log_filter_event_type.clone(),
+            EventLogFilterField::Cohort => {
+                if self.event_log_filter_cohort.is_empty() {
+                    self.batch
+                        .as_ref()
+                        .map(|batch| batch.batch_id.clone())
+                        .unwrap_or_default()
+                } else {
+                    self.event_log_filter_cohort.clone()
+                }
+            }
+        };
+        self.event_log_filter_input = Some(field);
+    }
+
+    pub fn push_event_log_filter_char(&mut self, ch: char) {
+        if self.event_log_filter_input.is_some() && !ch.is_control() {
+            self.event_log_filter_buffer.push(ch);
+        }
+    }
+
+    pub fn pop_event_log_filter_char(&mut self) {
+        if self.event_log_filter_input.is_some() {
+            self.event_log_filter_buffer.pop();
+        }
+    }
+
+    pub fn commit_event_log_filter(&mut self) {
+        let Some(field) = self.event_log_filter_input.take() else {
+            return;
+        };
+        let value = self.event_log_filter_buffer.trim().to_string();
+        match field {
+            EventLogFilterField::TaskId => self.event_log_filter_task_id = value,
+            EventLogFilterField::EventType => self.event_log_filter_event_type = value,
+            EventLogFilterField::Cohort => self.event_log_filter_cohort = value,
+        }
+        self.event_log_filter_buffer.clear();
+        self.event_log_scroll = 0;
+    }
+
+    pub fn cancel_event_log_filter(&mut self) {
+        self.event_log_filter_input = None;
+        self.event_log_filter_buffer.clear();
+    }
+
+    pub fn clear_event_log_filter(&mut self, field: EventLogFilterField) {
+        match field {
+            EventLogFilterField::TaskId => self.event_log_filter_task_id.clear(),
+            EventLogFilterField::EventType => self.event_log_filter_event_type.clear(),
+            EventLogFilterField::Cohort => self.event_log_filter_cohort.clear(),
+        }
+        self.event_log_scroll = 0;
+    }
+
+    /// Scroll the Event Log viewport, saturating at both representable bounds.
+    pub fn scroll_event_log(&mut self, delta: i16) {
+        let current = i32::from(self.event_log_scroll);
+        self.event_log_scroll = (current + i32::from(delta)).clamp(0, i32::from(u16::MAX)) as u16;
+    }
+
+    /// Cycle through overview, Decision Inbox, and the read-only Event Log.
     pub fn toggle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Overview => Screen::DecisionInbox,
-            Screen::DecisionInbox => Screen::Overview,
+            Screen::DecisionInbox => Screen::EventLog,
+            Screen::EventLog => Screen::Overview,
         };
     }
 
@@ -741,6 +873,11 @@ impl AppState {
 
 // ---- payload extraction helpers (opaque Map<String, Value>) --------------------------------
 
+fn filter_matches(filter: &str, value: Option<&str>) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || value.is_some_and(|value| value.eq_ignore_ascii_case(filter))
+}
+
 fn pstr(p: &Map<String, Value>, key: &str) -> Option<String> {
     p.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
@@ -778,6 +915,65 @@ mod tests {
     const CAP_10: &str = r#"{"schema_version":1,"event_id":"e-c10","occurred_at":"2026-07-11T11:46:59Z","type":"task.captured","batch_id":"B-2","task_id":"T-10","actor":{"kind":"agent","name":"processor"},"payload":{"level":"coder_deep","branch":"task/T-10","worktree":".work/worktrees/T-10","domain":"tui/**","wave":1}}"#;
     const CAP_11: &str = r#"{"schema_version":1,"event_id":"e-c11","occurred_at":"2026-07-11T11:47:01Z","type":"task.captured","batch_id":"B-2","task_id":"T-11","actor":{"kind":"agent","name":"processor"},"payload":{"level":"coder","branch":"task/T-11","worktree":".work/worktrees/T-11","domain":"engine/**","wave":1}}"#;
     const REVIEW_10: &str = r#"{"schema_version":1,"event_id":"e-r10","occurred_at":"2026-07-11T12:00:12Z","type":"task.status_changed","batch_id":"B-2","task_id":"T-10","actor":{"kind":"agent","name":"processor"},"payload":{"from":"в работе","to":"на ревью"}}"#;
+    // Copied from `engine/tests/events_fixture.rs` so the Event Log tests exercise the same
+    // journal envelope shapes as the engine's end-to-end tail fixture.
+    const ENGINE_FIXTURE_A: &str = r#"{"schema_version":1,"event_id":"evt-a","occurred_at":"2026-07-08T12:24:10Z","type":"cohort.opened","batch_id":"B-1","actor":{"kind":"agent","name":"processor"},"payload":{"wave":1,"tasks":["T-1"]}}"#;
+    const ENGINE_FIXTURE_B: &str = r#"{"schema_version":1,"event_id":"evt-b","occurred_at":"2026-07-08T12:24:11Z","type":"task.captured","batch_id":"B-1","task_id":"T-1","actor":{"kind":"agent","name":"processor"},"payload":{"level":"coder","wave":1}}"#;
+
+    #[test]
+    fn event_log_filters_are_pure_exact_predicates_and_compose() {
+        let mut app = AppState::new();
+        app.apply_all(&events(&[ENGINE_FIXTURE_A, ENGINE_FIXTURE_B]));
+
+        assert_eq!(app.get_filtered_events().len(), 2);
+
+        app.event_log_filter_task_id = "t-1".into();
+        let filtered = app.get_filtered_events();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event_id, "evt-b");
+
+        app.event_log_filter_task_id.clear();
+        app.event_log_filter_event_type = "cohort.opened".into();
+        assert_eq!(app.get_filtered_events()[0].event_id, "evt-a");
+
+        app.event_log_filter_event_type.clear();
+        app.event_log_filter_cohort = "B-1".into();
+        assert_eq!(app.get_filtered_events().len(), 2);
+
+        app.event_log_filter_task_id = "T-1".into();
+        app.event_log_filter_event_type = "task.captured".into();
+        assert_eq!(app.get_filtered_events()[0].event_id, "evt-b");
+
+        app.event_log_filter_cohort = "B-missing".into();
+        assert!(app.get_filtered_events().is_empty());
+    }
+
+    #[test]
+    fn event_log_cohort_filter_accepts_payload_coordinate_fallback() {
+        let mut event = events(&[ENGINE_FIXTURE_B]).remove(0);
+        event.batch_id = None;
+        event
+            .payload
+            .insert("cohort_id".into(), Value::String("B-payload".into()));
+        let mut app = AppState::new();
+        app.event_log_filter_cohort = "B-payload".into();
+        assert!(app.filter_by_cohort(&event));
+    }
+
+    #[test]
+    fn event_log_window_is_bounded_and_keeps_newest_events() {
+        let template = events(&[ENGINE_FIXTURE_B]).remove(0);
+        let mut app = AppState::new();
+        for index in 0..=EVENT_LOG_CAP {
+            let mut event = template.clone();
+            event.event_id = format!("evt-{index}");
+            app.apply(&event);
+        }
+
+        assert_eq!(app.event_log.len(), EVENT_LOG_CAP);
+        assert_eq!(app.event_log.first().unwrap().event_id, "evt-500");
+        assert_eq!(app.event_log.last().unwrap().event_id, "evt-1");
+    }
 
     #[test]
     fn cohort_opened_sets_current_batch() {

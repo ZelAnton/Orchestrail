@@ -1,6 +1,6 @@
 //! orchestrail-tui — a live operator overview of a running orchestrator, **read-only by default for
-//! observation** but able to send a small, named command subset "downward", with two switchable
-//! screens (`Tab`): the §6.1 overview and the §6.2 Decision Inbox.
+//! observation** but able to send a small, named command subset "downward", with three switchable
+//! screens (`Tab`): the §6.1 overview, §6.2 Decision Inbox, and a read-only Event Log.
 //!
 //! It tails `<work>/events.jsonl` through the engine crate's cursor reader
 //! ([`orchestrail_engine::events::TailReader`] — the SAME reader the future engine uses, so
@@ -50,7 +50,7 @@ use orchestrail_engine::state::SnapshotCache;
 use orchestrail_engine::telemetry::batch_telemetry_summary_with_pricing;
 use orchestrail_engine::work_fs;
 
-use app::{AppState, InboxPanel, Modal, Screen};
+use app::{AppState, EventLogFilterField, InboxPanel, Modal, Screen};
 use cli::{Cli, Config};
 
 const MAX_PAUSE_BYTES: u64 = 4 * 1024;
@@ -140,7 +140,9 @@ fn run(cfg: Config) -> io::Result<()> {
         {
             // An open modal captures ALL input until dismissed, so no navigation or other
             // command can leak past the force-lock confirmation gate (§6.2).
-            if app.has_modal() {
+            if app.event_log_filter_input.is_some() {
+                handle_event_log_filter_key(&mut app, k);
+            } else if app.has_modal() {
                 handle_modal_key(&mut app, &cfg.work_dir, &mut control_plane_cache, k);
             } else if handle_key(
                 &mut app,
@@ -171,6 +173,11 @@ fn handle_key(
     k: KeyEvent,
 ) -> bool {
     match k.code {
+        KeyCode::Char('c')
+            if k.modifiers.contains(KeyModifiers::CONTROL) && app.screen == Screen::EventLog =>
+        {
+            app.clear_event_log_filter(EventLogFilterField::Cohort)
+        }
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('q') if k.modifiers.is_empty() => return true,
         // Esc first dismisses a lease-status overlay if one is showing, otherwise it quits.
@@ -265,9 +272,51 @@ fn handle_key(
                 app.scroll_inbox(10);
             }
         }
+        // ---- Event Log filters and navigation. These bindings are screen-local and therefore
+        // leave the Decision Inbox's a/d, arrows, h/j/k/l, and paging behaviour untouched. -----
+        KeyCode::Char('t') if k.modifiers.is_empty() && app.screen == Screen::EventLog => {
+            app.begin_event_log_filter(EventLogFilterField::TaskId)
+        }
+        KeyCode::Char('y') if k.modifiers.is_empty() && app.screen == Screen::EventLog => {
+            app.begin_event_log_filter(EventLogFilterField::EventType)
+        }
+        KeyCode::Char('c') if k.modifiers.is_empty() && app.screen == Screen::EventLog => {
+            app.begin_event_log_filter(EventLogFilterField::Cohort)
+        }
+        KeyCode::Char('u')
+            if k.modifiers.contains(KeyModifiers::CONTROL) && app.screen == Screen::EventLog =>
+        {
+            app.clear_event_log_filter(EventLogFilterField::TaskId)
+        }
+        KeyCode::Char('y')
+            if k.modifiers.contains(KeyModifiers::CONTROL) && app.screen == Screen::EventLog =>
+        {
+            app.clear_event_log_filter(EventLogFilterField::EventType)
+        }
+        KeyCode::Up if app.screen == Screen::EventLog => app.scroll_event_log(-1),
+        KeyCode::Char('k') if k.modifiers.is_empty() && app.screen == Screen::EventLog => {
+            app.scroll_event_log(-1)
+        }
+        KeyCode::Down if app.screen == Screen::EventLog => app.scroll_event_log(1),
+        KeyCode::Char('j') if k.modifiers.is_empty() && app.screen == Screen::EventLog => {
+            app.scroll_event_log(1)
+        }
+        KeyCode::PageUp if app.screen == Screen::EventLog => app.scroll_event_log(-20),
+        KeyCode::PageDown if app.screen == Screen::EventLog => app.scroll_event_log(20),
         _ => {}
     }
     false
+}
+
+/// Capture text for an Event Log filter without invoking commands or mutating external state.
+fn handle_event_log_filter_key(app: &mut AppState, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc => app.cancel_event_log_filter(),
+        KeyCode::Enter if k.modifiers.is_empty() => app.commit_event_log_filter(),
+        KeyCode::Backspace if k.modifiers.is_empty() => app.pop_event_log_filter_char(),
+        KeyCode::Char(ch) if k.modifiers.is_empty() => app.push_event_log_filter_char(ch),
+        _ => {}
+    }
 }
 
 fn refresh_batch_telemetry(app: &mut AppState, work: &Path) {
@@ -525,6 +574,105 @@ mod tests {
         ));
         assert_eq!(app.modal, Modal::ConfirmApprove);
         assert!(app.take_approval_confirmation().is_some());
+    }
+
+    #[test]
+    fn event_log_keys_are_screen_local_and_filter_input_is_in_memory() {
+        let cfg = Config {
+            work_dir: PathBuf::from("unused"),
+            tick_ms: 250,
+        };
+        let mut app = AppState::new();
+        let mut control_plane_cache = ControlPlaneCache::default();
+        let mut reloaded = Instant::now();
+
+        assert!(!handle_key(
+            &mut app,
+            &cfg,
+            Path::new("unused/status.md"),
+            &mut control_plane_cache,
+            &mut reloaded,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        ));
+        assert!(app.event_log_filter_input.is_none());
+
+        app.screen = Screen::EventLog;
+        assert!(!handle_key(
+            &mut app,
+            &cfg,
+            Path::new("unused/status.md"),
+            &mut control_plane_cache,
+            &mut reloaded,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        ));
+        assert_eq!(
+            app.event_log_filter_input,
+            Some(EventLogFilterField::TaskId)
+        );
+        for ch in "T-33".chars() {
+            handle_event_log_filter_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        handle_event_log_filter_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.event_log_filter_task_id, "T-33");
+        assert!(app.event_log_filter_input.is_none());
+
+        assert!(!handle_key(
+            &mut app,
+            &cfg,
+            Path::new("unused/status.md"),
+            &mut control_plane_cache,
+            &mut reloaded,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ));
+        assert_eq!(app.event_log_scroll, 1);
+
+        assert!(!handle_key(
+            &mut app,
+            &cfg,
+            Path::new("unused/status.md"),
+            &mut control_plane_cache,
+            &mut reloaded,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        ));
+        assert!(app.event_log_filter_task_id.is_empty());
+        assert_eq!(app.event_log_scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_c_clears_cohort_only_on_event_log_and_quits_elsewhere() {
+        let cfg = Config {
+            work_dir: PathBuf::from("unused"),
+            tick_ms: 250,
+        };
+        let mut app = AppState::new();
+        app.screen = Screen::EventLog;
+        app.event_log_filter_cohort = "B-1".into();
+        let mut control_plane_cache = ControlPlaneCache::default();
+        let mut reloaded = Instant::now();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(!handle_key(
+            &mut app,
+            &cfg,
+            Path::new("unused/status.md"),
+            &mut control_plane_cache,
+            &mut reloaded,
+            ctrl_c,
+        ));
+        assert!(app.event_log_filter_cohort.is_empty());
+
+        app.screen = Screen::Overview;
+        assert!(handle_key(
+            &mut app,
+            &cfg,
+            Path::new("unused/status.md"),
+            &mut control_plane_cache,
+            &mut reloaded,
+            ctrl_c,
+        ));
     }
 
     #[test]
