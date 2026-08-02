@@ -81,7 +81,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
