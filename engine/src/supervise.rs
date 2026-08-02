@@ -244,6 +244,18 @@ async fn run_async(spec: &SpawnSpec, started: Instant) -> Verdict {
     }
 }
 
+/// Fan out a set of LABELED contained calls through [`run_batch`] and pair each verdict back to its
+/// label, preserving the caller's order (not completion order). This is the review-roster fan-out
+/// primitive (`resolvers::reviewer::ReviewerRoster`): the caller names each review dimension, builds
+/// one [`SpawnSpec`] per dimension, and dispatches the WHOLE set through the same parallel
+/// supervisor as every other batched call — no dimension review spins up its own container runner,
+/// so each child still gets its private ProcessKit group/timeout/cancel/kill-on-parent-death from
+/// [`run_batch`].
+pub fn run_labeled_batch<L>(labeled: Vec<(L, SpawnSpec)>) -> Vec<(L, Verdict)> {
+    let (labels, specs): (Vec<L>, Vec<SpawnSpec>) = labeled.into_iter().unzip();
+    labels.into_iter().zip(run_batch(specs)).collect()
+}
+
 async fn run_batch_async(specs: Vec<SpawnSpec>, started: Vec<Instant>) -> Vec<Verdict> {
     debug_assert_eq!(specs.len(), started.len());
     let mut results = std::iter::repeat_with(|| None)
@@ -590,6 +602,36 @@ mod tests {
         let verdict = run(&test_child("supervise::tests::clean_output_test_child"));
         assert_eq!(verdict.reason, Reason::Ok, "{}", verdict.outcome_reason);
         assert!(verdict.stdout.contains("processkit-supervise-output"));
+    }
+
+    /// The review-roster fan-out primitive: labels (review-dimension names) pair back to their own
+    /// verdict in the caller's order, and the whole set runs through `run_batch` rather than any
+    /// ad-hoc runner. Two clean children stand in for a two-dimension review cycle.
+    #[test]
+    fn labeled_batch_pairs_each_verdict_to_its_label_in_order() {
+        let results = run_labeled_batch(vec![
+            (
+                "functionality".to_string(),
+                test_child("supervise::tests::clean_output_test_child"),
+            ),
+            (
+                "security".to_string(),
+                test_child("supervise::tests::clean_output_test_child"),
+            ),
+        ]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "functionality");
+        assert_eq!(results[1].0, "security");
+        assert!(
+            results
+                .iter()
+                .all(|(_, verdict)| verdict.reason == Reason::Ok),
+            "{:?}",
+            results
+                .iter()
+                .map(|(label, verdict)| (label, &verdict.outcome_reason))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
