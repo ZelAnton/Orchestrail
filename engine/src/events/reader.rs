@@ -15,10 +15,11 @@
 //!   delivered exactly once. (This reader only *reads*; append-repair itself is §19.5's writer,
 //!   out of this task's scope.)
 //!
-//! `events.jsonl` is append-only / single-writer (§19.6), so a byte offset is a stable cursor:
-//! everything before it is permanently committed. Newline-terminated but *invalid* lines are
-//! skipped (counted, not delivered) AND the cursor advances past them — a permanently corrupt
-//! committed line must not wedge the stream forever, matching `tools/outbox.ps1 read`.
+//! The logical stream (ordered immutable archives followed by `events.jsonl`) is append-only /
+//! single-writer (§19.6), so an absolute byte offset is a stable cursor: everything before it is
+//! permanently committed. Newline-terminated but *invalid* lines are skipped (counted, not
+//! delivered) AND the cursor advances past them — a permanently corrupt committed line must not
+//! wedge the stream forever, matching `tools/outbox.ps1 read`.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -28,7 +29,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::model::Event;
-use super::outbox::open_existing_plain_outbox;
+use super::outbox::{EventStreamLayout, event_stream_layout, open_existing_plain_outbox};
 use super::parse::parse_line;
 
 /// Largest byte range one `poll` retains at once.  The reader is long-lived, while an outbox can
@@ -154,7 +155,7 @@ impl RecentIds {
 
 /// A durable cursor: how far the consumer has read, and which ids it has already delivered.
 ///
-/// `byte_offset` alone would suffice for dedup *within* a monotonic file, but `delivered_ids`
+/// `byte_offset` alone would suffice for dedup within the monotonic logical stream, but `delivered_ids`
 /// makes dedup robust to duplicates that are appended later (idempotent replay writes the same
 /// `event_id` again, §19.5) and lets a persisted cursor resume without re-emitting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -331,20 +332,32 @@ impl TailReader {
     /// reads as empty (so `--follow` can wait for the file to appear).
     pub fn poll(&mut self) -> io::Result<Vec<Event>> {
         self.unterminated_tail = false;
-        let mut file = match open_existing_plain_outbox(&self.path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let len = file.metadata()?.len();
-        // Defensive: an append-only file should never shrink (§19.6). If it somehow did,
-        // there is nothing new past our cursor to read.
-        if self.offset >= len {
+        let layout = event_stream_layout(&self.path)?;
+        // Defensive: a logical append-only stream should never shrink. If it somehow did, there
+        // is nothing new past our cursor to read.
+        if self.offset >= layout.logical_len {
             return Ok(Vec::new());
         }
-        let unread = len - self.offset;
+        let source = layout
+            .sources
+            .iter()
+            .find(|source| self.offset >= source.start_offset && self.offset < source.end_offset)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "events cursor does not resolve to an archive or active segment",
+                )
+            })?;
+        let mut file = open_existing_plain_outbox(&source.path)?;
+        let unread = source.end_offset - self.offset;
         let read_len = unread.min(MAX_POLL_BYTES);
-        file.seek(SeekFrom::Start(self.offset))?;
+        let physical_offset = source
+            .physical_start
+            .checked_add(self.offset - source.start_offset)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "event source offset overflowed")
+            })?;
+        file.seek(SeekFrom::Start(physical_offset))?;
         let mut buf = Vec::with_capacity(read_len as usize);
         (&mut file).take(read_len).read_to_end(&mut buf)?;
 
@@ -357,10 +370,10 @@ impl TailReader {
                 let raw = &buf[line_start..i]; // line content, newline excluded
                 consumed = i + 1;
                 line_start = i + 1;
-                self.process_line(raw, absolute_line_start, &mut file, &mut out)?;
+                self.process_line(raw, absolute_line_start, &layout, &mut out)?;
             }
         }
-        self.unterminated_tail = consumed < buf.len() && read_len == unread;
+        self.unterminated_tail = !source.archived && consumed < buf.len() && read_len == unread;
         // buf[line_start..] is the unterminated trailing fragment (torn tail or not-yet-newline
         // valid line): deliberately NOT consumed and NOT advanced past. If it has filled a whole
         // capped poll while more bytes were already committed, it cannot become a valid bounded
@@ -371,6 +384,12 @@ impl TailReader {
                 format!("events.jsonl record exceeds {MAX_POLL_BYTES} byte limit"),
             ));
         }
+        if source.archived && consumed < buf.len() && read_len == unread {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archived events segment has an unterminated record",
+            ));
+        }
         self.offset += consumed as u64;
         Ok(out)
     }
@@ -379,7 +398,7 @@ impl TailReader {
         &mut self,
         raw: &[u8],
         absolute_line_start: u64,
-        file: &mut std::fs::File,
+        layout: &EventStreamLayout,
         out: &mut Vec<Event>,
     ) -> io::Result<()> {
         // A non-UTF-8 line cannot be a valid event; treat as an invalid (skipped) line.
@@ -397,7 +416,7 @@ impl TailReader {
             Ok(ev) => {
                 let duplicate = self.recent.contains(&ev.event_id)
                     || self.dedupe_filter.maybe_contains(&ev.event_id)
-                        && history_contains_event_id(file, absolute_line_start, &ev.event_id)?;
+                        && history_contains_event_id(layout, absolute_line_start, &ev.event_id)?;
                 if duplicate {
                     self.stats.skipped_dup += 1;
                 } else {
@@ -416,42 +435,51 @@ impl TailReader {
 }
 
 fn history_contains_event_id(
-    file: &mut std::fs::File,
+    layout: &EventStreamLayout,
     committed_end: u64,
     event_id: &str,
 ) -> io::Result<bool> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut reader = BufReader::new(file);
-    let mut position = 0_u64;
-    while position < committed_end {
-        let remaining = committed_end - position;
-        let read_limit = remaining.min(MAX_POLL_BYTES + 2);
-        let mut bounded = (&mut reader).take(read_limit);
-        let mut raw = Vec::new();
-        let read = bounded.read_until(b'\n', &mut raw)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "events history ended before the replay boundary",
-            ));
-        }
-        position = position
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "event offset overflowed"))?;
-        if raw.last() != Some(&b'\n') || raw.len() - 1 > MAX_POLL_BYTES as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("events.jsonl record exceeds {MAX_POLL_BYTES} byte limit"),
-            ));
-        }
-        raw.pop();
-        let Ok(text) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        if let Ok(event) = parse_line(text.trim())
-            && event.event_id == event_id
-        {
-            return Ok(true);
+    for source in layout
+        .sources
+        .iter()
+        .take_while(|source| source.start_offset < committed_end)
+    {
+        let logical_end = source.end_offset.min(committed_end);
+        let byte_len = logical_end - source.start_offset;
+        let mut file = open_existing_plain_outbox(&source.path)?;
+        file.seek(SeekFrom::Start(source.physical_start))?;
+        let mut reader = BufReader::new(file);
+        let mut position = 0_u64;
+        while position < byte_len {
+            let remaining = byte_len - position;
+            let read_limit = remaining.min(MAX_POLL_BYTES + 2);
+            let mut bounded = (&mut reader).take(read_limit);
+            let mut raw = Vec::new();
+            let read = bounded.read_until(b'\n', &mut raw)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "events history ended before the replay boundary",
+                ));
+            }
+            position = position.checked_add(read as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "event offset overflowed")
+            })?;
+            if raw.last() != Some(&b'\n') || raw.len() - 1 > MAX_POLL_BYTES as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("events.jsonl record exceeds {MAX_POLL_BYTES} byte limit"),
+                ));
+            }
+            raw.pop();
+            let Ok(text) = std::str::from_utf8(&raw) else {
+                continue;
+            };
+            if let Ok(event) = parse_line(text.trim())
+                && event.event_id == event_id
+            {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

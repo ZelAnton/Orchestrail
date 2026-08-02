@@ -1725,6 +1725,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::events::{Outbox, parse_line};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1884,6 +1885,39 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            cohort_token_usage(&work, "B-1", true),
+            TokenTelemetrySnapshot::Available(TokenUsage {
+                actual_tokens: 10,
+                estimated_tokens: 7,
+                actual_events: 1,
+                estimated_events: 1,
+                unmetered_events: 0,
+            })
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn cohort_token_snapshot_is_lossless_across_archive_and_active_segments() {
+        let work = temp_work("rotated-token-snapshot");
+        let outbox = Outbox::with_rotation_enabled(&work, true);
+        let actual = parse_line(&usage("u-archived", "B-1", 10, false)).unwrap();
+        let published = parse_line(
+            r#"{"schema_version":1,"event_id":"published-1","occurred_at":"2026-07-25T12:00:01Z","type":"cohort.published","batch_id":"B-1","actor":{"kind":"agent","name":"engine"},"payload":{}}"#,
+        )
+        .unwrap();
+        let closed = parse_line(
+            r#"{"schema_version":1,"event_id":"closed-1","occurred_at":"2026-07-25T12:00:02Z","type":"cohort.closed","batch_id":"B-1","actor":{"kind":"agent","name":"engine"},"payload":{}}"#,
+        )
+        .unwrap();
+        outbox.append_idempotent(&actual).unwrap();
+        outbox.append_idempotent(&published).unwrap();
+        outbox.append_idempotent(&closed).unwrap();
+        assert!(fs::read(work.join(OUTBOX_FILE)).unwrap().is_empty());
+
+        let estimated = parse_line(&usage("u-active", "B-1", 7, true)).unwrap();
+        outbox.append_idempotent(&estimated).unwrap();
         assert_eq!(
             cohort_token_usage(&work, "B-1", true),
             TokenTelemetrySnapshot::Available(TokenUsage {

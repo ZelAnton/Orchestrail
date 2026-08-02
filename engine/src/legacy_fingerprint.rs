@@ -13,9 +13,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use crate::events::outbox::{event_stream_layout, open_existing_plain_outbox};
 use crate::task_id::is_task_id;
 use sha2::{Digest, Sha256};
 use vcs_core::{BackendKind, Repo};
@@ -299,38 +300,51 @@ fn archive_digest(work: &Path) -> Result<String> {
 }
 
 fn outbox_digest(work: &Path) -> Result<String> {
-    let text = read_optional(&work.join("events.jsonl"))?;
     let mut event_ids = BTreeSet::new();
     let mut identities = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(event_id) = value.get("event_id").map(json_scalar) else {
-            continue;
-        };
-        if !event_ids.insert(event_id) {
-            continue;
-        }
-        let event_type = value.get("type").map(json_scalar).unwrap_or_default();
-        let batch = value.get("batch_id").map(json_scalar).unwrap_or_default();
-        let task = value.get("task_id").map(json_scalar).unwrap_or_default();
-        let (from, to) = value
-            .get("payload")
-            .and_then(serde_json::Value::as_object)
-            .map(|payload| {
-                (
-                    payload.get("from").map(json_scalar).unwrap_or_default(),
-                    payload.get("to").map(json_scalar).unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
-        let transition = if from.is_empty() && to.is_empty() {
-            String::new()
+    let path = work.join("events.jsonl");
+    let layout = event_stream_layout(&path)?;
+    for source in layout.sources {
+        let mut file = open_existing_plain_outbox(&source.path)?;
+        file.seek(SeekFrom::Start(source.physical_start))?;
+        let byte_len = source.end_offset - source.start_offset;
+        let mut text = String::new();
+        (&mut file).take(byte_len).read_to_string(&mut text)?;
+        let text = if source.start_offset == 0 {
+            text.strip_prefix('\u{feff}').unwrap_or(&text)
         } else {
-            format!("{from}>{to}")
+            &text
         };
-        identities.push(format!("{event_type}|{batch}|{task}|{transition}"));
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(event_id) = value.get("event_id").map(json_scalar) else {
+                continue;
+            };
+            if !event_ids.insert(event_id) {
+                continue;
+            }
+            let event_type = value.get("type").map(json_scalar).unwrap_or_default();
+            let batch = value.get("batch_id").map(json_scalar).unwrap_or_default();
+            let task = value.get("task_id").map(json_scalar).unwrap_or_default();
+            let (from, to) = value
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .map(|payload| {
+                    (
+                        payload.get("from").map(json_scalar).unwrap_or_default(),
+                        payload.get("to").map(json_scalar).unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default();
+            let transition = if from.is_empty() && to.is_empty() {
+                String::new()
+            } else {
+                format!("{from}>{to}")
+            };
+            identities.push(format!("{event_type}|{batch}|{task}|{transition}"));
+        }
     }
     identities.sort();
     Ok(identities.join(";"))
@@ -450,6 +464,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::events::{
+        Actor, ActorKind, Event, EventType, Outbox, SCHEMA_VERSION, deterministic_event_id,
+    };
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -461,6 +478,23 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create fingerprint fixture");
         root
+    }
+
+    fn lifecycle_event(key: &str, event_type: EventType) -> Event {
+        Event {
+            schema_version: SCHEMA_VERSION,
+            event_id: deterministic_event_id(key),
+            occurred_at: "2026-07-24T12:00:00Z".into(),
+            event_type,
+            actor: Actor {
+                kind: ActorKind::Agent,
+                name: "engine".into(),
+            },
+            batch_id: Some("B-1".into()),
+            task_id: None,
+            payload_version: 1,
+            payload: serde_json::Map::new(),
+        }
     }
 
     #[test]
@@ -524,6 +558,31 @@ mod tests {
             "7b400d7c0af8af649db695c3c1cbd3f5d2d1ad475ffa51aafccb1bfdb40ab1dd"
         );
         let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn rotated_and_monolithic_outboxes_have_identical_legacy_fingerprints() {
+        let monolithic = work();
+        let rotated = work();
+        let events = [
+            lifecycle_event("open", EventType::CohortOpened),
+            lifecycle_event("published", EventType::CohortPublished),
+            lifecycle_event("closed", EventType::CohortClosed),
+        ];
+        let plain_outbox = Outbox::new(&monolithic);
+        let rotating_outbox = Outbox::with_rotation_enabled(&rotated, true);
+        for event in &events {
+            plain_outbox.append_idempotent(event).unwrap();
+            rotating_outbox.append_idempotent(event).unwrap();
+        }
+
+        let tree = [TreeEntry::new("app.txt", "same\n")];
+        let plain = final_state_fingerprint(&monolithic, tree.clone()).unwrap();
+        let archived = final_state_fingerprint(&rotated, tree).unwrap();
+        assert_eq!(archived.outbox, plain.outbox);
+        assert_eq!(archived.combined, plain.combined);
+        let _ = fs::remove_dir_all(monolithic);
+        let _ = fs::remove_dir_all(rotated);
     }
 
     #[test]

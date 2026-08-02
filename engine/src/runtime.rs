@@ -233,6 +233,13 @@ impl ProcessorRuntime {
         &self.pending
     }
 
+    /// Bind the operator's non-semantic storage policy after configuration has been decoded.
+    /// Rotation is deliberately not part of the reducer checkpoint: archives preserve the same
+    /// logical event stream and may be enabled or disabled between otherwise identical runs.
+    pub fn set_events_rotation_enabled(&mut self, enabled: bool) {
+        self.outbox.set_rotation_enabled(enabled);
+    }
+
     /// Return the durable ledger key associated with an effect. Effects without a key are
     /// informational scheduling markers and must not be acknowledged as completed work.
     pub fn effect_key(effect: &Effect) -> Option<String> {

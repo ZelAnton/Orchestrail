@@ -202,6 +202,7 @@ per context first, so a sort parameter would be silently ignored.
 | Key | Type and accepted forms | Default when absent | Meaning | Invalid or special behavior |
 | --- | --- | --- | --- | --- |
 | `EVENTS_OUTBOX` | `true/false` or `on/off` | `true` | Enables durable engine event and usage telemetry. Its value is snapshotted per cohort. | Invalid boolean text rejects the configuration. Disabling it makes a positive cohort token budget unusable, so model dispatch fails closed at the token gate. |
+| `EVENTS_ROTATION_ENABLED` | `true/false` or `on/off` | `false` | After a published cohort completes Phase 6, transfers the complete active event segment to `.work/events_archive/`. Archived ranges remain part of the logical outbox for readers, deduplication, telemetry, and fingerprints. | Invalid boolean text rejects the configuration. Disabling rotation does not hide archives created while it was enabled. |
 
 ## Codex agents
 

@@ -21,6 +21,9 @@ use crate::work_fs::{self, MAX_CONTROL_BYTES};
 pub struct EngineConfig {
     pub processor: ProcessorConfig,
     pub events_outbox: bool,
+    /// Rotate complete published-cohort event prefixes into immutable archive segments. Off by
+    /// default so existing repositories retain their single-file layout until explicitly opted in.
+    pub events_rotation_enabled: bool,
     pub knowledge_base: bool,
     /// Expire unconfirmed singleton knowledge entries after this many completed cohorts.
     pub knowledge_ttl_batches: u64,
@@ -147,6 +150,7 @@ impl Default for EngineConfig {
         Self {
             processor: ProcessorConfig::default(),
             events_outbox: true,
+            events_rotation_enabled: false,
             knowledge_base: true,
             knowledge_ttl_batches: 8,
             knowledge_cap_per_area: 12,
@@ -284,6 +288,8 @@ fn parse_with_environment(
         optional_true_false(&fields, "COHORT_TOKEN_BUDGET_STRICT")?
             .unwrap_or(config.processor.cohort_token_budget_strict);
     config.events_outbox = optional_bool(&fields, "EVENTS_OUTBOX")?.unwrap_or(config.events_outbox);
+    config.events_rotation_enabled = optional_bool(&fields, "EVENTS_ROTATION_ENABLED")?
+        .unwrap_or(config.events_rotation_enabled);
     config.processor.events_outbox_enabled = config.events_outbox;
     config.knowledge_base = resolve_knowledge_base(&fields, &environment)?;
     config.knowledge_ttl_batches =
@@ -886,10 +892,11 @@ mod tests {
     #[test]
     fn parser_handles_documented_boolean_spellings_and_zero_budget() {
         let parsed = parse(
-            "EVENTS_OUTBOX: off # disabled\nKB: on\nKB_TTL: 5\nKB_CAP: 7\nPUSH: false\nCI_WATCH: true\nPUBLISH_LINEAR_HISTORY: on\nCOHORT_BUDGET_SEC: 0\nCOHORT_TOKEN_BUDGET: 0\n",
+            "EVENTS_OUTBOX: off # disabled\nEVENTS_ROTATION_ENABLED: on\nKB: on\nKB_TTL: 5\nKB_CAP: 7\nPUSH: false\nCI_WATCH: true\nPUBLISH_LINEAR_HISTORY: on\nCOHORT_BUDGET_SEC: 0\nCOHORT_TOKEN_BUDGET: 0\n",
         )
         .unwrap();
         assert!(!parsed.events_outbox);
+        assert!(parsed.events_rotation_enabled);
         assert!(parsed.knowledge_base);
         assert_eq!(parsed.knowledge_ttl_batches, 5);
         assert_eq!(parsed.knowledge_cap_per_area, 7);
@@ -899,6 +906,8 @@ mod tests {
         assert_eq!(parsed.processor.cohort_budget_secs, None);
         assert_eq!(parsed.processor.cohort_token_budget, None);
         assert!(!parsed.processor.events_outbox_enabled);
+        assert!(!EngineConfig::default().events_rotation_enabled);
+        assert!(parse("EVENTS_ROTATION_ENABLED: maybe\n").is_err());
     }
 
     #[test]

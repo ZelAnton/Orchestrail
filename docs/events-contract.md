@@ -445,9 +445,9 @@ For each append, the writer:
 6. Returns without appending for an already-present event; otherwise writes one compact JSON
    object plus `\n`, then calls `sync_all`.
 
-Earlier committed records are never rewritten or removed. Tail truncation is limited to bytes
-after the last commit line feed. If the whole file is one unterminated record, recovery truncates
-it to zero before a new append.
+With rotation disabled (the default), earlier committed records are never rewritten or removed.
+Tail truncation is limited to bytes after the last commit line feed. If the whole file is one
+unterminated record, recovery truncates it to zero before a new append.
 
 A newline-terminated malformed existing record makes the writer fail closed before appending.
 An unterminated tail is not parsed as a committed record; it is discarded on the next append.
@@ -455,8 +455,25 @@ Both writer indexing and reader delivery impose a 1 MiB per-record ceiling. An o
 committed record, or an oversized unterminated tail for which a safe commit boundary cannot be
 found, is an error.
 
-These guarantees depend on the append-only invariant. Consumers must not rotate, truncate,
-replace, or rewrite `events.jsonl` underneath an active cursor.
+### Optional archive rotation
+
+`EVENTS_ROTATION_ENABLED: true` lets the native writer rotate only after it has durably committed
+both `cohort.published` and the later Phase-6 `cohort.closed` for the same batch. The entire
+newline-terminated active file becomes the next immutable, zero-padded segment in
+`.work/events_archive/`; `.work/events_rotation.json` maps each segment to its original absolute
+byte range. The active file then continues at the last archived offset.
+
+Transfer is a recoverable sequence: a streamed temporary archive is synchronized and renamed,
+metadata atomically publishes the archived range plus a pending active-prefix marker, the active
+file is atomically replaced without that prefix, and metadata clears the marker. Before metadata
+publication readers use the unchanged active file. While the marker is present they read the
+archive and skip its duplicate active prefix; after replacement they read the archive and the new
+active suffix. A writer restart adopts a fully written orphan segment only after proving that it
+matches the active prefix, then completes the same sequence. Thus every crash point exposes one
+logical copy of every committed byte.
+
+Only the engine owns rotation. Consumers and operators must not independently rotate, truncate,
+replace, edit, or remove the active file, archive metadata, or immutable segments.
 
 ## `TailReader` and persistent cursors
 
@@ -484,7 +501,7 @@ filter.
 
 | Cursor field | Presence | Semantics |
 | --- | --- | --- |
-| `byte_offset` | Required | Byte position immediately after the last processed committed newline. It advances past valid events, duplicates, invalid committed lines, and blank lines. It never advances into an unterminated tail. |
+| `byte_offset` | Required | Absolute logical byte position immediately after the last processed committed newline, as if archived segments and the active file were still one monolithic journal. It advances past valid events, duplicates, invalid committed lines, and blank lines. It never advances into an unterminated active tail. |
 | `delivered_ids` | Required | Exact ordered window of up to the 512 most recently delivered IDs. More than 512 input IDs are accepted but only the newest 512 are retained. |
 | `dedupe_filter` | Optional for legacy cursors | Fixed hexadecimal membership filter covering delivered IDs known to the current cursor. Parsing a legacy cursor without it builds a filter from `delivered_ids`. |
 
@@ -496,12 +513,15 @@ the consuming application is responsible for durably persisting it.
 ### Resolving the next read position
 
 Create `TailReader::new(path)` to start at byte zero. To resume, parse the consumer's cursor and
-create `TailReader::with_cursor(path, &cursor)`. The reader starts exactly at `byte_offset`; it
-does not search by timestamp or by the last ID.
+create `TailReader::with_cursor(path, &cursor)`. The reader resolves `byte_offset` through sorted
+archive ranges and then the active segment; it does not search by timestamp or by the last ID.
+Consequently a cursor persisted before rotation resumes at the identical next byte afterward.
 
-A missing journal reads as empty, which allows a follow-mode consumer to wait for creation. If
-the file has unexpectedly shrunk to or below the stored offset, the reader returns no events; it
-does not reset or replay because shrinking violates the append-only precondition.
+A missing journal and absent archive map read as empty, which allows a follow-mode consumer to
+wait for creation. If the complete logical stream has unexpectedly shrunk to or below the stored
+offset, the reader returns no events; it does not reset or replay because logical shrinking
+violates the append-only precondition. Guarded rotation can shrink the physical active file but
+never the archive-plus-active logical stream.
 
 ### `poll()` versus `poll_all()`
 
@@ -517,9 +537,10 @@ applied the returned events. Persisting first can lose delivery after a consumer
 
 ### Torn tails, invalid lines, and counters
 
-Only newline-terminated records are processed. A final unterminated fragment remains unread;
-`has_unterminated_tail()` reports it after the poll that reached physical EOF. Once the writer
-repairs or completes the tail and a newline exists, a later poll can process it.
+Only newline-terminated records are processed. Archived segments must end at a committed newline;
+an unterminated archive is corruption. A final unterminated fragment in the active segment remains
+unread; `has_unterminated_tail()` reports it after the poll that reached physical EOF. Once the
+writer repairs or completes the tail and a newline exists, a later poll can process it.
 
 A committed non-UTF-8 or envelope-invalid line is skipped, increments `skipped_invalid`, and
 advances the cursor so one corrupt record cannot wedge a live stream. A duplicate increments
@@ -571,5 +592,5 @@ the parity fingerprint.
 6. Treat Russian task status strings and telemetry enum values as stable wire literals.
 7. Surface invalid committed lines and torn tails rather than silently presenting a complete
    snapshot.
-8. Never rewrite, rotate, or truncate the journal while an engine or cursor-based consumer is
-   active.
+8. Never rewrite, rotate, truncate, or remove event storage outside the engine's guarded rotation
+   mechanism.
