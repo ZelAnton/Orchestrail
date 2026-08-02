@@ -6,7 +6,7 @@ Status: Accepted · Date: 2026-05-10
 
 The native processor path fails closed when an integration does not have a native, typed implementation. It does not silently fall back to the legacy sandbox mode: `engine/src/lib.rs` identifies `engine run` as a sandbox-only compatibility fixture and the native processor as the production-oriented path.
 
-Model calls and forge CI are injected at the native-port edge because projects differ in authentication and provider policy. All other native processor operations use the durable `ControlPlane` and `VcsService` layers. Publication CI accepts only the typed GitHub, GitLab, and Gitea backends; an unrecognised `FORGE` value is rejected during configuration rather than allowing publication without observed CI.
+Model calls and forge CI are injected at the native-port edge because projects differ in authentication and provider policy. At that edge, `ControlPlane` owns control-plane mutations only, and `VcsService` owns repository effects only. `engine/src/native_port.rs` also wires approval storage, dependency-graph synchronization, inbox handling, notification dispatch, policy loading, verification, and durable outbox event services. Publication CI accepts only the typed GitHub, GitLab, and Gitea backends; an unrecognised `FORGE` value is rejected during configuration rather than allowing publication without observed CI.
 
 ## Why
 
@@ -20,4 +20,4 @@ Model calls and forge CI are injected at the native-port edge because projects d
 - Unsupported native integrations stop with explicit error context and require a native implementation before they can proceed.
 - Extending publication CI requires an explicit typed forge implementation and configuration support; it cannot rely on a generic fallback.
 - GitHub, GitLab, and Gitea configuration are supported; values outside `github`, `gitlab`, and `gitea` are invalid.
-- Native effects flow through `ControlPlane` and `VcsService`, reinforcing [ADR 0001](0001-processkit-sole-boundary.md) and [ADR 0002](0002-typed-vcs-crates.md).
+- Native control-plane mutations and repository effects flow through `ControlPlane` and `VcsService`, respectively; the additional native-port services retain their own typed boundaries. This reinforces [ADR 0001](0001-processkit-sole-boundary.md) and [ADR 0002](0002-typed-vcs-crates.md).

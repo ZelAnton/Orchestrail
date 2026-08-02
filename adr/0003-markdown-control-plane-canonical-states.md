@@ -19,5 +19,5 @@ The orchestrator's durable control plane is represented by human-readable Markdo
 
 - Consumers use canonical names such as `not-started`, `working`, `in-review`, `ready`, `merged`, `published`, `done`, `escalated`, and `conflict` after parsing task literals.
 - Cohort admission uses the canonical `open` and `closed` names; integration state has its own canonical vocabulary, including `none` and `in-progress`.
-- State changes and transition validation remain the responsibility of `tools/state-tx.ps1`, not the state snapshot layer.
+- The state snapshot module remains read-only. Native Markdown mutations and task-transition validation are owned by `engine/src/control.rs`; `tools/state-tx.ps1` retains that authority only in the legacy sandbox compatibility path.
 - The explicit read-only boundary complements the durable native processor described in [ADR 0004](0004-fail-closed-unported-integrations.md).

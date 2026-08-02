@@ -13,13 +13,13 @@ Create one Markdown file in this directory named `<NNNN>-<kebab-case-title>.md`.
 
 Status: Accepted · Date: YYYY-MM-DD
 
+## Context
+
+Describe the background, constraints, and rationale that made the decision necessary.
+
 ## Decision
 
 State the architectural choice and its scope.
-
-## Why
-
-- Record the relevant context and rationale.
 
 ## Consequences
 
