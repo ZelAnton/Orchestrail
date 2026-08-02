@@ -1,4 +1,5 @@
 /target
+.verification-tmp/
 
 # Per-user scratch notes — never committed. Use these names freely for
 # throwaway planning/working files.

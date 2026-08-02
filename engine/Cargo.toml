@@ -47,6 +47,8 @@ uuid = { version = "1", features = ["v4", "v5"] }
 [dev-dependencies]
 # Property tests for parser and state-machine panic-freedom.
 proptest = { version = "=1.0.0", default-features = false, features = ["std"] }
+# Statistical micro-benchmarks for append-only event and control-plane hot paths.
+criterion = "0.7.0"
 
 [lib]
 name = "orchestrail_engine"
@@ -81,3 +83,23 @@ test = false
 name = "orchestrail-fixture-process-tree"
 path = "tests/support/fixture_process_tree.rs"
 test = false
+
+[[bench]]
+name = "events_reader"
+path = "benches/events_reader.rs"
+harness = false
+
+[[bench]]
+name = "events_outbox"
+path = "benches/events_outbox.rs"
+harness = false
+
+[[bench]]
+name = "events_projector"
+path = "benches/events_projector.rs"
+harness = false
+
+[[bench]]
+name = "state_snapshot"
+path = "benches/state_snapshot.rs"
+harness = false
