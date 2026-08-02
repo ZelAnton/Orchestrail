@@ -6,8 +6,8 @@
 //! a changed fingerprint or policy necessarily addresses a different record.
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -163,7 +163,7 @@ impl ApprovalStore {
     pub fn new(work: impl AsRef<Path>) -> Result<Self> {
         let work = work.as_ref();
         let metadata = fs::symlink_metadata(work).map_err(ApprovalError::Io)?;
-        if !metadata.is_dir() || redirected(&metadata) {
+        if !metadata.is_dir() || work_fs::redirected(&metadata) {
             return Err(ApprovalError::Invalid(format!(
                 "approval work directory does not exist: {}",
                 work.display()
@@ -304,9 +304,21 @@ impl ApprovalStore {
     pub fn load(&self, id: &str) -> Result<Option<ApprovalRecord>> {
         validate_id(id)?;
         let path = self.path(id);
-        let Some(text) = read_plain_approval(&self.work, &self.directory, &path)? else {
+        if !approval_directory_available(&self.work, &self.directory, false)? {
             return Ok(None);
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
+        work_fs::require_plain_file(&path, &metadata).map_err(|_| {
+            ApprovalError::Corrupt(format!(
+                "approval artifact is redirected or non-regular: {}",
+                path.display()
+            ))
+        })?;
+        let text = read_approval_text(&path, metadata.len())?;
         let record: ApprovalRecord = serde_json::from_str(&text)?;
         validate_record(&record, id)?;
         Ok(Some(record))
@@ -359,38 +371,37 @@ impl ApprovalStore {
     }
 
     fn replace_plain(&self, path: &Path, content: &[u8]) -> Result<()> {
-        ensure_approval_directory(&self.work, &self.directory, true)?;
+        approval_directory_available(&self.work, &self.directory, true)?;
         if content.len() as u64 > MAX_APPROVAL_BYTES {
             return Err(ApprovalError::Corrupt(
                 "approval artifact is oversized".into(),
             ));
         }
         match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() && !redirected(&metadata) => {}
-            Ok(_) => {
-                return Err(ApprovalError::Corrupt(format!(
+            Ok(metadata) => work_fs::require_plain_file(path, &metadata).map_err(|_| {
+                ApprovalError::Corrupt(format!(
                     "approval artifact is redirected or non-regular: {}",
                     path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                ))
+            })?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         work_fs::replace_file(&self.work, path, content, MAX_APPROVAL_BYTES)?;
         let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file() || redirected(&metadata) {
-            return Err(ApprovalError::Corrupt(format!(
+        work_fs::require_plain_file(path, &metadata).map_err(|_| {
+            ApprovalError::Corrupt(format!(
                 "approval replacement is not a plain file: {}",
                 path.display()
-            )));
-        }
+            ))
+        })?;
         Ok(())
     }
 
     fn with_mutation_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        ensure_approval_directory(&self.work, &self.directory, true)?;
+        approval_directory_available(&self.work, &self.directory, true)?;
         let lock = self.directory.join(MUTATION_LOCK);
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&lock) {
+        let mut file = match work_fs::create_new_plain_file(&lock) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(ApprovalError::Busy);
@@ -433,109 +444,66 @@ impl ApprovalStore {
     }
 }
 
-fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-fn ensure_approval_directory(work: &Path, directory: &Path, create: bool) -> Result<bool> {
-    let work_metadata = fs::symlink_metadata(work)?;
-    if !work_metadata.is_dir() || redirected(&work_metadata) {
-        return Err(ApprovalError::Corrupt(
-            "approval .work is redirected".into(),
-        ));
-    }
+fn approval_directory_available(work: &Path, directory: &Path, create: bool) -> Result<bool> {
+    work_fs::require_plain_directory(work).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            ApprovalError::Corrupt("approval .work is redirected".into())
+        } else {
+            ApprovalError::Io(error)
+        }
+    })?;
     match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.is_dir() && !redirected(&metadata) => Ok(true),
-        Ok(_) => Err(ApprovalError::Corrupt(
-            "approval directory is redirected or non-directory".into(),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(directory)?;
-            let metadata = fs::symlink_metadata(directory)?;
-            if metadata.is_dir() && !redirected(&metadata) {
-                Ok(true)
-            } else {
-                Err(ApprovalError::Corrupt(
-                    "created approval directory is not plain".into(),
-                ))
-            }
+        Ok(_) => work_fs::require_plain_directory(directory)
+            .map(|()| true)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    ApprovalError::Corrupt(
+                        "approval directory is redirected or non-directory".into(),
+                    )
+                } else {
+                    ApprovalError::Io(error)
+                }
+            }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !create => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            work_fs::ensure_plain_directory(directory).map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    ApprovalError::Corrupt("created approval directory is not plain".into())
+                } else {
+                    ApprovalError::Io(error)
+                }
+            })?;
+            Ok(true)
         }
         Err(error) => Err(error.into()),
     }
 }
 
-fn read_plain_approval(work: &Path, directory: &Path, path: &Path) -> Result<Option<String>> {
-    if !ensure_approval_directory(work, directory, false)? {
-        return Ok(None);
-    }
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !before.is_file() || redirected(&before) {
-        return Err(ApprovalError::Corrupt(format!(
-            "approval artifact is redirected or non-regular: {}",
-            path.display()
-        )));
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x0020_0000);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0o400_000);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0x0100);
-    }
-    let mut file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || redirected(&metadata) || metadata.len() > MAX_APPROVAL_BYTES {
+fn read_approval_text(path: &Path, initial_len: u64) -> Result<String> {
+    if initial_len > MAX_APPROVAL_BYTES {
         return Err(ApprovalError::Corrupt(
             "approval artifact is invalid or oversized".into(),
         ));
     }
-    let mut text = String::new();
-    (&mut file)
-        .take(MAX_APPROVAL_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > MAX_APPROVAL_BYTES {
-        return Err(ApprovalError::Corrupt(
-            "approval artifact grew oversized".into(),
-        ));
-    }
-    let after = fs::symlink_metadata(path)?;
-    if !after.is_file() || redirected(&after) {
-        return Err(ApprovalError::Corrupt(
-            "approval artifact was replaced while reading".into(),
-        ));
-    }
-    Ok(Some(text))
+    let bytes = work_fs::read_plain_bytes(path, MAX_APPROVAL_BYTES).map_err(|error| {
+        if error.kind() != io::ErrorKind::InvalidData {
+            return ApprovalError::Io(error);
+        }
+        let diagnostic = error.to_string();
+        if diagnostic.starts_with("control-plane artifact grew beyond") {
+            ApprovalError::Corrupt("approval artifact grew oversized".into())
+        } else if diagnostic.starts_with("control-plane artifact exceeds") {
+            ApprovalError::Corrupt("approval artifact is invalid or oversized".into())
+        } else {
+            ApprovalError::Corrupt("approval artifact was replaced while reading".into())
+        }
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        ApprovalError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
+    })
 }
 
 #[derive(Serialize)]

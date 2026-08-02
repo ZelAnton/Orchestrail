@@ -5,8 +5,9 @@
 //! observes the claim instead of sending a duplicate message.  It deliberately persists neither
 //! command output nor the underlying VCS/approval payload.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fmt;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,95 +23,62 @@ const NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
 const NOTIFICATION_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const NOTIFICATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 
-fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+#[derive(Debug)]
+enum NotificationError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    Invalid(String),
 }
 
-fn require_plain_directory(path: &Path) -> Result<(), ()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if metadata.is_dir() && !redirected(&metadata) {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
-
-fn ensure_receipt_parent(work: &Path, path: &Path) -> Result<(), ()> {
-    require_plain_directory(work)?;
-    let parent = path.parent().ok_or(())?;
-    if parent != work.join("notifications") || path.parent().and_then(Path::parent) != Some(work) {
-        return Err(());
-    }
-    match fs::symlink_metadata(parent) {
-        Ok(_) => require_plain_directory(parent),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(parent).map_err(|_| ())?;
-            require_plain_directory(parent)
+impl fmt::Display for NotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "notification receipt I/O error: {error}"),
+            Self::Json(error) => write!(f, "notification receipt JSON error: {error}"),
+            Self::Invalid(message) => f.write_str(message),
         }
-        Err(_) => Err(()),
     }
 }
 
-fn read_receipt(work: &Path, path: &Path) -> Result<String, ()> {
-    ensure_receipt_parent(work, path)?;
-    let before = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !before.is_file() || redirected(&before) {
-        return Err(());
+impl std::error::Error for NotificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::Invalid(_) => None,
+        }
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+impl From<io::Error> for NotificationError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
+}
+
+impl From<serde_json::Error> for NotificationError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
     }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
+}
+
+type NotificationResult<T> = std::result::Result<T, NotificationError>;
+
+fn ensure_receipt_location(work: &Path, path: &Path) -> NotificationResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        NotificationError::Invalid(format!(
+            "notification receipt path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    if parent != work.join("notifications") || path.parent().and_then(Path::parent) != Some(work) {
+        return Err(NotificationError::Invalid(format!(
+            "notification receipt path is outside the notifications directory: {}",
+            path.display()
+        )));
     }
-    let mut file = options.open(path).map_err(|_| ())?;
-    let opened = file.metadata().map_err(|_| ())?;
-    if !opened.is_file() || redirected(&opened) || opened.len() > NOTIFICATION_RECEIPT_MAX_BYTES {
-        return Err(());
-    }
-    let mut text = String::new();
-    (&mut file)
-        .take(NOTIFICATION_RECEIPT_MAX_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| ())?;
-    if text.len() as u64 > NOTIFICATION_RECEIPT_MAX_BYTES {
-        return Err(());
-    }
-    let after = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !after.is_file() || redirected(&after) {
-        return Err(());
-    }
-    Ok(text)
+    work_fs::ensure_plain_parent(work, path)?;
+    Ok(())
 }
 
 /// The three processor boundaries that may request an operator notification.
@@ -275,7 +243,7 @@ impl NotificationDispatcher {
             Ok(Claim::Final(outcome)) => return Some(outcome),
             Ok(Claim::InProgress) => return None,
             Ok(Claim::Claimed) => {}
-            Err(()) => return Some(self.outcome(event, subject, NotificationStatus::Failed, 0)),
+            Err(_) => return Some(self.outcome(event, subject, NotificationStatus::Failed, 0)),
         }
 
         let context = safe_context(event, subject);
@@ -338,7 +306,7 @@ impl NotificationDispatcher {
         path: &Path,
         event: NotificationEvent,
         subject: &str,
-    ) -> Result<Claim, ()> {
+    ) -> NotificationResult<Claim> {
         let expected_id = notification_id(event, subject);
         let receipt = NotificationReceipt {
             schema: NOTIFICATION_SCHEMA.into(),
@@ -349,24 +317,27 @@ impl NotificationDispatcher {
             reason: None,
             duration_ms: None,
         };
-        let mut content = serde_json::to_vec_pretty(&receipt).map_err(|_| ())?;
+        let mut content = serde_json::to_vec_pretty(&receipt)?;
         content.push(b'\n');
-        ensure_receipt_parent(&self.work, path)?;
-        match OpenOptions::new().write(true).create_new(true).open(path) {
+        ensure_receipt_location(&self.work, path)?;
+        match work_fs::create_new_plain_file(path) {
             Ok(mut file) => {
-                file.write_all(&content).map_err(|_| ())?;
-                file.sync_all().map_err(|_| ())?;
+                file.write_all(&content)?;
+                file.sync_all()?;
                 Ok(Claim::Claimed)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let text = read_receipt(&self.work, path)?;
-                let existing: NotificationReceipt = serde_json::from_str(&text).map_err(|_| ())?;
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let text = work_fs::read_plain_text(path, NOTIFICATION_RECEIPT_MAX_BYTES)?;
+                let existing: NotificationReceipt = serde_json::from_str(&text)?;
                 if existing.schema != NOTIFICATION_SCHEMA
                     || existing.id != expected_id
                     || existing.event != event
                     || existing.subject != subject
                 {
-                    return Err(());
+                    return Err(NotificationError::Invalid(format!(
+                        "notification receipt does not match request: {}",
+                        path.display()
+                    )));
                 }
                 match (existing.status, existing.duration_ms) {
                     (Some(status), Some(duration_ms)) => Ok(Claim::Final(NotificationOutcome {
@@ -380,10 +351,13 @@ impl NotificationDispatcher {
                         duration_ms,
                     })),
                     (None, None) => Ok(Claim::InProgress),
-                    _ => Err(()),
+                    _ => Err(NotificationError::Invalid(format!(
+                        "notification receipt has inconsistent completion fields: {}",
+                        path.display()
+                    ))),
                 }
             }
-            Err(_) => Err(()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -392,7 +366,7 @@ impl NotificationDispatcher {
         path: &Path,
         subject: &str,
         outcome: &NotificationOutcome,
-    ) -> Result<(), ()> {
+    ) -> NotificationResult<()> {
         let mut content = serde_json::to_vec_pretty(&NotificationReceipt {
             schema: NOTIFICATION_SCHEMA.into(),
             id: outcome.id.clone(),
@@ -401,20 +375,14 @@ impl NotificationDispatcher {
             status: Some(outcome.status),
             reason: Some(outcome.reason),
             duration_ms: Some(outcome.duration_ms),
-        })
-        .map_err(|_| ())?;
+        })?;
         content.push(b'\n');
-        ensure_receipt_parent(&self.work, path)?;
-        let existing = fs::symlink_metadata(path).map_err(|_| ())?;
-        if !existing.is_file() || redirected(&existing) {
-            return Err(());
-        }
-        work_fs::replace_file(&self.work, path, &content, NOTIFICATION_RECEIPT_MAX_BYTES)
-            .map_err(|_| ())?;
-        let final_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-        if !final_metadata.is_file() || redirected(&final_metadata) {
-            return Err(());
-        }
+        ensure_receipt_location(&self.work, path)?;
+        let existing = fs::symlink_metadata(path)?;
+        work_fs::require_plain_file(path, &existing)?;
+        work_fs::replace_file(&self.work, path, &content, NOTIFICATION_RECEIPT_MAX_BYTES)?;
+        let final_metadata = fs::symlink_metadata(path)?;
+        work_fs::require_plain_file(path, &final_metadata)?;
         Ok(())
     }
 }

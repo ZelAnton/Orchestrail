@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -435,7 +435,7 @@ fn read_final_reply_candidate(work: &Path, message_id: &str) -> Result<FinalRepl
             path.display()
         )));
     }
-    let text = read_plain_text(&path, "final-v1 reply candidate", MAX_MESSAGE_RECORD_BYTES)?;
+    let text = read_inbox_text(&path, "final-v1 reply candidate", MAX_MESSAGE_RECORD_BYTES)?;
     let raw: Value = serde_json::from_str(&text).map_err(|error| {
         InboxError::Malformed(format!(
             "final-v1 reply candidate is not valid JSON {}: {error}",
@@ -674,7 +674,7 @@ impl InboxLock {
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
+            match work_fs::create_new_plain_file(path) {
                 Ok(mut file) => {
                     let token = format!("{}\n", Uuid::new_v4());
                     file.write_all(token.as_bytes())?;
@@ -818,7 +818,7 @@ fn load_message(path: PathBuf) -> Result<Record> {
         .and_then(|name| name.strip_suffix(".json"))
         .map(|suffix| format!("msg-{suffix}"))
         .ok_or_else(|| InboxError::Malformed(format!("invalid message filename {name:?}")))?;
-    let text = read_plain_text(&path, "inbox message", MAX_MESSAGE_RECORD_BYTES)?;
+    let text = read_inbox_text(&path, "inbox message", MAX_MESSAGE_RECORD_BYTES)?;
     let value: Value = serde_json::from_str(&text).map_err(|error| {
         InboxError::Malformed(format!("{} is not valid JSON: {error}", path.display()))
     })?;
@@ -1175,7 +1175,7 @@ fn task_links(root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
         return Ok(links);
     };
     for file in ["Tasks_Queue.md", "Tasks_Done.md"] {
-        if let Some(text) = read_optional_plain_file(&work.join(file))? {
+        if let Some(text) = read_optional_inbox_text(&work, &work.join(file))? {
             add_links_from_text(&text, None, &mut links);
         }
     }
@@ -1198,7 +1198,7 @@ fn task_links(root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
             let task_directory = entry.path();
             let metadata = fs::symlink_metadata(&task_directory)?;
             assert_plain_directory(&task_directory, &metadata)?;
-            if let Some(text) = read_optional_plain_file(&task_directory.join("task.md"))? {
+            if let Some(text) = read_optional_inbox_text(&work, &task_directory.join("task.md"))? {
                 add_links_from_text(&text, Some(&task_id), &mut links);
             }
         }
@@ -1221,78 +1221,56 @@ fn work_directory(root: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-fn read_optional_plain_file(path: &Path) -> Result<Option<String>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            assert_plain_file(path, &metadata)?;
-            Ok(Some(read_plain_text(
-                path,
-                "inbox control-plane file",
-                MAX_CONTROL_BYTES,
-            )?))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+fn read_optional_inbox_text(work: &Path, path: &Path) -> Result<Option<String>> {
+    work_fs::read_optional_bytes(work, path, MAX_CONTROL_BYTES)
+        .map_err(|error| {
+            map_plain_read_error(path, "inbox control-plane file", MAX_CONTROL_BYTES, error)
+        })?
+        .map(decode_plain_text)
+        .transpose()
+}
+
+fn read_inbox_text(path: &Path, label: &str, maximum_bytes: u64) -> Result<String> {
+    let bytes = work_fs::read_plain_bytes(path, maximum_bytes)
+        .map_err(|error| map_plain_read_error(path, label, maximum_bytes, error))?;
+    decode_plain_text(bytes)
+}
+
+fn map_plain_read_error(
+    path: &Path,
+    label: &str,
+    maximum_bytes: u64,
+    error: io::Error,
+) -> InboxError {
+    if error.kind() != io::ErrorKind::InvalidData {
+        return InboxError::Io(error);
+    }
+    let diagnostic = error.to_string();
+    if diagnostic.starts_with("control-plane artifact grew beyond") {
+        InboxError::Malformed(format!(
+            "{label} grew beyond the {maximum_bytes}-byte limit: {}",
+            path.display()
+        ))
+    } else if diagnostic.starts_with("control-plane artifact exceeds") {
+        InboxError::Malformed(format!(
+            "{label} exceeds the {maximum_bytes}-byte limit: {}",
+            path.display()
+        ))
+    } else {
+        InboxError::Malformed(format!(
+            "inbox path is not a plain file: {}",
+            path.display()
+        ))
     }
 }
 
-/// Read text through a checked handle rather than `read_to_string(path)`. On Windows opening a
-/// reparse point itself makes the existing metadata predicate apply to the opened object, not a
-/// target substituted between a path check and the read. Unix uses its corresponding `O_NOFOLLOW`
-/// flag; the post-open path check is retained on every platform as a second defense against a
-/// concurrent rename.
-fn read_plain_text(path: &Path, label: &str, maximum_bytes: u64) -> Result<String> {
-    let before = fs::symlink_metadata(path)?;
-    assert_plain_file(path, &before)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0o400_000;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        options.custom_flags(O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    let opened = file.metadata()?;
-    assert_plain_file(path, &opened)?;
-    if opened.len() > maximum_bytes {
-        return Err(InboxError::Malformed(format!(
-            "{label} exceeds the {maximum_bytes}-byte limit: {}",
-            path.display()
-        )));
-    }
-    let mut text = String::new();
-    (&mut file)
-        .take(maximum_bytes + 1)
-        .read_to_string(&mut text)?;
-    if text.len() as u64 > maximum_bytes {
-        return Err(InboxError::Malformed(format!(
-            "{label} grew beyond the {maximum_bytes}-byte limit: {}",
-            path.display()
-        )));
-    }
-    let after = fs::symlink_metadata(path)?;
-    assert_plain_file(path, &after)?;
-    Ok(text)
+fn decode_plain_text(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes).map_err(|_| {
+        InboxError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
+    })
 }
 
 fn add_links_from_text(
@@ -1367,7 +1345,7 @@ fn completed_ids(root: &Path) -> Result<BTreeSet<String>> {
     let Some(work) = work_directory(root)? else {
         return Ok(BTreeSet::new());
     };
-    match read_optional_plain_file(&work.join("Tasks_Done.md"))? {
+    match read_optional_inbox_text(&work, &work.join("Tasks_Done.md"))? {
         Some(text) => Ok(text
             .lines()
             .filter_map(archive_header_task_id)
@@ -1430,36 +1408,31 @@ fn write_message(path: &Path, value: &Value) -> Result<()> {
 }
 
 fn assert_plain_directory(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    if !metadata.is_dir() || is_redirected(metadata) {
+    if !metadata.is_dir() {
         return Err(InboxError::Malformed(format!(
             "inbox path is not a plain directory: {}",
             path.display()
         )));
     }
-    Ok(())
+    work_fs::require_plain_directory(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            InboxError::Malformed(format!(
+                "inbox path is not a plain directory: {}",
+                path.display()
+            ))
+        } else {
+            InboxError::Io(error)
+        }
+    })
 }
 
 fn assert_plain_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    if !metadata.is_file() || is_redirected(metadata) {
-        return Err(InboxError::Malformed(format!(
+    work_fs::require_plain_file(path, metadata).map_err(|_| {
+        InboxError::Malformed(format!(
             "inbox path is not a plain file: {}",
             path.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_redirected(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_redirected(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+        ))
+    })
 }
 
 fn valid_message_id(id: &str) -> bool {

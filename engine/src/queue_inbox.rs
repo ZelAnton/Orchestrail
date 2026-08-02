@@ -100,7 +100,7 @@ struct DrainTransaction {
 /// solely to name a human-auditable quarantine pair; it cannot affect task/proposal allocation.
 pub fn drain(work: &Path, occurred_at: &str) -> Result<DrainResult> {
     let work_metadata = fs::symlink_metadata(work)?;
-    if !work_metadata.is_dir() || is_redirected(&work_metadata) {
+    if !work_metadata.is_dir() || work_fs::redirected(&work_metadata) {
         return Err(QueueInboxError::Invalid(format!(
             "work directory is not a plain directory: {}",
             work.display()
@@ -115,7 +115,7 @@ pub fn drain(work: &Path, occurred_at: &str) -> Result<DrainResult> {
 
     let queue_path = work.join(QUEUE_FILE);
     let original =
-        read_optional_plain_text(work, &queue_path, MAX_CONTROL_BYTES)?.unwrap_or_default();
+        work_fs::read_optional_text(work, &queue_path, MAX_CONTROL_BYTES)?.unwrap_or_default();
     let queued = crate::state::queue::parse_queue(&original);
     let completed = completed_ids(work)?;
     let active = active_task_ids(work)?;
@@ -324,7 +324,7 @@ fn recover_pending_transaction(work: &Path, inbox: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file() || is_redirected(&metadata) {
+    if !metadata.is_file() || work_fs::redirected(&metadata) {
         return Err(QueueInboxError::Invalid(format!(
             "queue inbox transaction marker is not a plain file: {}",
             marker.display()
@@ -347,7 +347,7 @@ fn recover_pending_transaction(work: &Path, inbox: &Path) -> Result<()> {
 
     let queue_path = work.join(QUEUE_FILE);
     let queue =
-        read_optional_plain_bytes(work, &queue_path, MAX_CONTROL_BYTES)?.unwrap_or_default();
+        work_fs::read_optional_bytes(work, &queue_path, MAX_CONTROL_BYTES)?.unwrap_or_default();
     let queue_hash = content_hash(&queue);
     let state_path = work.join(QUEUE_STATE_FILE);
     let state_hash = read_optional_hash(work, &state_path, MAX_CONTROL_BYTES)?;
@@ -411,22 +411,17 @@ fn create_transaction_marker(
             "native queue inbox transaction exceeds the {MAX_TRANSACTION_BYTES}-byte limit"
         )));
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                QueueInboxError::Invalid(
-                    "native queue inbox transaction is already pending; recovery was skipped"
-                        .into(),
-                )
-            } else {
-                QueueInboxError::Io(error)
-            }
-        })?;
+    let mut file = work_fs::create_new_plain_file(&marker).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            QueueInboxError::Invalid(
+                "native queue inbox transaction is already pending; recovery was skipped".into(),
+            )
+        } else {
+            QueueInboxError::Io(error)
+        }
+    })?;
     if let Err(error) = file.write_all(&payload).and_then(|()| file.sync_all()) {
-        let _ = fs::remove_file(&marker);
+        let _ = work_fs::remove_plain_file(work, &marker);
         return Err(error.into());
     }
     work_fs::require_plain_directory(inbox)?;
@@ -453,7 +448,7 @@ fn consume_transaction_sources(
         let path = inbox.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                if !metadata.is_file() || is_redirected(&metadata) {
+                if !metadata.is_file() || work_fs::redirected(&metadata) {
                     return Err(QueueInboxError::Invalid(format!(
                         "queue inbox transaction source is not a plain file: {}",
                         path.display()
@@ -504,16 +499,8 @@ fn validate_transaction(transaction: &DrainTransaction) -> Result<()> {
     Ok(())
 }
 
-fn read_optional_plain_bytes(work: &Path, path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
-    work_fs::read_optional_bytes(work, path, max_bytes).map_err(QueueInboxError::Io)
-}
-
-fn read_optional_plain_text(work: &Path, path: &Path, max_bytes: u64) -> Result<Option<String>> {
-    work_fs::read_optional_text(work, path, max_bytes).map_err(QueueInboxError::Io)
-}
-
 fn read_optional_hash(work: &Path, path: &Path, max_bytes: u64) -> Result<Option<String>> {
-    Ok(read_optional_plain_bytes(work, path, max_bytes)?.map(|bytes| content_hash(&bytes)))
+    Ok(work_fs::read_optional_bytes(work, path, max_bytes)?.map(|bytes| content_hash(&bytes)))
 }
 
 fn plain_file_hash(work: &Path, path: &Path, max_bytes: u64) -> Result<String> {
@@ -546,7 +533,7 @@ fn is_plain_inbox_name(name: &str) -> bool {
 /// optimistic `expected-generation` guard will observe every native inbox insertion.
 fn next_queue_generation_update(work: &Path, delta: usize) -> Result<Vec<u8>> {
     let path = work.join(QUEUE_STATE_FILE);
-    let generation = match read_optional_plain_text(work, &path, MAX_CONTROL_BYTES)? {
+    let generation = match work_fs::read_optional_text(work, &path, MAX_CONTROL_BYTES)? {
         Some(text) => {
             let value: Value = serde_json::from_str(&text).map_err(|error| {
                 QueueInboxError::Invalid(format!(
@@ -611,10 +598,10 @@ fn direct_json_entries(work: &Path, inbox: &Path) -> Result<Vec<PathBuf>> {
         // The contract scans only direct JSON *files*. A plain directory whose name happens to
         // end in `.json` is outside that set (like the permanent `rejected/` directory), while
         // a redirect or non-file special object remains unsafe and therefore fails closed.
-        if metadata.is_dir() && !is_redirected(&metadata) {
+        if metadata.is_dir() && !work_fs::redirected(&metadata) {
             continue;
         }
-        if !metadata.is_file() || is_redirected(&metadata) {
+        if !metadata.is_file() || work_fs::redirected(&metadata) {
             return Err(QueueInboxError::Invalid(format!(
                 "queue inbox entry is not a plain file: {}",
                 path.display()
@@ -847,7 +834,7 @@ fn graph_has_cycle(graph: &BTreeMap<String, BTreeSet<String>>) -> bool {
 }
 
 fn completed_ids(work: &Path) -> Result<BTreeSet<String>> {
-    match read_optional_plain_text(work, &work.join(DONE_FILE), MAX_CONTROL_BYTES)? {
+    match work_fs::read_optional_text(work, &work.join(DONE_FILE), MAX_CONTROL_BYTES)? {
         Some(text) => Ok(text
             .lines()
             .filter_map(archive_header_task_id)
@@ -865,7 +852,7 @@ fn active_task_ids(work: &Path) -> Result<BTreeSet<String>> {
             continue;
         };
         let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.is_dir() || is_redirected(&metadata) {
+        if !metadata.is_dir() || work_fs::redirected(&metadata) {
             return Err(QueueInboxError::Invalid(format!(
                 "active task id path is not a plain directory: {}",
                 entry.path().display()
@@ -905,7 +892,7 @@ fn known_task_spellings(
             continue;
         };
         let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.is_dir() || is_redirected(&metadata) {
+        if !metadata.is_dir() || work_fs::redirected(&metadata) {
             return Err(QueueInboxError::Invalid(format!(
                 "active task id path is not a plain directory: {}",
                 entry.path().display()
@@ -926,7 +913,7 @@ fn known_task_titles(
         .map(|entry| normalize_title(&entry.title))
         .collect::<BTreeSet<_>>();
     for source in [work.join(DONE_FILE)] {
-        if let Some(text) = read_optional_plain_text(work, &source, MAX_CONTROL_BYTES)? {
+        if let Some(text) = work_fs::read_optional_text(work, &source, MAX_CONTROL_BYTES)? {
             titles.extend(archive_titles(&text));
             titles.extend(original_task_titles(&text));
         }
@@ -963,14 +950,14 @@ fn active_task_titles(work: &Path) -> Result<BTreeSet<String>> {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.is_dir() || is_redirected(&metadata) {
+        if !metadata.is_dir() || work_fs::redirected(&metadata) {
             return Err(QueueInboxError::Invalid(format!(
                 "active task id path is not a plain directory: {}",
                 entry.path().display()
             )));
         }
         if let Some(text) =
-            read_optional_plain_text(work, &entry.path().join("task.md"), MAX_CONTROL_BYTES)?
+            work_fs::read_optional_text(work, &entry.path().join("task.md"), MAX_CONTROL_BYTES)?
         {
             titles.extend(original_task_titles(&text));
         }
@@ -1006,7 +993,8 @@ fn max_known_proposal_number(work: &Path, queue_text: &str) -> Result<u32> {
         .into_iter()
         .max()
         .unwrap_or_default();
-    if let Some(text) = read_optional_plain_text(work, &work.join(DONE_FILE), MAX_CONTROL_BYTES)? {
+    if let Some(text) = work_fs::read_optional_text(work, &work.join(DONE_FILE), MAX_CONTROL_BYTES)?
+    {
         max = max.max(
             proposal_numbers_in(&text)
                 .into_iter()
@@ -1019,7 +1007,8 @@ fn max_known_proposal_number(work: &Path, queue_text: &str) -> Result<u32> {
 
 fn queue_history_texts(work: &Path) -> Result<Vec<String>> {
     let mut texts = Vec::new();
-    if let Some(text) = read_optional_plain_text(work, &work.join(DONE_FILE), MAX_CONTROL_BYTES)? {
+    if let Some(text) = work_fs::read_optional_text(work, &work.join(DONE_FILE), MAX_CONTROL_BYTES)?
+    {
         texts.push(text);
     }
     for entry in plain_task_entries(work)? {
@@ -1028,7 +1017,7 @@ fn queue_history_texts(work: &Path) -> Result<Vec<String>> {
             continue;
         };
         let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.is_dir() || is_redirected(&metadata) {
+        if !metadata.is_dir() || work_fs::redirected(&metadata) {
             return Err(QueueInboxError::Invalid(format!(
                 "active task id path is not a plain directory: {}",
                 entry.path().display()
@@ -1036,7 +1025,7 @@ fn queue_history_texts(work: &Path) -> Result<Vec<String>> {
         }
         texts.push(format!("T-{number}"));
         if let Some(text) =
-            read_optional_plain_text(work, &entry.path().join("task.md"), MAX_CONTROL_BYTES)?
+            work_fs::read_optional_text(work, &entry.path().join("task.md"), MAX_CONTROL_BYTES)?
         {
             texts.push(text);
         }
@@ -1142,7 +1131,7 @@ fn move_to_quarantine(
     reason: &str,
 ) -> Result<()> {
     let source_metadata = fs::symlink_metadata(source)?;
-    if !source_metadata.is_file() || is_redirected(&source_metadata) {
+    if !source_metadata.is_file() || work_fs::redirected(&source_metadata) {
         return Err(QueueInboxError::Invalid(format!(
             "queue inbox quarantine source is not a plain file: {}",
             source.display()
@@ -1161,7 +1150,7 @@ fn move_to_quarantine(
         )));
     }
     let rejected_metadata = fs::symlink_metadata(&rejected)?;
-    if is_redirected(&rejected_metadata) {
+    if work_fs::redirected(&rejected_metadata) {
         return Err(QueueInboxError::Invalid(format!(
             "queue inbox rejected path is redirected: {}",
             rejected.display()
@@ -1194,7 +1183,7 @@ fn move_to_quarantine(
             .map_err(QueueInboxError::Io)?;
         fs::rename(source, &record)?;
         let record_metadata = fs::symlink_metadata(&record)?;
-        if !record_metadata.is_file() || is_redirected(&record_metadata) {
+        if !record_metadata.is_file() || work_fs::redirected(&record_metadata) {
             return Err(QueueInboxError::Invalid(format!(
                 "queue inbox quarantined record is not a plain file: {}",
                 record.display()
@@ -1211,19 +1200,6 @@ fn normalize_title(title: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
-}
-
-#[cfg(windows)]
-fn is_redirected(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_redirected(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
 }
 
 fn task_number(id: &str) -> Option<u32> {
