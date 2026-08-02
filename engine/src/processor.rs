@@ -2753,6 +2753,8 @@ impl Processor {
                 if author.is_some() {
                     task.implementation_author = author;
                 }
+                task.pending_fix_open_findings = None;
+                task.pending_fix_open_finding_ids = None;
                 task.phase = TaskPhase::Committing;
                 Ok(vec![Effect::CommitTask {
                     task_id: task_id.into(),
@@ -2771,17 +2773,17 @@ impl Processor {
                         reason,
                     }]);
                 }
+                let open_findings = task.pending_fix_open_findings.take();
+                // Cleared alongside the count it was captured with (R-06) — see
+                // `TaskRuntime::pending_fix_open_finding_ids`. Its value was already consumed
+                // by the adapter that computed this `wont_fixed`, not by this reducer.
+                task.pending_fix_open_finding_ids = None;
                 if let Some(wont_fixed) = wont_fixed {
                     if kind != LeafKind::Fix {
                         return Err(ProcessorError::InvalidCommand(format!(
                             "task {task_id} reported fix-cycle won't-fix metadata outside a fix leaf"
                         )));
                     }
-                    let open_findings = task.pending_fix_open_findings.take();
-                    // Cleared alongside the count it was captured with (R-06) — see
-                    // `TaskRuntime::pending_fix_open_finding_ids`. Its value was already consumed
-                    // by the adapter that computed this `wont_fixed`, not by this reducer.
-                    task.pending_fix_open_finding_ids = None;
                     if let Some(open_findings) = open_findings
                         && let Some(reason) =
                             empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
@@ -2887,6 +2889,8 @@ impl Processor {
         match outcome {
             TaskLeafPreparationOutcome::Completed => {
                 task.implementation_author = Some("coder_codex".into());
+                task.pending_fix_open_findings = None;
+                task.pending_fix_open_finding_ids = None;
                 task.phase = TaskPhase::Committing;
                 Ok(vec![Effect::CommitTask {
                     task_id: task_id.into(),
@@ -2926,14 +2930,14 @@ impl Processor {
                         reason,
                     }]);
                 }
+                let open_findings = task.pending_fix_open_findings.take();
+                task.pending_fix_open_finding_ids = None;
                 if let Some(wont_fixed) = wont_fixed {
                     if kind != LeafKind::Fix {
                         return Err(ProcessorError::InvalidCommand(format!(
                             "task {task_id} reported fix-cycle won't-fix metadata outside a fix leaf"
                         )));
                     }
-                    let open_findings = task.pending_fix_open_findings.take();
-                    task.pending_fix_open_finding_ids = None;
                     if let Some(open_findings) = open_findings
                         && let Some(reason) =
                             empty_fixed_set_decision(wont_fixed, open_findings).escalation_reason()
@@ -3153,7 +3157,8 @@ impl Processor {
                 // the fixer's own `не исправлено` count the moment this fix round returns (see
                 // `task_leaf`'s `LeafOutcome::CompletedWithWontFix` arm).
                 task.pending_fix_open_findings = Some(open_findings);
-                task.pending_fix_open_finding_ids = Some(open_finding_ids);
+                task.pending_fix_open_finding_ids =
+                    Some(open_finding_ids).filter(|ids| !ids.is_empty());
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
@@ -3197,7 +3202,8 @@ impl Processor {
                     }]);
                 }
                 task.pending_fix_open_findings = Some(open_findings);
-                task.pending_fix_open_finding_ids = Some(open_finding_ids);
+                task.pending_fix_open_finding_ids =
+                    Some(open_finding_ids).filter(|ids| !ids.is_empty());
                 task.phase = TaskPhase::Fixing;
                 task.leaf_attempt(LeafKind::Fix);
                 Ok(vec![Effect::PrepareTaskLeaf {
