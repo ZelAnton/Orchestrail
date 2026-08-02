@@ -24,8 +24,9 @@ pub struct CohortThresholds {
     pub size: u32,
     /// `COHORT_MAX_AGE` — minutes to keep admission open from the cohort's start (default 90).
     pub max_age_minutes: u64,
-    /// `COHORT_BUDGET_SEC` — total wall-clock budget for the cohort in seconds; `None` or `0`
-    /// disables the budget circuit-breaker (the config default `0` = no limit).
+    /// `COHORT_BUDGET_SEC` — total wall-clock budget for the cohort in seconds; `None` disables
+    /// the budget circuit-breaker. The config parser normalizes its user-facing `0` (no limit) to
+    /// `None`, so a raw `Some(0)` here remains a fail-closed degenerate threshold.
     pub budget_sec: Option<u64>,
 }
 
@@ -55,7 +56,8 @@ pub enum AdmissionGate {
 /// Priority follows the processor's textual order (size before the time limits): the cohort being
 /// full (`COHORT_SIZE`) is reported first; otherwise either the admission window (`COHORT_MAX_AGE`)
 /// or the wall-clock budget (`COHORT_BUDGET_SEC`) elapsing closes admission with the time-based
-/// `COHORT_MAX_AGE` reason. A `budget_sec` of `None`/`0` disables the budget circuit-breaker.
+/// `COHORT_MAX_AGE` reason. Only a `budget_sec` of `None` disables the budget circuit-breaker;
+/// `Some(0)` is an already-exhausted, fail-closed boundary.
 pub fn admission_gate(counters: CohortCounters, thresholds: CohortThresholds) -> AdmissionGate {
     // Size circuit-breaker: the cohort is full.
     if counters.admitted_total >= thresholds.size {
@@ -65,10 +67,10 @@ pub fn admission_gate(counters: CohortCounters, thresholds: CohortThresholds) ->
     if counters.age_minutes >= thresholds.max_age_minutes {
         return AdmissionGate::Close(CloseReason::CohortMaxAge);
     }
-    // Wall-clock budget circuit-breaker (only when COHORT_BUDGET_SEC > 0): the cohort has spent its
-    // whole time budget -> stop admitting, reported with the existing time-based reason.
+    // Wall-clock budget circuit-breaker: the cohort has spent its whole time budget -> stop
+    // admitting, reported with the existing time-based reason. The config parser normalizes the
+    // user-facing unlimited value `0` to `None`; an unnormalized `Some(0)` fails closed here.
     if let Some(budget) = thresholds.budget_sec
-        && budget > 0
         && counters.elapsed_sec >= budget
     {
         return AdmissionGate::Close(CloseReason::CohortMaxAge);
@@ -103,14 +105,22 @@ mod tests {
             admission_gate(counters(4, 30, 1800), t),
             AdmissionGate::Continue
         );
-        // Budget disabled (None / 0) never trips even at a huge elapsed.
+        // Only None disables the budget and therefore never trips even at a huge elapsed.
         assert_eq!(
             admission_gate(counters(4, 30, 999_999), thresholds(15, 90, None)),
             AdmissionGate::Continue
         );
+    }
+
+    #[test]
+    fn zero_wall_clock_budget_fails_closed() {
         assert_eq!(
-            admission_gate(counters(4, 30, 999_999), thresholds(15, 90, Some(0))),
-            AdmissionGate::Continue
+            admission_gate(counters(4, 30, 0), thresholds(15, 90, Some(0))),
+            AdmissionGate::Close(CloseReason::CohortMaxAge)
+        );
+        assert_eq!(
+            admission_gate(counters(4, 30, u64::MAX), thresholds(15, 90, Some(0))),
+            AdmissionGate::Close(CloseReason::CohortMaxAge)
         );
     }
 

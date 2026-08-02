@@ -104,26 +104,33 @@ fn budget_closure_case() -> BoxedStrategy<(CohortCounters, CohortThresholds)> {
                 },
             )
         ),
-        // Enabled wall-clock budget boundaries: exact threshold, above it, and near overflow.
-        prop::sample::select(vec![(Some(1), 1), (Some(1), 2), (Some(u64::MAX), u64::MAX)])
-            .prop_map(|(budget_sec, elapsed_sec)| (
-                CohortCounters {
-                    admitted_total: 0,
-                    age_minutes: 0,
-                    elapsed_sec,
-                },
-                CohortThresholds {
-                    size: u32::MAX,
-                    max_age_minutes: u64::MAX,
-                    budget_sec,
-                },
-            )),
+        // Wall-clock budget boundaries: zero is fail-closed regardless of elapsed time, as are an
+        // exact enabled threshold, a value above it, and the largest representable exact limit.
+        prop::sample::select(vec![
+            (Some(0), 0),
+            (Some(0), u64::MAX),
+            (Some(1), 1),
+            (Some(1), 2),
+            (Some(u64::MAX), u64::MAX),
+        ])
+        .prop_map(|(budget_sec, elapsed_sec)| (
+            CohortCounters {
+                admitted_total: 0,
+                age_minutes: 0,
+                elapsed_sec,
+            },
+            CohortThresholds {
+                size: u32::MAX,
+                max_age_minutes: u64::MAX,
+                budget_sec,
+            },
+        )),
     ]
     .boxed()
 }
 
 fn disabled_budget_case() -> impl Strategy<Value = (CohortCounters, CohortThresholds)> {
-    prop::sample::select(vec![None, Some(0)]).prop_map(|budget_sec| {
+    Just(None).prop_map(|budget_sec| {
         (
             CohortCounters {
                 admitted_total: 0,
