@@ -267,8 +267,12 @@ pub(crate) fn create_new_plain_file_rooted(work: &Path, path: &Path) -> io::Resu
     Ok(file)
 }
 
+/// Install a one-shot, thread-local interception that runs between the parent-identity capture and
+/// the creation itself. Crate-visible because every confined writer that creates a control-plane
+/// file has to be able to prove it rejects a parent swapped inside exactly that window, not only
+/// the primitive's own tests.
 #[cfg(test)]
-fn set_create_new_plain_file_hook(hook: impl FnOnce() -> io::Result<()> + 'static) {
+pub(crate) fn set_create_new_plain_file_hook(hook: impl FnOnce() -> io::Result<()> + 'static) {
     CREATE_NEW_PLAIN_FILE_HOOK.with(|slot| {
         assert!(
             slot.replace(Some(Box::new(hook))).is_none(),
@@ -836,9 +840,75 @@ pub(crate) fn remove_plain_directory_all(work: &Path, path: &Path) -> io::Result
     Ok(true)
 }
 
+/// Redirect a directory pathname for a confinement test. Shared with the other control-plane
+/// writers (for example the event-rotation path in `events::outbox`) so every parent-swap proof
+/// installs the redirect the same way, including the unprivileged Windows junction fallback.
+#[cfg(all(test, windows))]
+pub(crate) fn symlink_directory_for_test(target: &Path, link: &Path) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(1_314) => {
+            let parent = target.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "test target has no parent")
+            })?;
+            let relative_link = link.strip_prefix(parent).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "test junction paths do not share a parent",
+                )
+            })?;
+            let target_name = target.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "test target has no name")
+            })?;
+            let command = format!(
+                "mklink /j {} {}",
+                relative_link.to_string_lossy().replace('/', "\\"),
+                target_name.to_string_lossy()
+            );
+            let output = Command::new("cmd.exe")
+                .args(["/d", "/c", &command])
+                .current_dir(parent)
+                .stdin(Stdio::null())
+                .output()?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "failed to create test junction {} -> {}: stdout={} stderr={}",
+                    link.display(),
+                    target.display(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn symlink_directory_for_test(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn remove_directory_link_for_test(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn remove_directory_link_for_test(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::remove_directory_link_for_test as remove_directory_link;
+    use super::symlink_directory_for_test as symlink_directory;
 
     fn temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -846,66 +916,6 @@ mod tests {
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
-    }
-
-    #[cfg(windows)]
-    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
-        use std::process::{Command, Stdio};
-
-        match std::os::windows::fs::symlink_dir(target, link) {
-            Ok(()) => Ok(()),
-            Err(error) if error.raw_os_error() == Some(1_314) => {
-                let parent = target.parent().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no parent")
-                })?;
-                let relative_link = link.strip_prefix(parent).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "test junction paths do not share a parent",
-                    )
-                })?;
-                let target_name = target.file_name().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no name")
-                })?;
-                let command = format!(
-                    "mklink /j {} {}",
-                    relative_link.to_string_lossy().replace('/', "\\"),
-                    target_name.to_string_lossy()
-                );
-                let output = Command::new("cmd.exe")
-                    .args(["/d", "/c", &command])
-                    .current_dir(parent)
-                    .stdin(Stdio::null())
-                    .output()?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!(
-                        "failed to create test junction {} -> {}: stdout={} stderr={}",
-                        link.display(),
-                        target.display(),
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    )))
-                }
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(unix)]
-    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
-        std::os::unix::fs::symlink(target, link)
-    }
-
-    #[cfg(windows)]
-    fn remove_directory_link(path: &Path) -> io::Result<()> {
-        fs::remove_dir(path)
-    }
-
-    #[cfg(unix)]
-    fn remove_directory_link(path: &Path) -> io::Result<()> {
-        fs::remove_file(path)
     }
 
     #[test]

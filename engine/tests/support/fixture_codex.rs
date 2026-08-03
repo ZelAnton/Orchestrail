@@ -9,6 +9,10 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Hang backstop for the peer rendezvous, not a concurrency budget — see
+/// [`review_batch_barrier_released`]. Kept identical to the Claude fixture's constant.
+const PEER_START_BACKSTOP: Duration = Duration::from_secs(60);
+
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     if args.get(1).is_some_and(|arg| arg == "sandbox") {
@@ -135,8 +139,10 @@ fn canonical_task_id(value: &str) -> bool {
     })
 }
 
-/// Same test-only rendezvous contract as `fixture_claude`: clean output from either provider is
-/// impossible until both contained reviewer children have started.
+/// Same test-only rendezvous contract as `fixture_claude`, including the reason the wait is a hang
+/// backstop rather than a concurrency budget: the caller's ProcessKit deadline is what makes a
+/// sequential launcher fail, while a short self-timeout would also fire on a parallel launcher
+/// whose second `CreateProcess` merely landed late.
 fn review_batch_barrier_released(work: &Path, task_id: &str) -> bool {
     let evidence_dir = work.join("native-evidence");
     let barrier = evidence_dir.join("fixture-review-batch.barrier");
@@ -164,7 +170,7 @@ fn review_batch_barrier_released(work: &Path, task_id: &str) -> bool {
     {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + PEER_START_BACKSTOP;
     while Instant::now() < deadline {
         if peers.iter().all(|peer| {
             evidence_dir

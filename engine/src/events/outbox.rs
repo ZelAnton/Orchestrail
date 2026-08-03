@@ -1178,7 +1178,10 @@ fn copy_segment_atomically(
             ".segment.{}.{sequence}.tmp.jsonl",
             std::process::id()
         ));
-    let mut output = work_fs::create_new_plain_file(&temp)?;
+    // Rooted creation, not the bare primitive: the parent proof above is a separate syscall, so
+    // only capturing the archive directory's identity around the creation itself closes the window
+    // where `.work/events_archive` is swapped for a redirect between the check and the create.
+    let mut output = work_fs::create_new_plain_file_rooted(work, &temp)?;
     active.seek(SeekFrom::Start(0))?;
     let result = (|| {
         let mut remaining = len;
@@ -1226,7 +1229,9 @@ fn replace_active_without_prefix(work: &Path, path: &Path, prefix: u64) -> io::R
         ".{OUTBOX_FILE}.rotation.{}.{sequence}.tmp",
         std::process::id()
     ));
-    let mut output = work_fs::create_new_plain_file(&temp)?;
+    // The replacement temp lives directly in the work root, so rooted creation is the only proof
+    // that the root itself was not redirected while this rotation was writing through it.
+    let mut output = work_fs::create_new_plain_file_rooted(work, &temp)?;
     let result = (|| {
         io::copy(&mut input.take(len - prefix), &mut output)?;
         output.sync_all()
@@ -1912,6 +1917,144 @@ mod tests {
             vec![first, after]
         );
         let _ = fs::remove_dir_all(work);
+    }
+
+    /// The rotation write path creates its segment through the same rooted primitive as
+    /// `work_fs::replace_file`, so a `.work/events_archive` swapped for a redirect *after* the
+    /// parent proof and *before* the creation must be refused. Without the rooted creation the
+    /// archive directory identity is only checked once, and the immutable segment is published
+    /// into whatever the redirect points at.
+    #[test]
+    fn an_archive_parent_swapped_under_the_segment_temp_publishes_no_segment() {
+        let work = temp_work("rotation-archive-parent-swap");
+        let external = work.join("external");
+        let archive = work.join(EVENTS_ARCHIVE_DIR);
+        let displaced = work.join("events_archive-original");
+        let outbox = Outbox::with_rotation_policy(&work, rotate_every_boundary());
+        outbox.append_idempotent(&published()).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        let hook_archive = archive.clone();
+        let hook_displaced = displaced.clone();
+        let hook_external = external.clone();
+        work_fs::set_create_new_plain_file_hook(move || {
+            fs::rename(&hook_archive, &hook_displaced)?;
+            work_fs::symlink_directory_for_test(&hook_external, &hook_archive)
+        });
+
+        let error = match outbox.append_idempotent(&closed()) {
+            Err(OutboxError::Io(error)) => error,
+            other => panic!("a redirected archive parent must fail the rotation: {other:?}"),
+        };
+        assert!(
+            matches!(
+                work_fs::plain_read_violation(&error),
+                Some(work_fs::PlainReadViolation::ParentNotPlain { path }) if path == &archive
+            ),
+            "unexpected rotation error: {error}"
+        );
+        let redirected_entries = fs::read_dir(&external)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            redirected_entries
+                .iter()
+                .all(|name| name.starts_with(".segment.")),
+            "no immutable segment may be published through the redirect: {redirected_entries:?}"
+        );
+        assert!(
+            !redirected_entries.is_empty(),
+            "the fixture must exercise creation through the redirected parent"
+        );
+        assert!(!work.join(EVENTS_ROTATION_FILE).exists());
+
+        // Restore a plain archive directory before reading: the stream reader walks it too, and
+        // this assertion is about the events the refused rotation preserved, not the redirect.
+        work_fs::remove_directory_link_for_test(&archive).unwrap();
+        fs::rename(&displaced, &archive).unwrap();
+        assert_eq!(
+            TailReader::new(outbox.path()).poll_all().unwrap(),
+            vec![published(), closed()],
+            "a refused rotation keeps every byte in the active segment"
+        );
+        assert!(archived_segments(&work).is_empty());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    /// The active-file replacement writes its temporary directly into the work root, so the root
+    /// itself is the parent chain that has to survive the creation. A root swapped inside that
+    /// window must be refused before the replacement can be renamed through the redirect.
+    ///
+    /// Unix-only fixture, not a Unix-only property: this replacement holds the active segment open
+    /// while it writes, and Windows refuses to rename a directory that owns an open descendant
+    /// handle, so the redirect cannot be installed there at all. The archive-parent proof above
+    /// exercises the same rooted primitive on every platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_work_root_swapped_under_the_active_replacement_is_rejected() {
+        let work = temp_work("rotation-active-root-swap");
+        let displaced = temp_work("rotation-active-root-displaced");
+        let external = temp_work("rotation-active-root-external");
+        fs::create_dir_all(&external).unwrap();
+        let outbox = Outbox::new(&work);
+        let first = event("pending-prefix");
+        outbox.append_idempotent(&first).unwrap();
+        let active_path = outbox.path();
+        let mut active = open_existing_plain_outbox(&active_path).unwrap();
+        let len = active.metadata().unwrap().len();
+        let archive_path = work.join(EVENTS_ARCHIVE_DIR).join(segment_name(1, 0, len));
+        let digest = copy_segment_atomically(&work, &mut active, len, &archive_path).unwrap();
+        drop(active);
+        let mut metadata = RotationMetadata {
+            schema_version: ROTATION_SCHEMA_VERSION,
+            generation: 1,
+            segment_count: 1,
+            archived_len: len,
+            active_prefix_bytes: len,
+            active_prefix_sha256: Some(digest),
+            last_rotation_at: None,
+        };
+        write_rotation_metadata(&work, &metadata, RotationLimits::DEFAULT.max_metadata_bytes)
+            .unwrap();
+
+        let hook_work = work.clone();
+        let hook_displaced = displaced.clone();
+        let hook_external = external.clone();
+        work_fs::set_create_new_plain_file_hook(move || {
+            fs::rename(&hook_work, &hook_displaced)?;
+            work_fs::symlink_directory_for_test(&hook_external, &hook_work)
+        });
+
+        let error = complete_pending_rotation(&work, &mut metadata).unwrap_err();
+        assert!(
+            matches!(
+                work_fs::plain_read_violation(&error),
+                Some(work_fs::PlainReadViolation::ParentNotPlain { path }) if path == &work
+            ),
+            "unexpected pending-rotation error: {error}"
+        );
+        let redirected_entries = fs::read_dir(&external)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !redirected_entries.iter().any(|name| name == OUTBOX_FILE),
+            "no active segment may be renamed into place through the redirect: {redirected_entries:?}"
+        );
+        assert!(
+            !redirected_entries.is_empty(),
+            "the fixture must exercise creation through the redirected root"
+        );
+        assert_eq!(
+            fs::read_to_string(displaced.join(OUTBOX_FILE)).unwrap(),
+            format!("{}\n", first.to_json_line()),
+            "the real active segment keeps its archived prefix after a refused replacement"
+        );
+
+        work_fs::remove_directory_link_for_test(&work).unwrap();
+        let _ = fs::remove_dir_all(displaced);
+        let _ = fs::remove_dir_all(external);
     }
 
     #[test]

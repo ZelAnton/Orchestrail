@@ -700,7 +700,7 @@ impl LeaseStore {
             Err(error) => return Err(error.into()),
         }
         let tx = self.work.join(TRANSACTION_LOCK);
-        let mut guard = acquire_transaction_lock(&tx, timeout, stale_after)?;
+        let mut guard = acquire_transaction_lock(&self.work, &tx, timeout, stale_after)?;
         let result = operation();
         // A failure to remove our owner-checked CreateNew file is surfaced only when the operation
         // itself succeeded; otherwise preserve the primary error. Drop is a best-effort panic path.
@@ -1468,6 +1468,7 @@ impl Drop for TransactionLockGuard {
 }
 
 fn acquire_transaction_lock(
+    work: &Path,
     path: &Path,
     timeout: Duration,
     stale_after: Duration,
@@ -1508,7 +1509,7 @@ fn acquire_transaction_lock(
                 continue;
             }
         };
-        if create_transaction_lock(path, &owner, &lifecycle)? {
+        if create_transaction_lock(work, path, &owner, &lifecycle)? {
             return Ok(TransactionLockGuard {
                 path: path.to_path_buf(),
                 owner,
@@ -1519,7 +1520,7 @@ fn acquire_transaction_lock(
         let snapshot = match transaction_lock_snapshot(path) {
             Ok(snapshot) => snapshot,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if create_transaction_lock(path, &owner, &lifecycle)? {
+                if create_transaction_lock(work, path, &owner, &lifecycle)? {
                     return Ok(TransactionLockGuard {
                         path: path.to_path_buf(),
                         owner,
@@ -1547,14 +1548,24 @@ fn acquire_transaction_lock(
 }
 
 fn create_transaction_lock(
+    work: &Path,
     path: &Path,
     owner: &str,
     lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<bool> {
     lifecycle.validate()?;
-    let mut file = match work_fs::create_new_plain_file(path) {
+    // The rooted primitive, exactly as `work_fs::replace_file` uses it for the lease document
+    // beside this lock: the transaction lock lives directly in the work root, so its whole parent
+    // chain is that root, and only capturing the root's identity across the creation rejects a
+    // redirect installed between `with_transaction_policy`'s proof and this CreateNew. The
+    // handle-identity proofs below cannot see that substitution — the file they compare against
+    // is the very one created through the redirect.
+    let mut file = match work_fs::create_new_plain_file_rooted(work, path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        // A confinement violation is a refusal, never contention: reporting it as a busy lock
+        // would retry until the timeout and hide the redirect behind a routine `Busy`.
+        Err(error) if work_fs::plain_read_violation(&error).is_some() => return Err(error),
         Err(_error) if fs::symlink_metadata(path).is_ok() => {
             // Windows reports AccessDenied rather than AlreadyExists when CreateNew targets the
             // directory lock left by an older native build. An entry proven to exist is still
@@ -2029,7 +2040,8 @@ mod tests {
             .unwrap()
             .expect("replacement inode has an independent kernel lock");
 
-        let error = create_transaction_lock(&tx, "must-not-be-created", &original).unwrap_err();
+        let error =
+            create_transaction_lock(&work, &tx, "must-not-be-created", &original).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("identity is no longer valid"));
         assert!(
@@ -2235,6 +2247,7 @@ mod tests {
         let owners = thread::scope(|scope| {
             let mut handles = Vec::new();
             for _ in 0..2 {
+                let work = work.clone();
                 let tx = tx.clone();
                 let start = Arc::clone(&start);
                 let active = Arc::clone(&active);
@@ -2242,7 +2255,8 @@ mod tests {
                 handles.push(scope.spawn(move || {
                     start.wait();
                     let mut guard =
-                        acquire_transaction_lock(&tx, Duration::from_secs(2), stale_after).unwrap();
+                        acquire_transaction_lock(&work, &tx, Duration::from_secs(2), stale_after)
+                            .unwrap();
                     let owner = guard.owner.clone();
                     let entrants = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(entrants, Ordering::SeqCst);

@@ -2,8 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orchestrail_engine::events::{EventType, OUTBOX_FILE, TailReader};
 use orchestrail_engine::headless::{HeadlessConfig, HeadlessExternalPort};
@@ -14,13 +15,34 @@ use orchestrail_engine::resolvers::{CodexReviewer, Level, Risk};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[test]
-fn task_reviewer_reads_the_immutable_range_before_emitting_a_clean_gate() {
+/// A private root per run, unique across processes as well as within one.
+///
+/// A failing assertion leaves its root behind (cleanup is the last statement, by design, so the
+/// evidence survives), and these roots are named after the process id. Windows recycles process
+/// ids freely, so pid plus a per-process counter eventually re-selects an abandoned root — whose
+/// `fixture-review-started-*` markers would silently pre-release the rendezvous that the batch
+/// proofs below exist to enforce. The wall-clock component makes that reuse impossible.
+fn unique_root(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test host clock is after the epoch")
+        .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "orchestrail-headless-reviewer-{}-{}",
+        "orchestrail-headless-{label}-{}-{}-{unique}",
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
+    assert!(
+        !root.exists(),
+        "fixture root must be private to this run: {}",
+        root.display()
+    );
+    root
+}
+
+#[test]
+fn task_reviewer_reads_the_immutable_range_before_emitting_a_clean_gate() {
+    let root = unique_root("reviewer");
     let work = root.join(".work");
     let workspace = root.join(".work/worktrees/T-1");
     fs::create_dir_all(work.join("native-evidence")).unwrap();
@@ -90,11 +112,7 @@ fn task_reviewer_reads_the_immutable_range_before_emitting_a_clean_gate() {
 
 #[test]
 fn concurrent_reviewers_consume_their_own_immutable_ranges_in_request_order() {
-    let root = std::env::temp_dir().join(format!(
-        "orchestrail-headless-reviewer-batch-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = unique_root("reviewer-batch");
     let work = root.join(".work");
     let workspace_one = work.join("worktrees/T-1");
     let workspace_two = work.join("worktrees/T-2");
@@ -186,18 +204,24 @@ fn concurrent_reviewers_consume_their_own_immutable_ranges_in_request_order() {
         )
         .unwrap();
     assert_eq!(results.len(), 2);
-    assert!(matches!(
-        &results[0],
-        TaskEffectResult::Review {
-            outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
-        } if review_sha == "review-head-T-2"
-    ));
-    assert!(matches!(
-        &results[1],
-        TaskEffectResult::Review {
-            outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
-        } if review_sha == "review-head-T-1"
-    ));
+    assert!(
+        matches!(
+            &results[0],
+            TaskEffectResult::Review {
+                outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
+            } if review_sha == "review-head-T-2"
+        ),
+        "{results:?}"
+    );
+    assert!(
+        matches!(
+            &results[1],
+            TaskEffectResult::Review {
+                outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
+            } if review_sha == "review-head-T-1"
+        ),
+        "{results:?}"
+    );
     let first = fs::read_to_string(work.join("tasks/T-1/review.md")).unwrap();
     let second = fs::read_to_string(work.join("tasks/T-2/review.md")).unwrap();
     assert!(first.contains("fixture-review-sentinel:T-1"));
@@ -211,11 +235,7 @@ fn concurrent_reviewers_consume_their_own_immutable_ranges_in_request_order() {
 
 #[test]
 fn reviewer_deadline_during_parallel_collection_never_becomes_a_clean_result() {
-    let root = std::env::temp_dir().join(format!(
-        "orchestrail-headless-reviewer-deadline-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = unique_root("reviewer-deadline");
     let work = root.join(".work");
     let workspace_one = work.join("worktrees/T-1");
     let workspace_two = work.join("worktrees/T-2");
@@ -313,18 +333,24 @@ fn reviewer_deadline_during_parallel_collection_never_becomes_a_clean_result() {
         .unwrap();
 
     assert_eq!(results.len(), 2, "collection retains both request slots");
-    assert!(matches!(
-        &results[0],
-        TaskEffectResult::Review {
-            outcome: orchestrail_engine::processor::ReviewOutcome::Escalated { reason }
-        } if reason.contains("supervisor timeout")
-    ));
-    assert!(matches!(
-        &results[1],
-        TaskEffectResult::Review {
-            outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
-        } if review_sha == "review-head-T-2"
-    ));
+    assert!(
+        matches!(
+            &results[0],
+            TaskEffectResult::Review {
+                outcome: orchestrail_engine::processor::ReviewOutcome::Escalated { reason }
+            } if reason.contains("supervisor timeout")
+        ),
+        "{results:?}"
+    );
+    assert!(
+        matches!(
+            &results[1],
+            TaskEffectResult::Review {
+                outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
+            } if review_sha == "review-head-T-2"
+        ),
+        "{results:?}"
+    );
     assert!(
         !work.join("tasks/T-1/review.md").exists(),
         "the timed-out child must not leave a clean review artifact"
@@ -343,11 +369,7 @@ fn reviewer_deadline_during_parallel_collection_never_becomes_a_clean_result() {
 
 #[test]
 fn mixed_claude_and_codex_reviewers_consume_their_own_ranges_in_request_order() {
-    let root = std::env::temp_dir().join(format!(
-        "orchestrail-headless-mixed-reviewer-batch-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = unique_root("mixed-reviewer-batch");
     let work = root.join(".work");
     let claude_workspace = work.join("worktrees/T-1");
     let codex_workspace = work.join("worktrees/T-2");
@@ -441,20 +463,26 @@ fn mixed_claude_and_codex_reviewers_consume_their_own_ranges_in_request_order() 
         .unwrap();
 
     assert_eq!(results.len(), 2);
-    assert!(matches!(
-        &results[0],
-        TaskEffectResult::ReviewPrepared {
-            outcome: orchestrail_engine::processor::TaskReviewPreparationOutcome::Completed(
-                orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
-            )
-        } if review_sha == "review-head-T-2"
-    ));
-    assert!(matches!(
-        &results[1],
-        TaskEffectResult::Review {
-            outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
-        } if review_sha == "review-head-T-1"
-    ));
+    assert!(
+        matches!(
+            &results[0],
+            TaskEffectResult::ReviewPrepared {
+                outcome: orchestrail_engine::processor::TaskReviewPreparationOutcome::Completed(
+                    orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
+                )
+            } if review_sha == "review-head-T-2"
+        ),
+        "{results:?}"
+    );
+    assert!(
+        matches!(
+            &results[1],
+            TaskEffectResult::Review {
+                outcome: orchestrail_engine::processor::ReviewOutcome::Clean { review_sha }
+            } if review_sha == "review-head-T-1"
+        ),
+        "{results:?}"
+    );
     let claude_review = fs::read_to_string(work.join("tasks/T-1/review.md")).unwrap();
     let codex_review = fs::read_to_string(work.join("tasks/T-2/review.md")).unwrap();
     assert!(claude_review.contains("fixture-review-sentinel:T-1"));

@@ -8,6 +8,11 @@ use std::env;
 use std::fs;
 use std::time::{Duration, Instant};
 
+/// Hang backstop for the peer rendezvous, not a concurrency budget — see
+/// [`review_batch_barrier_released`]. Every real caller bounds this child with its own ProcessKit
+/// deadline, which is always shorter than this.
+const PEER_START_BACKSTOP: Duration = Duration::from_secs(60);
+
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     let prompt = args
@@ -125,6 +130,17 @@ fn canonical_task_id(value: &str) -> bool {
 /// A test-only rendezvous. The production prompt never creates the marker, while the dual-review
 /// fixture supplies canonical peer ids. A sequential launcher leaves the first child waiting and
 /// cannot manufacture two clean review results.
+///
+/// The wait is deliberately far longer than any real start skew and is NOT the thing that proves
+/// concurrency. The caller's own ProcessKit deadline is: a child still waiting here when that
+/// deadline expires is killed and can never report a clean review, so a sequential launcher fails
+/// the batch proofs deterministically. A short self-timeout cannot make that distinction — it
+/// reports "not concurrent" for a launcher that submitted both slots together but whose second
+/// `CreateProcess` merely landed late, which on Windows routinely costs seconds the first time a
+/// freshly built fixture image is executed (the same cold-start latency
+/// `supervise::tests::batch_starts_real_contained_children_before_collecting_any_result` budgets
+/// fifteen seconds for). This backstop only keeps a fixture invoked without any deadline at all
+/// from hanging forever.
 fn review_batch_barrier_released(work: &std::path::Path, task_id: &str) -> bool {
     let evidence_dir = work.join("native-evidence");
     let barrier = evidence_dir.join("fixture-review-batch.barrier");
@@ -152,7 +168,7 @@ fn review_batch_barrier_released(work: &std::path::Path, task_id: &str) -> bool 
     {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + PEER_START_BACKSTOP;
     while Instant::now() < deadline {
         if peers.iter().all(|peer| {
             evidence_dir
