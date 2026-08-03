@@ -50,7 +50,7 @@ emitted by the native engine use the deterministic UUIDv5 schemes documented bel
 | `type` | Required | String | One of the 12 closed v1 types listed below. Unknown types are rejected. |
 | `batch_id` | Optional | String or `null` | Cohort coordinate. When present, the generic reader requires a string beginning with `B-`. Individual telemetry validators can impose a stricter whole-token shape. |
 | `task_id` | Optional | String or `null` | Task coordinate. Normally exactly `T-` followed by one or more ASCII digits. `usage.recorded` additionally permits `_cohort`, `_integration`, and `_release`. |
-| `payload_version` | Optional | Positive integer | Version of the type-specific payload. Absence or `null` reads as `1`; native emitters currently write `1`. |
+| `payload_version` | Optional | Positive integer | Version of the type-specific payload. Absence or `null` reads as `1`; native emitters write `1` except for `cohort.closed`, which writes `2`. |
 | `actor` | Required | Object | Contains `kind` and `name`. |
 | `actor.kind` | Required | String | One of `agent`, `human`, or `tool`. |
 | `actor.name` | Required | String | Non-empty emitter name. |
@@ -73,14 +73,15 @@ validate arbitrary payload keys.
 | `cohort.admission_closed` | `batch_id` | `agent:engine` | `reason` |
 | `cohort.join_started` | `batch_id` | `agent:engine` | Empty |
 | `cohort.published` | `batch_id` | `agent:engine` | `main_sha`, `pushed`, `tasks`, `ci` |
-| `cohort.closed` | `batch_id` | `agent:engine` | Empty |
+| `cohort.closed` | `batch_id` | `agent:engine` | v2: `merged`, `quarantined`, `escalated` |
 | `task.captured` | `batch_id`, `task_id` | `agent:engine` | Empty |
 | `task.status_changed` | `task_id`; no `batch_id` | `agent:engine` | `from`, `to` |
 | `codex.attempt` | `batch_id`, `task_id` | `agent:processor` | Strict Codex attempt payload |
 | `usage.recorded` | `batch_id`, `task_id` or usage pseudo-ID | `tool:claude` or `tool:codex` | Provider usage or an explicit unavailable marker |
 | `operation.completed` | `batch_id`, `task_id` | `agent:engine` | Strict operation timing payload |
 
-All native events use `schema_version: 1` and `payload_version: 1`.
+All native events use `schema_version: 1`. They use `payload_version: 1` except for
+`cohort.closed`, which uses `payload_version: 2`.
 
 ### Ordering within one processor transition
 
@@ -168,8 +169,18 @@ reconstructs the same ID even when `occurred_at` changes.
 
 ### `cohort.closed`
 
-Emitted when a transition removes the active batch and leaves the processor idle. The payload is
-empty and the fixed identity coordinate is `close`.
+Emitted when a transition removes the active batch and leaves the processor idle. Native emitters
+write payload version 2. Historical payload-version-1 events have an empty payload.
+
+| Payload field | Type | Semantics |
+| --- | --- | --- |
+| `merged` | Non-negative JSON integer | Number of tasks in the terminal `Done` phase at closure. |
+| `quarantined` | Non-negative JSON integer | Number of tasks in the terminal `Conflict` phase at closure. |
+| `escalated` | Non-negative JSON integer | Number of tasks in the terminal `Escalated` phase at closure. |
+
+The engine deterministically derives all three counts from the corresponding disjoint sets of
+task IDs in terminal phases at the closure boundary. The fixed identity coordinate remains
+`close`; payload version 2 is also included in the native UUIDv5 key as described below.
 
 ## Task lifecycle events
 
@@ -351,10 +362,18 @@ JSON serialization are not identity inputs.
 
 ### Processor lifecycle identity
 
-Lifecycle events from `events/projector.rs` use:
+Payload-version-1 lifecycle events from `events/projector.rs` use:
 
 ```text
 <type>|<batch_id-or-empty>|<task_id-or-empty>|<coordinate>
+```
+
+For payload version 2 or later, the projector appends `|payload:v<payload_version>` to that key.
+This preserves all v1 UUIDs while ensuring a changed payload contract cannot reuse an older
+event ID. For example, the native payload-version-2 close key is:
+
+```text
+cohort.closed|<batch_id>||close|payload:v2
 ```
 
 The per-type coordinate is:
@@ -407,7 +426,10 @@ Shared operations therefore have one deterministic ID per affected task.
 ## Idempotency and deduplication
 
 The native writer indexes committed history by `event_id`. Its semantic fingerprint is SHA-256
-over the normalized known v1 event with `occurred_at` cleared.
+over the normalized known v1 envelope, including `payload_version` and `payload`, with
+`occurred_at` cleared. Because the payload-version-2 suffix gives `cohort.closed` a new UUID, an
+upgraded replay can coexist with a historical empty-payload v1 close instead of producing an
+`EventIdCollision`.
 
 - The same `event_id` and the same normalized content, differing only in `occurred_at`, returns
   `AlreadyPresent` and appends nothing.

@@ -2674,7 +2674,7 @@ impl VcsService {
     }
 
     /// Read the durable integration ref while a previously checkpointed merge is intentionally
-    /// dirty/conflicted. This is deliberately narrower than [`integration_workspace_tip`]: the
+    /// dirty/conflicted. This is deliberately narrower than [`Self::integration_workspace_tip`]: the
     /// caller must already possess the reducer's pending-conflict coordinate, and this method
     /// still verifies the registered Git branch/JJ bookmark rather than trusting `HEAD`/`@`.
     pub fn integration_workspace_tip_during_merge_resolution(

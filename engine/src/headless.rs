@@ -1228,12 +1228,24 @@ impl HeadlessExternalPort {
         self.record_usage(state, coordinates, &invocation)?;
         let artifact = self.read_work_artifact(&self.task_review_artifact_path(task_id))?;
         // "No report from this reviewer" is an absent artifact *or* one that is byte-for-byte what
-        // was already there before the call. The distinction started to matter when the engine's
-        // review-cycle gate began pre-writing `review.md`: parsing the engine's own text as if it
-        // were the reviewer's report would find no `ИТОГ:` line and turn a bounded, repeatable
-        // `Incomplete` into a terminal protocol escalation blaming the reviewer for a file it never
-        // wrote. It also stops a leftover artifact from a previous round from being re-read as a
-        // fresh report.
+        // was already there before the call. The distinction is what stops a leftover artifact
+        // from a PREVIOUS round — a complete one, tail and all — from being re-read as this
+        // round's fresh report; the freshness window alone would reject it, but only after
+        // parsing engine/stale text as if this reviewer had authored it.
+        //
+        // Since T-026 this shortcut is one route into `Incomplete` among several rather than the
+        // only one: `task_review_outcome` itself now classifies every artifact that proves neither
+        // findings nor a complete clean pass (notably a report cut short before its `ИТОГ:` tail)
+        // as the same bounded phase-2.7 repeat. Both routes mean one thing — this reviewer pass is
+        // not done — and both are spent against `REVIEW_LOOP_MAX` by the reducer.
+        //
+        // The shortcut deliberately keeps precedence over the adapter's own classification,
+        // including its terminal future-dated-`SUMMARY-R` carve-out (R-14). The fact it reports is
+        // about the CALL, not the artifact: a reviewer that wrote nothing has not yet made any
+        // claim about a file it may never have read, so its round is the transient one worth
+        // repeating even when the leftover artifact happens to be unprovable. The carve-out applies
+        // as soon as any reviewer actually writes — which, being terminal, is what bounds the
+        // combination.
         let no_new_report = match (&artifact, &review.artifact_before) {
             (None, _) => true,
             (Some(artifact), Some(before)) => &sha256_hex(artifact.as_bytes()) == before,
@@ -3687,9 +3699,12 @@ impl ExternalPort for HeadlessExternalPort {
         let artifact = match self.read_work_artifact(&artifact_path) {
             // An artifact identical to the one this call started with carries no report from this
             // reviewer — most plausibly it is the engine's own review-cycle finding, written before
-            // the call. Treat it exactly like an absent artifact (a bounded `Incomplete` retry)
-            // instead of parsing engine text as a reviewer protocol violation. The replay binding
-            // stays the artifact's real digest, so recovery still re-proves the exact bytes.
+            // the call, or a complete artifact left by an earlier round. Treat it exactly like an
+            // absent artifact (a bounded `Incomplete` retry) instead of reading foreign text as
+            // this round's report. The replay binding stays the artifact's real digest, so
+            // recovery still re-proves the exact bytes. `task_review_outcome` below applies the
+            // same phase-2.7 classification to an artifact this reviewer DID write but did not
+            // finish (T-026), so both Codex and Claude review paths agree on `Incomplete`.
             Ok(Some(artifact))
                 if artifact_before
                     .as_deref()
@@ -7142,6 +7157,52 @@ mod tests {
         assert!(
             matches!(outcome, ReviewOutcome::Findings { .. }),
             "an open finding owes a fix cycle rather than a terminal escalation: {outcome:?}"
+        );
+
+        // T-026: the same bounded round state must also cover a reviewer that DID replace the
+        // artifact but was cut short (typically `maxTurns`) before the mandatory `ИТОГ:` tail —
+        // the digest shortcut above cannot see it, so this exercises the adapter itself through
+        // the production entry point. Terminally escalating here would spend a whole task on a
+        // transient truncation the contract (phase 2.7) says to simply re-run.
+        let review = prepared(&port);
+        fs::write(
+            task_dir.join("review.md"),
+            "## Проход 1\nПеречитываю диапазон ревью; открытых замечаний пока нет,\n",
+        )
+        .unwrap();
+        let outcome = port
+            .finish_task_review("T-014", review, &state, invocation_with_usage(1))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Incomplete,
+            "a report cut short before its ИТОГ tail is a repeatable round, not a lost task"
+        );
+
+        // And a complete clean report still promotes, so the widening did not swallow the CLEAN
+        // branch: the tail plus an in-window `SUMMARY-R` remain both required. The window is taken
+        // from the same clock `finish_task_review` closes it with, so the assertion does not
+        // depend on a hard-coded date staying in the past.
+        let review = ClaudeTaskReview {
+            since: epoch_to_iso(now_epoch_secs().saturating_sub(60)),
+            ..prepared(&port)
+        };
+        fs::write(
+            task_dir.join("review.md"),
+            format!(
+                "### [SUMMARY-R-{}] Итог ревью задачи — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+                epoch_to_iso(now_epoch_secs())
+            ),
+        )
+        .unwrap();
+        let outcome = port
+            .finish_task_review("T-014", review, &state, invocation_with_usage(1))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Clean {
+                review_sha: "head".into()
+            }
         );
         let _ = fs::remove_dir_all(root);
     }

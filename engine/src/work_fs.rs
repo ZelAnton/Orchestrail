@@ -26,6 +26,8 @@ thread_local! {
         const { RefCell::new(None) };
     static CREATE_NEW_PLAIN_FILE_POST_HOOK: RefCell<Option<CreateNewPlainFileHook>> =
         const { RefCell::new(None) };
+    static OPEN_ROOTED_PLAIN_FILE_HOOK: RefCell<Option<CreateNewPlainFileHook>> =
+        const { RefCell::new(None) };
 }
 
 /// Default ceiling for one authority-bearing control-plane artifact.
@@ -252,6 +254,53 @@ pub(crate) fn create_new_plain_file(path: &Path) -> io::Result<File> {
     open_plain_file(path, false, true, false, true)
 }
 
+/// Proof that a confined control-plane path resolved through one exact chain of plain parent
+/// directories, from the `.work` root down.
+///
+/// Recapturing it after a syscall is what turns a redirect installed *around* that syscall into a
+/// refusal instead of an accepted result. Callers that have to interleave further checks between
+/// the open and the first use of a handle — proving the opened volume supports kernel locking, for
+/// instance — keep the proof so the confinement question is answered against the very same chain
+/// the handle was opened through, not against whatever the pathname resolves to afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootedParents(PlainParentIdentity);
+
+/// Open, and optionally create, a confined control-plane file, rejecting a parent redirect
+/// installed around the open attempt.
+///
+/// The confinement proof is re-taken on the failure path too: a redirect installed inside the open
+/// window has to surface as a confinement violation rather than as whatever opaque I/O error the
+/// redirect happened to produce, because callers legitimately treat ordinary open failures as
+/// retryable and a violation must never be retried into acceptance.
+pub(crate) fn open_plain_file_read_write_rooted(
+    work: &Path,
+    path: &Path,
+    create: bool,
+) -> io::Result<(File, RootedParents)> {
+    let parents = RootedParents(ensure_plain_parent_identity(work, path)?);
+    #[cfg(test)]
+    run_open_rooted_plain_file_hook()?;
+    let opened = open_plain_file(path, true, true, create, false);
+    let confined = assert_plain_parent(work, path, Some(&parents.0));
+    let file = match (opened, confined) {
+        (_, Err(violation)) => return Err(violation),
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(file), Ok(())) => file,
+    };
+    assert_plain_file_identity(path, &file)?;
+    Ok((file, parents))
+}
+
+/// Re-prove that a confined path still resolves through the very same parent chain a rooted open
+/// captured, without re-deriving what "the same chain" meant at open time.
+pub(crate) fn assert_rooted_parents_unchanged(
+    work: &Path,
+    path: &Path,
+    parents: &RootedParents,
+) -> io::Result<()> {
+    assert_plain_parent(work, path, Some(&parents.0))
+}
+
 /// Create a new confined control-plane file and reject a parent redirect installed around the
 /// creation attempt.
 pub(crate) fn create_new_plain_file_rooted(work: &Path, path: &Path) -> io::Result<File> {
@@ -302,6 +351,28 @@ fn run_create_new_plain_file_hook() -> io::Result<()> {
 #[cfg(test)]
 fn run_create_new_plain_file_post_hook() -> io::Result<()> {
     CREATE_NEW_PLAIN_FILE_POST_HOOK.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+/// The rooted-open counterpart of [`set_create_new_plain_file_hook`]: it runs between the parent
+/// identity capture and the open itself, so a caller that opens a durable sidecar can prove it
+/// rejects a parent swapped inside exactly that window instead of creating the sidecar outside
+/// `.work`.
+#[cfg(test)]
+pub(crate) fn set_open_rooted_plain_file_hook(hook: impl FnOnce() -> io::Result<()> + 'static) {
+    OPEN_ROOTED_PLAIN_FILE_HOOK.with(|slot| {
+        assert!(
+            slot.replace(Some(Box::new(hook))).is_none(),
+            "rooted-open test hook is already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_open_rooted_plain_file_hook() -> io::Result<()> {
+    OPEN_ROOTED_PLAIN_FILE_HOOK.with(|slot| match slot.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
@@ -1035,6 +1106,104 @@ mod tests {
 
         fs::remove_dir_all(work).unwrap();
         fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn rooted_open_rejects_a_parent_swapped_after_the_initial_check() {
+        let work = temp_root("open-parent-swap");
+        let external = temp_root("open-parent-external");
+        let parent = work.join("approvals");
+        let displaced = work.join("approvals-original");
+        let path = parent.join("sidecar.lock");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        let hook_parent = parent.clone();
+        let hook_displaced = displaced.clone();
+        let hook_external = external.clone();
+        set_open_rooted_plain_file_hook(move || {
+            fs::rename(&hook_parent, &hook_displaced)?;
+            symlink_directory(&hook_external, &hook_parent)
+        });
+        let error = open_plain_file_read_write_rooted(&work, &path, true).unwrap_err();
+
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::ParentNotPlain { path: violation_path })
+                if violation_path == &parent
+        ));
+        assert!(
+            external.join("sidecar.lock").is_file(),
+            "the post-open parent proof must reject a sidecar opened through the redirect"
+        );
+
+        remove_directory_link(&parent).unwrap();
+        fs::remove_dir_all(work).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    /// A redirect that also makes the open itself fail must still be reported as a confinement
+    /// violation. Callers legitimately retry or reclassify ordinary open failures, so leaking the
+    /// redirect out as the incidental `NotFound` it produced would turn a refusal into a retry.
+    #[test]
+    fn rooted_open_reports_a_parent_redirect_even_when_the_open_itself_fails() {
+        let work = temp_root("open-parent-swap-failing");
+        let parent = work.join("approvals");
+        let displaced = work.join("approvals-original");
+        let absent = temp_root("open-parent-absent");
+        let path = parent.join("sidecar.lock");
+        fs::create_dir_all(&parent).unwrap();
+
+        let hook_parent = parent.clone();
+        let hook_displaced = displaced.clone();
+        let hook_absent = absent.clone();
+        set_open_rooted_plain_file_hook(move || {
+            fs::rename(&hook_parent, &hook_displaced)?;
+            symlink_directory(&hook_absent, &hook_parent)
+        });
+        let error = open_plain_file_read_write_rooted(&work, &path, true).unwrap_err();
+
+        assert!(
+            matches!(
+                plain_read_violation(&error),
+                Some(PlainReadViolation::ParentNotPlain { path: violation_path })
+                    if violation_path == &parent
+            ),
+            "{error:?}"
+        );
+        assert!(!absent.exists(), "the redirect target must stay absent");
+
+        remove_directory_link(&parent).unwrap();
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn a_rooted_open_proof_stops_matching_once_the_parent_is_replaced() {
+        let work = temp_root("open-parent-proof");
+        let parent = work.join("approvals");
+        let displaced = work.join("approvals-original");
+        let path = parent.join("sidecar.lock");
+        fs::create_dir_all(&parent).unwrap();
+
+        let (file, parents) = open_plain_file_read_write_rooted(&work, &path, true).unwrap();
+        assert_rooted_parents_unchanged(&work, &path, &parents)
+            .expect("an untouched parent chain re-proves");
+
+        // A plain directory of the same name is still a different directory: the proof is an
+        // identity, so re-creating the parent cannot resurrect the confinement it once had.
+        // Windows refuses to rename a directory that still holds an open file, so the handle is
+        // released first; the proof under test is about the parent chain, not about the handle.
+        drop(file);
+        fs::rename(&parent, &displaced).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let error = assert_rooted_parents_unchanged(&work, &path, &parents).unwrap_err();
+
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::ParentNotPlain { path: violation_path })
+                if violation_path == &parent
+        ));
+        fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

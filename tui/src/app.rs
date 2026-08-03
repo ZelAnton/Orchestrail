@@ -342,6 +342,25 @@ impl AppState {
 
     fn on_cohort_closed(&mut self, ev: &Event) {
         self.set_phase(CohortPhase::Closed, ev);
+        let batch = ev.batch_id.clone().unwrap_or_default();
+        if ev.payload_version < 2 {
+            // Historical v1 close events did not carry outcome counters. Treating their empty
+            // payload as three zeroes would turn an unknown outcome into a false success signal.
+            if let Some(b) = self.batch.as_mut() {
+                b.close_stats = None;
+            }
+            self.push_recent(
+                &ev.occurred_at,
+                format!(
+                    "когорта {batch} закрыта (статистика недоступна: payload v{})",
+                    ev.payload_version
+                ),
+                RecentKind::Attention,
+            );
+            return;
+        }
+        // `cohort.closed` is an engine-authored outcome contract: native projector counters are
+        // derived from terminal task states, while the TUI only presents and classifies them.
         let stats = CloseStats {
             merged: pi64(&ev.payload, "merged").unwrap_or(0),
             quarantined: pi64(&ev.payload, "quarantined").unwrap_or(0),
@@ -355,7 +374,6 @@ impl AppState {
         } else {
             RecentKind::Good
         };
-        let batch = ev.batch_id.clone().unwrap_or_default();
         self.push_recent(
             &ev.occurred_at,
             format!(
@@ -1057,15 +1075,45 @@ mod tests {
     }
 
     #[test]
-    fn cohort_closed_records_stats_and_flags_quarantine() {
-        let closed = r#"{"schema_version":1,"event_id":"e-cl","occurred_at":"2026-07-11T12:30:00Z","type":"cohort.closed","batch_id":"B-2","actor":{"kind":"agent","name":"processor"},"payload":{"merged":1,"quarantined":1,"escalated":0}}"#;
+    fn cohort_closed_classifies_engine_supplied_outcomes() {
+        let good = r#"{"schema_version":1,"event_id":"e-good","occurred_at":"2026-07-11T12:30:00Z","type":"cohort.closed","batch_id":"B-2","actor":{"kind":"agent","name":"engine"},"payload_version":2,"payload":{"merged":2,"quarantined":0,"escalated":0}}"#;
+        let attention = r#"{"schema_version":1,"event_id":"e-attention","occurred_at":"2026-07-11T12:31:00Z","type":"cohort.closed","batch_id":"B-2","actor":{"kind":"agent","name":"engine"},"payload_version":2,"payload":{"merged":1,"quarantined":1,"escalated":1}}"#;
         let mut app = AppState::new();
-        app.apply_all(&events(&[OPENED, closed]));
+        app.apply_all(&events(&[OPENED, good]));
         let stats = app.batch.as_ref().unwrap().close_stats.unwrap();
-        assert_eq!(stats.merged, 1);
-        assert_eq!(stats.quarantined, 1);
-        // quarantine > 0 => the close is flagged as an attention item, not silent-green.
+        assert_eq!(stats.merged, 2);
+        assert_eq!(app.recent[0].kind, RecentKind::Good);
+
+        app.apply_all(&events(&[attention]));
+        let stats = app.batch.as_ref().unwrap().close_stats.unwrap();
+        assert_eq!(
+            stats,
+            CloseStats {
+                merged: 1,
+                quarantined: 1,
+                escalated: 1
+            }
+        );
+        // Nonzero engine-supplied quarantine/escalation counts are attention, never silent-green.
         assert_eq!(app.recent[0].kind, RecentKind::Attention);
+    }
+
+    #[test]
+    fn historical_v1_cohort_close_is_unknown_and_never_false_good() {
+        // Pre-versioning archive records have no `payload_version`; the event parser maps them to
+        // v1, whose empty close payload carried no outcome information.
+        let historical = r#"{"schema_version":1,"event_id":"e-historical","occurred_at":"2026-07-11T12:32:00Z","type":"cohort.closed","batch_id":"B-2","actor":{"kind":"agent","name":"engine"},"payload":{}}"#;
+        let mut app = AppState::new();
+        app.apply_all(&events(&[OPENED, historical]));
+
+        let batch = app.batch.as_ref().expect("closed batch remains projected");
+        assert_eq!(batch.phase, CohortPhase::Closed);
+        assert_eq!(batch.close_stats, None);
+        assert_eq!(app.recent[0].kind, RecentKind::Attention);
+        assert!(app.recent[0].label.contains("статистика недоступна"));
+        assert!(!app.recent[0].label.contains("слито 0"));
+        assert!(!app.recent[0].label.contains("карантин 0"));
+        assert!(!app.recent[0].label.contains("эскалировано 0"));
     }
 
     #[test]

@@ -7637,7 +7637,20 @@ mod tests {
             "an undecided approval must not even fast-forward the local primary checkout"
         );
         let approval_directory = work.join("approvals");
-        let approvals = fs::read_dir(&approval_directory).unwrap().count();
+        // Count artifacts only: the directory also holds the mutation lock's persistent
+        // kernel-lock sidecar, which is control-plane machinery rather than an approval.
+        let approvals = fs::read_dir(&approval_directory)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("json")
+            })
+            .count();
         assert_eq!(
             approvals, 2,
             "one deterministic approval record and its content manifest were created"
