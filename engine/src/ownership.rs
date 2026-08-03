@@ -1,13 +1,15 @@
 //! Native, interoperable owner lease for `.work/orchestrator.lock`.
 //!
 //! Orchestra's historical control plane stores an `orchestra/lease@1` JSON record in that
-//! directory. During catch-up development Orchestrail must coexist with a running Orchestra
-//! process, so this implementation preserves the record shape and the same `state-tx.lock`
-//! CreateNew-file interlock. A persistent, kernel-locked lifecycle sidecar makes identity-check +
-//! create/rename/remove sequences indivisible across Orchestrail processes. It also recognizes the
-//! directory lock written by older native builds. It does not invoke the PowerShell script and
-//! never recursively removes a lock directory: a foreign/corrupt lock remains an operator-visible
-//! refusal.
+//! directory. Orchestrail preserves that record shape and recognizes the historical
+//! `state-tx.lock` forms so it can inspect them and take over a stale lease after Orchestra has
+//! stopped. A running PowerShell control plane does not participate in Orchestrail's kernel-lock
+//! protocol, so concurrent lease mutation by the two control planes is not supported. A
+//! persistent, kernel-locked lifecycle sidecar makes identity-check + create/rename/remove
+//! sequences indivisible across Orchestrail processes. The sidecar is accepted only when the host
+//! can classify its storage as local with reliable kernel locking; network and unrecognized Unix
+//! filesystems fail closed. This module does not invoke the PowerShell script and never recursively
+//! removes a lock directory: a foreign/corrupt lock remains an operator-visible refusal.
 
 use std::env;
 use std::fmt;
@@ -734,9 +736,25 @@ impl TransactionLockSnapshot {
 /// system file lock cannot recurse into another stale-lock protocol. Every CreateNew, final stale
 /// identity check plus rename, and owner check plus removal requires this guard. `flock` and
 /// `LockFileEx` are released by the kernel when a process exits, which gives the whole lifecycle
-/// one filesystem-backed critical section shared by threads and independent processes.
+/// one filesystem-backed critical section shared by threads and independent processes. The open
+/// file's identity is revalidated against the sidecar path before every mutation so external
+/// unlink/recreate cannot silently split that critical section across two file identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionLifecycleIdentity {
+    filesystem: u64,
+    file: u64,
+}
+
 struct TransactionLifecycleGuard {
-    _file: fs::File,
+    file: fs::File,
+    path: PathBuf,
+    identity: TransactionLifecycleIdentity,
+}
+
+impl TransactionLifecycleGuard {
+    fn validate(&self) -> io::Result<()> {
+        validate_transaction_lifecycle_identity(&self.file, &self.path, self.identity)
+    }
 }
 
 fn try_acquire_transaction_lifecycle(
@@ -753,15 +771,32 @@ fn try_acquire_transaction_lifecycle(
     })?;
     let lifecycle_path = parent.join(TRANSACTION_LIFECYCLE_LOCK);
     let file = work_fs::open_plain_file_read_write(&lifecycle_path, true)?;
-    if try_lock_transaction_lifecycle_file(&file)? {
-        Ok(Some(TransactionLifecycleGuard { _file: file }))
-    } else {
-        Ok(None)
+    validate_filesystem_supports_kernel_locking(&lifecycle_path)?;
+    let Some(identity) = try_lock_transaction_lifecycle_file(&file, &lifecycle_path)? else {
+        return Ok(None);
+    };
+    Ok(Some(TransactionLifecycleGuard {
+        file,
+        path: lifecycle_path,
+        identity,
+    }))
+}
+
+fn try_lock_transaction_lifecycle_file(
+    file: &fs::File,
+    path: &Path,
+) -> io::Result<Option<TransactionLifecycleIdentity>> {
+    if !try_lock_transaction_lifecycle_file_os(file)? {
+        return Ok(None);
     }
+
+    let identity = transaction_lifecycle_identity(file)?;
+    validate_transaction_lifecycle_identity(file, path, identity)?;
+    Ok(Some(identity))
 }
 
 #[cfg(unix)]
-fn try_lock_transaction_lifecycle_file(file: &fs::File) -> io::Result<bool> {
+fn try_lock_transaction_lifecycle_file_os(file: &fs::File) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: `file` owns a live descriptor for the duration of this call. `flock` neither takes
@@ -781,7 +816,7 @@ fn try_lock_transaction_lifecycle_file(file: &fs::File) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn try_lock_transaction_lifecycle_file(file: &fs::File) -> io::Result<bool> {
+fn try_lock_transaction_lifecycle_file_os(file: &fs::File) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
@@ -815,10 +850,392 @@ fn try_lock_transaction_lifecycle_file(file: &fs::File) -> io::Result<bool> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn try_lock_transaction_lifecycle_file(_file: &fs::File) -> io::Result<bool> {
+fn try_lock_transaction_lifecycle_file_os(_file: &fs::File) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cross-process transaction lifecycle locks are unavailable on this platform",
+    ))
+}
+
+fn lifecycle_identity_error(path: &Path, reason: impl fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "state transaction lifecycle lock identity is no longer valid at {}: {reason}; \
+             refusing control-plane mutation",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionLifecycleIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(TransactionLifecycleIdentity {
+        filesystem: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn validate_transaction_lifecycle_identity(
+    file: &fs::File,
+    path: &Path,
+    expected: TransactionLifecycleIdentity,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = file.metadata()?;
+    if opened.nlink() == 0 {
+        return Err(lifecycle_identity_error(
+            path,
+            "the locked file descriptor has no directory link",
+        ));
+    }
+    let current =
+        fs::symlink_metadata(path).map_err(|error| lifecycle_identity_error(path, error))?;
+    work_fs::require_plain_file(path, &current)
+        .map_err(|error| lifecycle_identity_error(path, error))?;
+
+    let opened_identity = TransactionLifecycleIdentity {
+        filesystem: opened.dev(),
+        file: opened.ino(),
+    };
+    let current_identity = TransactionLifecycleIdentity {
+        filesystem: current.dev(),
+        file: current.ino(),
+    };
+    if opened_identity != expected {
+        return Err(lifecycle_identity_error(
+            path,
+            "the open file descriptor changed identity",
+        ));
+    }
+    if current.nlink() == 0 || current_identity != opened_identity {
+        return Err(lifecycle_identity_error(
+            path,
+            "the current path names a different file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_lifecycle_file_identity(
+    file: &fs::File,
+    path: &Path,
+) -> io::Result<(TransactionLifecycleIdentity, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a live handle and `information` points to writable storage for the
+    // complete BY_HANDLE_FILE_INFORMATION result.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(lifecycle_identity_error(path, io::Error::last_os_error()));
+    }
+    // SAFETY: a successful GetFileInformationByHandle call initialized the result structure.
+    let information = unsafe { information.assume_init() };
+    Ok((
+        TransactionLifecycleIdentity {
+            filesystem: u64::from(information.dwVolumeSerialNumber),
+            file: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        },
+        u64::from(information.nNumberOfLinks),
+    ))
+}
+
+#[cfg(windows)]
+fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionLifecycleIdentity> {
+    windows_lifecycle_file_identity(file, Path::new("<open lifecycle lock>"))
+        .map(|(identity, _)| identity)
+}
+
+#[cfg(windows)]
+fn validate_transaction_lifecycle_identity(
+    file: &fs::File,
+    path: &Path,
+    expected: TransactionLifecycleIdentity,
+) -> io::Result<()> {
+    let (opened_identity, opened_links) = windows_lifecycle_file_identity(file, path)?;
+    if opened_links == 0 {
+        return Err(lifecycle_identity_error(
+            path,
+            "the locked file handle has no directory link",
+        ));
+    }
+    let current = work_fs::open_existing_plain_file(path)
+        .map_err(|error| lifecycle_identity_error(path, error))?;
+    let (current_identity, current_links) = windows_lifecycle_file_identity(&current, path)?;
+    if opened_identity != expected {
+        return Err(lifecycle_identity_error(
+            path,
+            "the open file handle changed identity",
+        ));
+    }
+    if current_links == 0 || current_identity != opened_identity {
+        return Err(lifecycle_identity_error(
+            path,
+            "the current path names a different file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn transaction_lifecycle_identity(_file: &fs::File) -> io::Result<TransactionLifecycleIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "transaction lifecycle file identity is unavailable on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_transaction_lifecycle_identity(
+    _file: &fs::File,
+    _path: &Path,
+    _expected: TransactionLifecycleIdentity,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "transaction lifecycle file identity is unavailable on this platform",
+    ))
+}
+
+fn unsupported_locking_filesystem(path: &Path, reason: impl fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "lease lock requires local filesystem with reliable kernel locking; NFS and SMB are \
+             not supported ({}: {reason})",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Result<()> {
+    const LOCAL_FILESYSTEMS: &[u64] = &[
+        0x0000_3434, // NILFS
+        0x0000_4D44, // FAT/MS-DOS
+        0x0000_72B6, // JFFS2
+        0x0000_EF53, // ext2/ext3/ext4
+        0x0102_1994, // tmpfs
+        0x1501_3346, // UDF
+        0x2011_BAB0, // exFAT
+        0x2405_1905, // UBIFS
+        0x2FC1_2FC1, // ZFS
+        0x3153_464A, // JFS
+        0x5265_4973, // ReiserFS
+        0x5265_4974, // ReiserFS v2
+        0x5265_4975, // ReiserFS v3
+        0x5346_544E, // NTFS
+        0x5846_5342, // XFS
+        0x6175_6673, // AUFS
+        0x794C_7630, // overlayfs
+        0x8584_58F6, // ramfs
+        0x9123_683E, // Btrfs
+        0xCA45_1A4E, // bcachefs
+        0xF2F5_2010, // F2FS
+    ];
+    const NETWORK_OR_UNVERIFIABLE_FILESYSTEMS: &[u64] = &[
+        0x0000_517B, // SMB
+        0x0000_564C, // NCP
+        0x0000_6969, // NFS
+        0x00C3_6400, // Ceph
+        0x0102_1997, // 9P, including network-backed virtio mounts
+        0x0116_1970, // GFS2
+        0x0BD0_0BD0, // Lustre
+        0x4750_4653, // GPFS
+        0x5346_414F, // AFS
+        0x6573_5546, // FUSE (backing store cannot be established)
+        0x7375_7245, // Coda
+        0x7461_636F, // OCFS2
+        0xAAD7_AAEA, // PanFS
+        0xFF53_4D42, // CIFS
+    ];
+
+    let filesystem_type = filesystem_type & u64::from(u32::MAX);
+    if LOCAL_FILESYSTEMS.contains(&filesystem_type) {
+        return Ok(());
+    }
+    let classification = if NETWORK_OR_UNVERIFIABLE_FILESYSTEMS.contains(&filesystem_type) {
+        "detected a network or distributed filesystem"
+    } else {
+        "filesystem type is not in the local-filesystem allowlist"
+    };
+    Err(unsupported_locking_filesystem(
+        path,
+        format_args!("{classification}: magic 0x{filesystem_type:08x}"),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| unsupported_locking_filesystem(path, "path contains an embedded NUL byte"))?;
+    let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `encoded` is NUL-terminated and `statistics` points to writable storage for statfs.
+    if unsafe { libc::statfs(encoded.as_ptr(), statistics.as_mut_ptr()) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(unsupported_locking_filesystem(
+            path,
+            format_args!("filesystem type lookup failed: {error}"),
+        ));
+    }
+    // SAFETY: a successful statfs call initialized the entire output structure.
+    let statistics = unsafe { statistics.assume_init() };
+    validate_linux_filesystem_type(path, statistics.f_type as u64)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| unsupported_locking_filesystem(path, "path contains an embedded NUL byte"))?;
+    let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `encoded` is NUL-terminated and `statistics` points to writable storage for statfs.
+    if unsafe { libc::statfs(encoded.as_ptr(), statistics.as_mut_ptr()) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(unsupported_locking_filesystem(
+            path,
+            format_args!("filesystem type lookup failed: {error}"),
+        ));
+    }
+    // SAFETY: statfs succeeded and its fixed-size filesystem-name field is NUL-terminated.
+    let statistics = unsafe { statistics.assume_init() };
+    let filesystem = unsafe { CStr::from_ptr(statistics.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    match filesystem.as_str() {
+        "apfs" | "exfat" | "ext2fs" | "ffs" | "hammer" | "hammer2" | "hfs" | "lfs" | "msdos"
+        | "ntfs" | "nullfs" | "tmpfs" | "ufs" | "unionfs" | "zfs" => Ok(()),
+        _ => Err(unsupported_locking_filesystem(
+            path,
+            format_args!("filesystem type {filesystem:?} is not in the local-filesystem allowlist"),
+        )),
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+    Err(unsupported_locking_filesystem(
+        path,
+        "filesystem type detection is unavailable on this Unix target",
+    ))
+}
+
+#[cfg(windows)]
+fn windows_path_is_unc(path: &Path) -> bool {
+    use std::path::Prefix;
+
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
+}
+
+#[cfg(windows)]
+fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+
+    if windows_path_is_unc(path) {
+        return Err(unsupported_locking_filesystem(path, "UNC path detected"));
+    }
+    let absolute = fs::canonicalize(path).map_err(|error| {
+        unsupported_locking_filesystem(path, format_args!("canonical path lookup failed: {error}"))
+    })?;
+    if windows_path_is_unc(&absolute) {
+        return Err(unsupported_locking_filesystem(
+            path,
+            "canonical path resolves to a UNC share",
+        ));
+    }
+    let wide_path: Vec<u16> = absolute
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let mut volume_path = vec![0_u16; 32_768];
+    // SAFETY: both vectors are live, NUL-terminated/writable as required, and the output length
+    // describes the complete allocated buffer.
+    if unsafe {
+        GetVolumePathNameW(
+            wide_path.as_ptr(),
+            volume_path.as_mut_ptr(),
+            volume_path.len() as u32,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(unsupported_locking_filesystem(
+            path,
+            format_args!("Windows volume lookup failed: {error}"),
+        ));
+    }
+    // SAFETY: GetVolumePathNameW succeeded and wrote a NUL-terminated root path to the buffer.
+    let drive_type = unsafe { GetDriveTypeW(volume_path.as_ptr()) };
+    validate_windows_drive_type(path, drive_type)
+}
+
+#[cfg(windows)]
+fn validate_windows_drive_type(path: &Path, drive_type: u32) -> io::Result<()> {
+    const DRIVE_UNKNOWN: u32 = 0;
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    const DRIVE_REMOTE: u32 = 4;
+
+    match drive_type {
+        DRIVE_REMOTE => Err(unsupported_locking_filesystem(
+            path,
+            "Windows reports a remote or mapped network drive",
+        )),
+        DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR => Err(unsupported_locking_filesystem(
+            path,
+            "Windows could not classify the containing volume",
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+    Err(unsupported_locking_filesystem(
+        path,
+        "filesystem type detection is unavailable on this platform",
     ))
 }
 
@@ -837,6 +1254,7 @@ impl TransactionLockGuard {
         let lifecycle = self.lifecycle.as_ref().ok_or_else(|| {
             io::Error::other("armed state transaction lock has no lifecycle guard")
         })?;
+        lifecycle.validate()?;
         let snapshot = transaction_lock_snapshot(&self.path)?;
         match snapshot.kind {
             TransactionLockKind::File { owner } if owner == self.owner => {
@@ -944,8 +1362,9 @@ fn acquire_transaction_lock(
 fn create_transaction_lock(
     path: &Path,
     owner: &str,
-    _lifecycle: &TransactionLifecycleGuard,
+    lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<bool> {
+    lifecycle.validate()?;
     let mut file = match work_fs::create_new_plain_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
@@ -957,25 +1376,29 @@ fn create_transaction_lock(
         }
         Err(error) => return Err(error),
     };
+    lifecycle.validate()?;
     if let Err(error) = (|| -> io::Result<()> {
         file.write_all(owner.as_bytes())?;
         file.sync_all()
     })() {
         drop(file);
+        lifecycle.validate()?;
         let _ = fs::remove_file(path);
         return Err(error);
     }
+    lifecycle.validate()?;
     Ok(true)
 }
 
 fn remove_owned_transaction_lock(
     path: &Path,
-    _lifecycle: &TransactionLifecycleGuard,
+    lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<()> {
     // The ownership read in `release` and this removal are one logical filesystem transaction:
     // every code path capable of renaming, creating, or removing the canonical name needs the
     // same cross-process lifecycle guard. There is no pathname lookup between a second ownership
     // check and deletion that could accidentally authorize a replacement lock.
+    lifecycle.validate()?;
     fs::remove_file(path)
 }
 
@@ -1016,7 +1439,7 @@ fn break_stale_transaction_lock(
     path: &Path,
     decided: &TransactionLockSnapshot,
     stale_after: Duration,
-    _lifecycle: &TransactionLifecycleGuard,
+    lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<bool> {
     if decided
         .age_ms
@@ -1024,6 +1447,7 @@ fn break_stale_transaction_lock(
     {
         return Ok(false);
     }
+    lifecycle.validate()?;
     // The lifecycle guard makes this final content/metadata check and the following atomic rename
     // one identity-conditional operation with respect to every Orchestrail process. Create and
     // release take the same OS file lock, so the canonical name cannot be replaced in this gap.
@@ -1054,6 +1478,7 @@ fn break_stale_transaction_lock(
         TRANSACTION_STALE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let stale_path = PathBuf::from(stale_path);
+    lifecycle.validate()?;
     match fs::rename(path, &stale_path) {
         Ok(()) => {}
         Err(error)
@@ -1080,6 +1505,7 @@ fn break_stale_transaction_lock(
 
     // The canonical lock name is now free and this unique quarantine name is owned by the
     // successful renamer, so cleanup cannot delete a replacement transaction lock.
+    lifecycle.validate()?;
     let removal = match confirmed.kind {
         TransactionLockKind::File { .. } => fs::remove_file(&stale_path),
         TransactionLockKind::EmptyDirectory => fs::remove_dir(&stale_path),
@@ -1321,6 +1747,79 @@ mod tests {
         );
         drop(lifecycle);
         let _ = fs::remove_dir_all(work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_guard_rejects_an_unlinked_and_recreated_sidecar() {
+        let work = work("recreated-lifecycle-sidecar");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        let original = try_acquire_transaction_lifecycle(&tx)
+            .unwrap()
+            .expect("test owns original lifecycle lock");
+        let lifecycle_path = original.path.clone();
+
+        fs::remove_file(&lifecycle_path).unwrap();
+        fs::write(&lifecycle_path, "replacement").unwrap();
+        let replacement = try_acquire_transaction_lifecycle(&tx)
+            .unwrap()
+            .expect("replacement inode has an independent kernel lock");
+
+        let error = create_transaction_lock(&tx, "must-not-be-created", &original).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("identity is no longer valid"));
+        assert!(
+            !tx.exists(),
+            "an obsolete lifecycle guard must deny further mutations"
+        );
+
+        drop(replacement);
+        drop(original);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn network_and_unknown_linux_filesystems_fail_closed() {
+        let path = Path::new("/test/.state-tx.lifecycle.lock");
+        for filesystem_type in [
+            0x0000_6969, // NFS
+            0xFF53_4D42, // CIFS
+            0x0000_517B, // SMB
+            0x5346_414F, // AFS
+            0x6573_5546, // FUSE
+            0xDEAD_BEEF, // unknown
+        ] {
+            let error = validate_linux_filesystem_type(path, filesystem_type).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("NFS and SMB are not supported"));
+        }
+        validate_linux_filesystem_type(path, 0x0000_EF53).unwrap();
+        validate_linux_filesystem_type(path, 0x794C_7630).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_paths_are_classified_as_remote() {
+        assert!(windows_path_is_unc(Path::new(
+            r"\\server\share\.state-tx.lifecycle.lock"
+        )));
+        assert!(windows_path_is_unc(Path::new(
+            r"\\?\UNC\server\share\.state-tx.lifecycle.lock"
+        )));
+        assert!(!windows_path_is_unc(Path::new(
+            r"C:\project\.work\.state-tx.lifecycle.lock"
+        )));
+        let path = Path::new(r"Z:\project\.work\.state-tx.lifecycle.lock");
+        let remote = validate_windows_drive_type(path, 4).unwrap_err();
+        assert_eq!(remote.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            remote
+                .to_string()
+                .contains("remote or mapped network drive")
+        );
+        assert!(validate_windows_drive_type(path, 3).is_ok());
     }
 
     #[cfg(windows)]
