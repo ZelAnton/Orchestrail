@@ -751,8 +751,7 @@ pub fn replace_file(work: &Path, path: &Path, payload: &[u8], max_bytes: u64) ->
         name.to_string_lossy(),
         std::process::id()
     ));
-    ensure_plain_parent(work, &temp)?;
-    let mut file = create_new_plain_file(&temp)?;
+    let mut file = create_new_plain_file_rooted(work, &temp)?;
     let result = (|| {
         file.write_all(payload)?;
         file.sync_all()
