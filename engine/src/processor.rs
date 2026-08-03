@@ -3246,6 +3246,21 @@ impl Processor {
                     kind: LeafKind::Fix,
                 }])
             }
+            // Phase 2.7 — the reviewer pass did not conclude (cut short before its `ИТОГ:` tail,
+            // no fresh `SUMMARY-R` to prove a clean gate, or no report of its own at all). Re-run
+            // the SAME reviewer; never dispatch a fixer against an empty finding list.
+            //
+            // This arm is the only budget holder for such rounds, and T-026 routed the remaining
+            // truncation shapes here instead of into a terminal escalation, so its accounting is
+            // load-bearing: `Циклов-ревью` counts every COMPLETED pass including this one (see
+            // `TaskRuntime::review_cycles`), which is what keeps `REVIEW_LOOP_MAX` finite for a
+            // reviewer that is repeatedly interrupted, and crash-safe across resume. The `>=`
+            // comparison (rather than the `>` used when concluding a clean pass) is deliberate: it
+            // decides whether ANOTHER cycle may run, matching the identical guard in
+            // `prepare_task_review`, so no review is dispatched that preparation would reject.
+            // `CALL_MAX_ATTEMPTS` (`leaf_max_attempts`) is untouched by this route and stays what
+            // it is — the transient-retry budget of implement/fix leaves; a reviewer's supervision
+            // failure remains terminal (`ReviewOutcome::Escalated`) rather than a retryable one.
             ReviewOutcome::Incomplete => {
                 task.review_cycles = task.review_cycles.saturating_add(1);
                 if task.review_cycles >= review_loop_max {
@@ -6324,6 +6339,84 @@ mod tests {
         assert_eq!(p.state.tasks["T-1"].phase, TaskPhase::Escalated);
         assert_eq!(p.state.tasks["T-1"].review_cycles, 2);
         assert!(matches!(effects.last(), Some(Effect::EscalateTask { .. })));
+    }
+
+    #[test]
+    fn incomplete_rounds_spend_the_same_review_budget_as_productive_ones() {
+        // T-026 routed every «reviewer interrupted» shape (a report cut short before its `ИТОГ:`
+        // tail, a ready claim without a fresh `SUMMARY-R`) into this arm instead of a terminal
+        // escalation, so the arm's accounting is what keeps the loop finite. `Циклов-ревью` is ONE
+        // budget shared by all round kinds: an incomplete round spends a unit exactly like a round
+        // with findings, and a productive round afterwards neither resets nor re-charges it.
+        let mut p = Processor::new(ProcessorConfig {
+            max_parallel: 2,
+            cohort_size: 3,
+            review_loop_max: 4,
+            integration_loop_max: 2,
+            ci_fix_max: 2,
+            stagnation_limit: 2,
+            leaf_max_attempts: 1,
+            ..ProcessorConfig::default()
+        })
+        .unwrap();
+        open(&mut p);
+        let mut task = TaskRuntime::new(&candidate("T-1", "engine/**"), 1);
+        task.phase = TaskPhase::Reviewing;
+        task.review_sha = Some("task-tip".into());
+        p.state.tasks.insert(task.id.clone(), task);
+
+        for expected in 1..=2 {
+            assert!(matches!(
+                p.apply(ProcessorCommand::TaskReview {
+                    task_id: "T-1".into(),
+                    outcome: ReviewOutcome::Incomplete,
+                })
+                .unwrap()
+                .last(),
+                Some(Effect::PrepareTaskReview { task_id }) if task_id == "T-1"
+            ));
+            assert_eq!(p.state.tasks["T-1"].review_cycles, expected);
+            assert_eq!(p.state.tasks["T-1"].phase, TaskPhase::Reviewing);
+        }
+
+        // A round that does conclude with findings continues on the SAME counter — the two
+        // incomplete rounds before it are not forgiven.
+        let effects = p
+            .apply(ProcessorCommand::TaskReview {
+                task_id: "T-1".into(),
+                outcome: ReviewOutcome::Findings {
+                    signature: signature("R-01 missing error path"),
+                    open_findings: 1,
+                    open_finding_ids: vec!["R-01".into()],
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            effects.last(),
+            Some(Effect::PrepareTaskLeaf {
+                kind: LeafKind::Fix,
+                ..
+            })
+        ));
+        assert_eq!(p.state.tasks["T-1"].review_cycles, 3);
+
+        // The fourth pass is the last one `REVIEW_LOOP_MAX = 4` allows: an incomplete round here
+        // escalates instead of dispatching a fifth reviewer, which is the same wall a findings
+        // round would hit at the same count.
+        p.state.tasks.get_mut("T-1").unwrap().phase = TaskPhase::Reviewing;
+        let effects = p
+            .apply(ProcessorCommand::TaskReview {
+                task_id: "T-1".into(),
+                outcome: ReviewOutcome::Incomplete,
+            })
+            .unwrap();
+        assert_eq!(p.state.tasks["T-1"].review_cycles, 4);
+        assert_eq!(p.state.tasks["T-1"].phase, TaskPhase::Escalated);
+        assert!(matches!(effects.last(), Some(Effect::EscalateTask { .. })));
+        assert_eq!(
+            p.state.tasks["T-1"].reason.as_deref(),
+            Some("не сходится ревью после 4 циклов")
+        );
     }
 
     #[test]
