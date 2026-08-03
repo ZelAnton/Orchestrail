@@ -4,22 +4,59 @@
 //! module records the exact subject, reason, content-bound fingerprint, and policy snapshot that
 //! an operator decided.  Its deterministic identifier makes a resumed request idempotent, while
 //! a changed fingerprint or policy necessarily addresses a different record.
+//!
+//! # Crash recovery of the mutation lock
+//!
+//! Every mutation runs inside `.work/approvals/.approval-mutation.lock`, taken through the same
+//! durable transaction-lock primitive as the owner lease's `state-tx.lock`
+//! ([`crate::ownership::acquire_transaction_lock`]). That shared primitive is what makes a killed
+//! process recoverable: a lock left behind by a holder that died mid-mutation is waited on only
+//! until [`TRANSACTION_LOCK_STALE_AFTER`], then broken by exactly one contender under a kernel
+//! lifecycle sidecar, and the mutation proceeds. An approval mutation therefore cannot be wedged
+//! forever by a crash, a power loss, or a killed supervisor child. A holder that is still live is
+//! still refused — with [`ApprovalError::Busy`] naming the holder and its age, so an operator can
+//! tell "someone else is deciding right now" from "this lock needs looking at".
+//!
+//! Recovery never softens ownership. The UUID holder token inside the lock is checked before the
+//! critical section and again when it is released, and a lock that stopped recording this
+//! acquisition is [`ApprovalError::Corrupt`] at both boundaries — including when the mutation
+//! itself also failed, because a second writer inside an authorization mutation is the more
+//! serious of the two facts and may not be suppressed by the less serious one.
+//!
+//! Adopting that primitive deliberately inherits its fail-closed storage requirement: the sidecar
+//! is refused on network, stackable, and unclassifiable filesystems, so a `.work/approvals`
+//! directory on such storage now reports an error instead of mutating. That is the correct
+//! trade for an authorization artifact — a lock whose exclusion the kernel will not honor cannot
+//! be allowed to admit two concurrent deciders — and `.work/approvals` sits under the same
+//! `.work` root as the lease lock, which already imposes exactly this requirement.
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::ownership::{
+    TRANSACTION_LOCK_STALE_AFTER, TRANSACTION_LOCK_TIMEOUT, TransactionLockError,
+    TransactionLockPolicy, TransactionReleaseError, acquire_transaction_lock,
+};
 use crate::work_fs;
 
 pub const APPROVAL_SCHEMA: &str = "orchestrail/approval@1";
 pub const APPROVAL_MANIFEST_SCHEMA: &str = "orchestrail/approval-manifest@1";
 const MAX_APPROVAL_BYTES: u64 = 4 * 1024 * 1024;
 const MUTATION_LOCK: &str = ".approval-mutation.lock";
+/// The mutation lock's own kernel-locked lifecycle sidecar. It is persistent and never removed,
+/// and its dot-prefixed, non-`.json` name keeps it out of every approval-artifact projection.
+const MUTATION_LIFECYCLE_LOCK: &str = ".approval-mutation.lifecycle.lock";
+/// Read ceiling for the holder token recorded inside the lock. The token itself is a v4 UUID
+/// rather than the lease's `pid:sequence` form: an approval mutation can come from any of several
+/// short-lived processes, and a recycled PID must never be able to look like a still-valid owner.
+const MUTATION_LOCK_MAX_TOKEN_BYTES: u64 = 1_024;
 
 /// A serializable artifact whose own content identity must match the approval record it is
 /// stored beside. This makes the human-readable manifest a checked part of the authorization,
@@ -104,10 +141,22 @@ pub enum ApprovalError {
     Json(serde_json::Error),
     Invalid(String),
     Corrupt(String),
-    AlreadyDecided { id: String },
-    Expired { id: String },
-    Missing { id: String },
-    Busy,
+    AlreadyDecided {
+        id: String,
+    },
+    Expired {
+        id: String,
+    },
+    Missing {
+        id: String,
+    },
+    /// A live peer holds the mutation lock. The observed holder and its age travel with the
+    /// refusal: a caller that retries, and an operator reading the message, both need to know
+    /// whether this is momentary contention or a lock worth inspecting.
+    Busy {
+        age_ms: Option<u128>,
+        kind: String,
+    },
 }
 
 impl fmt::Display for ApprovalError {
@@ -119,7 +168,20 @@ impl fmt::Display for ApprovalError {
             Self::AlreadyDecided { id } => write!(f, "approval {id:?} was already decided"),
             Self::Expired { id } => write!(f, "approval {id:?} expired before a decision"),
             Self::Missing { id } => write!(f, "approval {id:?} does not exist"),
-            Self::Busy => f.write_str("another approval mutation is already in progress"),
+            Self::Busy { age_ms, kind } => match age_ms {
+                Some(age_ms) => write!(
+                    f,
+                    "another approval mutation is already in progress ({kind}, age={age_ms}ms); \
+                     a holder that stops responding is recovered automatically once it exceeds \
+                     the {}ms stale threshold",
+                    TRANSACTION_LOCK_STALE_AFTER.as_millis()
+                ),
+                None => write!(
+                    f,
+                    "another approval mutation is already in progress ({kind}, age unavailable); \
+                     inspect .work/approvals/{MUTATION_LOCK} before retrying"
+                ),
+            },
         }
     }
 }
@@ -134,7 +196,7 @@ impl std::error::Error for ApprovalError {
             | Self::AlreadyDecided { .. }
             | Self::Expired { .. }
             | Self::Missing { .. }
-            | Self::Busy => None,
+            | Self::Busy { .. } => None,
         }
     }
 }
@@ -142,6 +204,15 @@ impl std::error::Error for ApprovalError {
 impl From<std::io::Error> for ApprovalError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<TransactionLockError> for ApprovalError {
+    fn from(error: TransactionLockError) -> Self {
+        match error {
+            TransactionLockError::Io(error) => Self::Io(error),
+            TransactionLockError::Busy { age_ms, kind } => Self::Busy { age_ms, kind },
+        }
     }
 }
 
@@ -399,44 +470,92 @@ impl ApprovalStore {
     }
 
     fn with_mutation_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_mutation_lock_policy(
+            TRANSACTION_LOCK_TIMEOUT,
+            TRANSACTION_LOCK_STALE_AFTER,
+            operation,
+        )
+    }
+
+    /// Run one mutation under the durable approval mutation lock.
+    ///
+    /// The lock itself is [`crate::ownership`]'s transaction-lock primitive rather than a private
+    /// copy of it: contention waits up to `timeout`, and a lock orphaned by a crashed holder is
+    /// broken after `stale_after` by exactly one contender. The holder token check below is kept
+    /// on top of that primitive's own filesystem-identity proofs because it answers a different
+    /// question — those proofs establish that the pathname still names the entry this process
+    /// created, while the token establishes that the *contents* still record this acquisition. An
+    /// external writer that overwrites the lock in place changes only the latter.
+    ///
+    /// Timing is a parameter purely so tests can drive both branches without waiting minutes;
+    /// every caller uses the shared defaults through [`Self::with_mutation_lock`], deliberately
+    /// the lease's own thresholds rather than an approval-specific pair. The wait is synchronous,
+    /// including on the TUI's decide keystroke, which is a considered trade: an *orphaned* lock
+    /// (the case that used to fail forever) is broken on the first observation without waiting at
+    /// all, and only a genuinely live peer — which holds the lock for one small read-modify-write
+    /// — can make a caller wait, bounded well under the 120s the legacy decide path on that same
+    /// keystroke already allows.
+    fn with_mutation_lock_policy<T>(
+        &self,
+        timeout: Duration,
+        stale_after: Duration,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         approval_directory_available(&self.work, &self.directory, true)?;
         let lock = self.directory.join(MUTATION_LOCK);
-        let mut file = match work_fs::create_new_plain_file_rooted(&self.work, &lock) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(ApprovalError::Busy);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let token = format!("{}\n", Uuid::new_v4());
+        let token = Uuid::new_v4().to_string();
+        let policy = TransactionLockPolicy::new(
+            &self.work,
+            &lock,
+            MUTATION_LIFECYCLE_LOCK,
+            timeout,
+            stale_after,
+        );
+        let mut guard = acquire_transaction_lock(&policy, token.clone())?;
         let result = (|| {
-            file.write_all(token.as_bytes())?;
-            file.sync_all()?;
-            let observed = work_fs::read_required_text(&self.work, &lock, 1_024)?;
-            if observed != token {
-                return Err(ApprovalError::Corrupt(
-                    "approval mutation lock ownership changed before use".into(),
-                ));
-            }
+            self.verify_mutation_lock_token(&lock, &token)?;
             operation()
         })();
-        drop(file);
-        let cleanup = match work_fs::read_optional_text(&self.work, &lock, 1_024) {
-            Ok(Some(observed)) if observed == token => {
-                work_fs::remove_plain_file(&self.work, &lock).map(|_| ())
+        // The guard removes the lock only while it still records our own token, so a lock taken
+        // over by anyone else is left untouched and reported. The two ways a release can fail are
+        // not the same condition, and collapsing them into one would silently weaken the holder
+        // token guarantee this store depends on:
+        //
+        // * A holder substitution — the lock stopped recording this acquisition — is exactly the
+        //   condition [`Self::verify_mutation_lock_token`] refuses on entry, observed one moment
+        //   later. It carries the same meaning there and here (another writer may have entered an
+        //   authorization mutation), so it reports the same `Corrupt`, and it is reported even
+        //   when the mutation itself failed: a second decider on an approval outranks whatever the
+        //   operation was going to say, and suppressing it would leave that fact unrecorded.
+        // * A plain I/O failure to remove our own lock is surfaced only when the mutation
+        //   succeeded; otherwise the mutation's own error is the primary one worth reporting.
+        match guard.release() {
+            Ok(()) => result,
+            Err(owner_changed @ TransactionReleaseError::OwnerChanged { .. }) => {
+                Err(ApprovalError::Corrupt(format!(
+                    "approval mutation lock ownership changed before release: {}",
+                    owner_changed.describe()
+                )))
             }
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "approval mutation lock is now owned by another process",
-            )),
-            Err(error) => Err(error),
-        };
-        match (result, cleanup) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(error.into()),
-            (Err(error), _) => Err(error),
+            Err(TransactionReleaseError::Io(error)) if result.is_ok() => {
+                Err(ApprovalError::Io(error))
+            }
+            Err(TransactionReleaseError::Io(_)) => result,
         }
+    }
+
+    /// Prove the held lock still records this acquisition's token before entering the critical
+    /// section. Anything else — a truncated, overwritten, or externally rewritten lock — is a
+    /// corrupt control-plane state, never a mutation this process may proceed with.
+    fn verify_mutation_lock_token(&self, lock: &Path, token: &str) -> Result<()> {
+        let observed =
+            work_fs::read_required_text(&self.work, lock, MUTATION_LOCK_MAX_TOKEN_BYTES)?;
+        if observed != token {
+            return Err(ApprovalError::Corrupt(
+                "approval mutation lock ownership changed before use".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn path(&self, id: &str) -> PathBuf {
@@ -655,7 +774,10 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::SystemTime;
 
     use super::*;
 
@@ -681,6 +803,15 @@ mod tests {
         ));
         fs::create_dir_all(&work).unwrap();
         work
+    }
+
+    /// Age a lock file's last-write stamp into the past, exactly as a holder that crashed that
+    /// long ago leaves it behind. Staleness is derived from this stamp and nothing else, so this
+    /// reproduces an orphaned lock without waiting out the real threshold.
+    fn freeze_lock_age(path: &Path, age: Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
     }
 
     fn request(now_secs: u64) -> ApprovalRequest {
@@ -867,9 +998,15 @@ mod tests {
         let store = ApprovalStore::new(&work).unwrap();
         let record = store.request(request(10)).unwrap();
         fs::write(store.directory().join(MUTATION_LOCK), "held\n").unwrap();
+        // A freshly written foreign lock is live, so the bounded wait expires and the mutation is
+        // refused. The wait is shortened here only so the test does not sit out the real timeout.
         assert!(matches!(
-            store.decide(&record.id, ApprovalDecision::Approve, "operator", None, 11),
-            Err(ApprovalError::Busy)
+            store.with_mutation_lock_policy(
+                Duration::from_millis(5),
+                TRANSACTION_LOCK_STALE_AFTER,
+                || store.load(&record.id)
+            ),
+            Err(ApprovalError::Busy { .. })
         ));
         fs::remove_file(store.directory().join(MUTATION_LOCK)).unwrap();
 
@@ -892,6 +1029,253 @@ mod tests {
             );
         }
         let _ = fs::remove_file(&external);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn an_orphaned_mutation_lock_is_recovered_and_the_mutation_completes() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        let record = store.request(request(10)).unwrap();
+
+        // Precisely what a process killed between creating and removing the lock leaves behind:
+        // the file is there, its holder is gone, and nobody will ever come back to remove it.
+        let lock = store.directory().join(MUTATION_LOCK);
+        fs::write(&lock, "crashed-holder").unwrap();
+        freeze_lock_age(
+            &lock,
+            TRANSACTION_LOCK_STALE_AFTER + Duration::from_secs(60),
+        );
+
+        // Deliberately the production policy rather than a test-shortened one: recovery has to
+        // hold for the real callers (`native_port`'s publication gate, the TUI's decide command).
+        let decided = store
+            .decide(&record.id, ApprovalDecision::Approve, "operator", None, 11)
+            .expect("an orphaned lock must not wedge approval mutations forever");
+        assert_eq!(decided.decision, Some(ApprovalDecision::Approve));
+        assert!(
+            store
+                .status(&record.id, &"a".repeat(64), &"b".repeat(64), 12)
+                .unwrap()
+                .allows_progress()
+        );
+        assert!(
+            !lock.exists(),
+            "the recovered lock is released by its new owner, not leaked again"
+        );
+
+        // The remaining mutation entry points recover through the same lock, not just `decide`.
+        fs::write(&lock, "crashed-holder-again").unwrap();
+        freeze_lock_age(
+            &lock,
+            TRANSACTION_LOCK_STALE_AFTER + Duration::from_secs(60),
+        );
+        store.clear_notification_pending(&record.id).unwrap();
+        assert!(
+            !store
+                .load(&record.id)
+                .unwrap()
+                .unwrap()
+                .notification_pending
+        );
+        assert!(!lock.exists());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_live_mutation_lock_is_never_broken_early_and_refuses_with_diagnostics() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        store.request(request(10)).unwrap();
+        let lock = store.directory().join(MUTATION_LOCK);
+        fs::write(&lock, "live-peer").unwrap();
+
+        let entered = AtomicUsize::new(0);
+        let error = store
+            .with_mutation_lock_policy(
+                Duration::from_millis(20),
+                TRANSACTION_LOCK_STALE_AFTER,
+                || {
+                    entered.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, ApprovalError::Busy { age_ms: Some(_), kind } if kind.contains("live-peer")),
+            "a refusal must name the holder it observed: {error:?}"
+        );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("age="), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&format!(
+                "{}ms stale threshold",
+                TRANSACTION_LOCK_STALE_AFTER.as_millis()
+            )),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            entered.load(Ordering::Relaxed),
+            0,
+            "a refused acquisition must never run the mutation"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock).unwrap(),
+            "live-peer",
+            "a holder short of the stale threshold is waited out, never broken"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn the_holder_token_check_still_refuses_a_lock_rewritten_under_us() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        store.request(request(10)).unwrap();
+        let lock = store.directory().join(MUTATION_LOCK);
+
+        fs::write(&lock, "someone-elses-token").unwrap();
+        assert!(matches!(
+            store.verify_mutation_lock_token(&lock, "our-token"),
+            Err(ApprovalError::Corrupt(message)) if message.contains("ownership changed before use")
+        ));
+        fs::write(&lock, "our-token").unwrap();
+        store
+            .verify_mutation_lock_token(&lock, "our-token")
+            .expect("our own token is what lets the critical section proceed");
+
+        // An emptied or truncated lock is ownership evidence we no longer have, not an absence of
+        // contention: it must fail closed exactly like foreign content does.
+        fs::write(&lock, "").unwrap();
+        assert!(matches!(
+            store.verify_mutation_lock_token(&lock, "our-token"),
+            Err(ApprovalError::Corrupt(_))
+        ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_hijacked_mutation_lock_is_never_removed_by_its_previous_holder() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        store.request(request(10)).unwrap();
+        let lock = store.directory().join(MUTATION_LOCK);
+
+        let error = store
+            .with_mutation_lock_policy(
+                Duration::from_millis(20),
+                TRANSACTION_LOCK_STALE_AFTER,
+                || {
+                    // An external writer takes the lock over in place while we hold it.
+                    fs::write(&lock, "hijacker").unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        // The token check on entry calls this `Corrupt`; observing the very same substitution one
+        // moment later, at release, may not quietly downgrade it to an I/O error.
+        assert!(
+            matches!(&error, ApprovalError::Corrupt(message)
+                if message.contains("ownership changed before release")
+                    && message.contains("hijacker")),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock).unwrap(),
+            "hijacker",
+            "owner-conditional cleanup must leave a lock this holder no longer owns"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    /// A hijack is evidence that a second decider may have entered an authorization mutation, so
+    /// it outranks the mutation's own failure. Reporting only the operation error here would hide
+    /// the more serious fact behind the less serious one.
+    #[test]
+    fn a_hijack_is_reported_even_when_the_mutation_itself_failed() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        store.request(request(10)).unwrap();
+        let lock = store.directory().join(MUTATION_LOCK);
+
+        let error = store
+            .with_mutation_lock_policy(
+                Duration::from_millis(20),
+                TRANSACTION_LOCK_STALE_AFTER,
+                || {
+                    fs::write(&lock, "hijacker").unwrap();
+                    Err::<(), _>(ApprovalError::Missing {
+                        id: "apr-does-not-matter".into(),
+                    })
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, ApprovalError::Corrupt(message)
+                if message.contains("ownership changed before release")),
+            "a concurrent operation failure must not suppress the hijack: {error:?}"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    // Two threads contend on one orphaned lock through the same kernel-backed sidecar the
+    // production cross-process path uses, so the mutual exclusion asserted here is the same
+    // property independent processes get; only the scheduling is cheaper to drive in-process.
+    #[test]
+    fn contenders_recovering_one_orphaned_lock_never_overlap() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        store.request(request(10)).unwrap();
+        let lock = store.directory().join(MUTATION_LOCK);
+        fs::write(&lock, "crashed-holder").unwrap();
+        freeze_lock_age(
+            &lock,
+            TRANSACTION_LOCK_STALE_AFTER + Duration::from_secs(60),
+        );
+
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let start = Barrier::new(2);
+        thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        store
+                            .with_mutation_lock_policy(
+                                Duration::from_secs(10),
+                                TRANSACTION_LOCK_STALE_AFTER,
+                                || {
+                                    let entrants = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    peak.fetch_max(entrants, Ordering::SeqCst);
+                                    thread::sleep(Duration::from_millis(20));
+                                    assert_eq!(
+                                        active.fetch_sub(1, Ordering::SeqCst),
+                                        1,
+                                        "approval critical sections overlapped"
+                                    );
+                                    Ok(())
+                                },
+                            )
+                            .expect("both contenders must eventually get the recovered lock");
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "breaking one stale lock must admit one contender, never two"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(!lock.exists(), "the last holder released the lock");
         let _ = fs::remove_dir_all(work);
     }
 }

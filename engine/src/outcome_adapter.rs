@@ -129,10 +129,70 @@ fn reported_risk(outcome: &contract::Outcome) -> Result<Option<Risk>, String> {
     }
 }
 
-/// Convert a supervised per-task review result. A clean transition requires both the declared
-/// outcome and the `SUMMARY-R`/no-open-`R-` gate bounded to this invocation. A report with open
-/// findings is signed from every marker id, heading, and status so a changed finding is not treated
-/// as stagnation.
+/// Convert a supervised per-task review result into the phase-2.6/2.7/2.8 branch
+/// (`agents/processor.md`) — the SAME three-way gate the pure resolver
+/// [`crate::resolvers::review_gate`] compiles, plus the facts a pure function over the artifact
+/// cannot see (how the call itself ended, and what the reviewer claimed about it).
+/// A clean transition requires the declared outcome AND the `SUMMARY-R`/no-open-`R-` gate bounded
+/// to this invocation. A report with open findings is signed from every marker id, heading, and
+/// status so a changed finding is not treated as stagnation.
+///
+/// # One contract, two implementations — the deliberate divergence (T-026, in the style of K-006)
+///
+/// The branch order below is [`crate::resolvers::gate::review_gate`]'s decision tree, restated
+/// over the same parsed artifact:
+///
+/// 1. open `R-` present → `Findings` (2.8),
+/// 2. else a `SUMMARY-R` inside this invocation window → `Clean` (2.6),
+/// 3. else the pass is **incomplete** (2.7) — re-run the SAME reviewer inside `REVIEW_LOOP_MAX`.
+///
+/// This adapter **deliberately tightens two of those steps, in the same direction — never the
+/// branch order**. Both are stated here rather than left implicit, because both are real
+/// divergences from the pure resolver:
+///
+/// 1. **Step 2 needs the completion tail.** The engine's reviewer prompt requires `review.md` to
+///    END with an exact `ИТОГ: готово к слиянию · открытых=0`, so a clean promotion additionally
+///    needs that decodable tail. An artifact `review_gate` would call `Clean` but that carries no
+///    such tail is NOT promoted — it falls to step 3, costing one bounded repeat.
+/// 2. **Step 3 excludes the one artifact that cannot converge.** A `SUMMARY-R` dated above the
+///    call window makes the clean gate unprovable FOREVER (see below), so `review_gate`'s
+///    `Incomplete` verdict for that shape becomes a terminal escalation here (R-14).
+///
+/// Both make production stricter than the resolver, never looser, and neither promotes anything
+/// the resolver would not.
+///
+/// **What the tightening may cost is a bounded retry, never the task.** The three CONVERGING ways
+/// an artifact can fail to prove the clean gate — a missing tail (the classic `maxTurns`
+/// truncation), a `готово к слиянию` tail over an absent or too-OLD `SUMMARY-R`, an `открытые
+/// находки` tail with no open `R-` — are exactly `agents/processor.md` 2.7 «ревьюер был прерван до
+/// завершения»: they land in [`ReviewOutcome::Incomplete`], whose reducer arm
+/// (`processor::task_review`) spends one `Циклов-ревью` unit and re-dispatches the same reviewer
+/// until `REVIEW_LOOP_MAX` is exhausted, then escalates. Before T-026 those three shapes escalated
+/// the whole task on the first occurrence, so a transient reviewer truncation burned a task that
+/// the contract says to simply re-run — while `resolvers/gate.rs` and `run.rs` documented the
+/// opposite semantics for the same phases. The `Incomplete` arm of the reducer was, in consequence,
+/// practically unreachable from this adapter.
+///
+/// **The absence of a claim is not a claim.** Escalation stays reserved for facts, not for gaps:
+///
+/// * a supervision failure (timeout/crash/cancel/error) — a fact about the call, and the one input
+///   `review_gate` structurally cannot have;
+/// * an explicit `ИТОГ: эскалация codex` — the reviewer declaring itself unable to review;
+/// * an UNDECODABLE positive claim by a reviewer that did finish its tail: an unknown `ИТОГ:`
+///   verdict word, or a malformed `Риск-повышен:` marker. Repeating a reviewer that speaks a
+///   foreign protocol has no reason to converge, so these stay terminal exactly as before;
+/// * a `SUMMARY-R` dated ABOVE the call window ([`contract::ReviewParse::summary_after_window`]) —
+///   a fact about the ARTIFACT rather than the claim, and the fourth shape's separation from the
+///   three above (R-14). Summaries are append-only, so a future-dated mark stays the chronological
+///   maximum forever and no later pass — not even one that honestly stamps a fresh summary — can
+///   re-prove the gate. Here the uselessness of a repeat is provable, not merely likely, so the
+///   round stays terminal and the reason names the mark instead of burning `REVIEW_LOOP_MAX` calls
+///   to reach an anonymous «не сходится ревью».
+///
+/// A `готово к слиянию` tail over an artifact that still carries an open `R-` remains `Findings`
+/// (it is a disagreement about findings, not a broken protocol — the engine's own review-cycle
+/// gate writes findings the reviewer did not author), and step 1 now covers the tail-less form of
+/// the same artifact for the same reason.
 pub fn task_review_outcome(
     verdict: &Verdict,
     report: &str,
@@ -151,12 +211,47 @@ pub fn task_review_outcome(
         Err(reason) => return review_protocol_error(&reason),
     };
     let parsed = contract::parse_review(report);
-    let Some(outcome) = strict_outcome(report) else {
-        return review_protocol_error("missing machine-readable ИТОГ line");
-    };
+    // The completion tail is OPTIONAL evidence here, not a precondition of reading the artifact:
+    // its absence is the 2.7 truncation signature, decided below with the rest of the gate.
+    let tail = strict_outcome(report);
+    if let Some(outcome) = &tail {
+        match outcome.verdict.as_str() {
+            "эскалация codex" => {
+                return ReviewOutcome::Escalated {
+                    reason: required_reason(outcome).unwrap_or_else(|| {
+                        "Codex reviewer escalation without причина field".into()
+                    }),
+                };
+            }
+            "готово к слиянию" | "открытые находки" => {}
+            other => return review_protocol_error(&format!("unknown reviewer outcome {other:?}")),
+        }
+    }
     let open = parsed.open_review_findings();
-    match outcome.verdict.as_str() {
-        "готово к слиянию" if parsed.is_clean_pass(since, until) => match risk {
+    if !open.is_empty() {
+        let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
+        let open_finding_ids = open.iter().map(|finding| finding.id.clone()).collect();
+        let signature = finding_signature(open.into_iter());
+        return match risk {
+            Some(risk) => ReviewOutcome::FindingsRiskElevated {
+                signature,
+                risk,
+                open_findings,
+                open_finding_ids,
+            },
+            None => ReviewOutcome::Findings {
+                signature,
+                open_findings,
+                open_finding_ids,
+            },
+        };
+    }
+    if tail
+        .as_ref()
+        .is_some_and(|outcome| outcome.verdict == "готово к слиянию")
+        && parsed.is_clean_pass(since, until)
+    {
+        return match risk {
             Some(risk) => ReviewOutcome::CleanRiskElevated {
                 review_sha: review_sha.to_string(),
                 risk,
@@ -164,62 +259,29 @@ pub fn task_review_outcome(
             None => ReviewOutcome::Clean {
                 review_sha: review_sha.to_string(),
             },
-        },
-        "открытые находки" if !open.is_empty() => {
-            let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
-            let open_finding_ids = open.iter().map(|finding| finding.id.clone()).collect();
-            let signature = finding_signature(open.into_iter());
-            match risk {
-                Some(risk) => ReviewOutcome::FindingsRiskElevated {
-                    signature,
-                    risk,
-                    open_findings,
-                    open_finding_ids,
-                },
-                None => ReviewOutcome::Findings {
-                    signature,
-                    open_findings,
-                    open_finding_ids,
-                },
-            }
-        }
-        "эскалация codex" => ReviewOutcome::Escalated {
-            reason: required_reason(&outcome)
-                .unwrap_or_else(|| "Codex reviewer escalation without причина field".into()),
-        },
-        // A "ready" claim over an artifact that still carries an open `R-` is a disagreement about
-        // findings, not a broken protocol: the reviewer may simply have ignored a finding it did
-        // not author (the engine's own review-cycle gate writes one). The safe reading is the
-        // conservative one — the round has open findings and owes a fix cycle. It can never
-        // authorize a merge, so escalating the whole task here would only convert a recoverable
-        // round into a terminal one. A missing fresh `SUMMARY-R` remains a protocol error below:
-        // there the reviewer claims a clean gate it never proved during this invocation.
-        "готово к слиянию" if !open.is_empty() => {
-            let open_findings = u32::try_from(open.len()).unwrap_or(u32::MAX);
-            let open_finding_ids = open.iter().map(|finding| finding.id.clone()).collect();
-            let signature = finding_signature(open.into_iter());
-            match risk {
-                Some(risk) => ReviewOutcome::FindingsRiskElevated {
-                    signature,
-                    risk,
-                    open_findings,
-                    open_finding_ids,
-                },
-                None => ReviewOutcome::Findings {
-                    signature,
-                    open_findings,
-                    open_finding_ids,
-                },
-            }
-        }
-        "готово к слиянию" => review_protocol_error(
-            "reviewer declared ready but did not provide a fresh clean SUMMARY-R gate",
-        ),
-        "открытые находки" => {
-            review_protocol_error("reviewer declared open findings but no open R-* finding exists")
-        }
-        other => review_protocol_error(&format!("unknown reviewer outcome {other:?}")),
+        };
     }
+    // 2.7 has exactly one carve-out, and it is not about the reviewer's claim but about the
+    // artifact's ability to ever prove the gate again. A `SUMMARY-R` dated ABOVE this call's window
+    // is append-only poison: it stays `latest_summary()`'s chronological maximum forever (the
+    // reviewer protocol never deletes summaries), so `is_clean_pass` is false for this round AND
+    // for every later one — including a round whose reviewer honestly stamps a fresh, correct
+    // summary. Repeating here would spend the whole `REVIEW_LOOP_MAX` budget on calls that cannot
+    // converge and then escalate with the anonymous «не сходится ревью», hiding the one fact an
+    // operator needs. So this shape stays terminal, exactly as it was before T-026, and the reason
+    // names it. The offending mark is quoted because `is_marker_id` admits a `SUMMARY-R-` id only
+    // with a strict `YYYY-MM-DDTHH:MM:SS(.d{1,3})?Z` timestamp behind it: a bounded protocol token
+    // like the verdict words above, not agent free text (see `supervisor_reason`).
+    if let Some(mark) = parsed.summary_after_window(until) {
+        return review_protocol_error(&format!(
+            "reviewer's latest SUMMARY-R {mark} is dated after this call's window end {until}; \
+             summaries are never deleted, so no later pass can re-prove the clean gate"
+        ));
+    }
+    // 2.7: no open `R-` and no proved clean pass. A risk elevation this round may have reported is
+    // deliberately dropped rather than carried on a unit variant: the round is repeated, not
+    // concluded, and the repeat re-derives the marker from the artifact it rewrites.
+    ReviewOutcome::Incomplete
 }
 
 /// Review prose is intentionally free-form, so a reviewer risk elevation needs one narrow
@@ -723,6 +785,23 @@ mod tests {
             "changed finding heading must change signature"
         );
 
+        // A `SUMMARY-R` outside the invocation window never authorizes the promotion — but WHICH
+        // side of the window it fell out of decides what happens next (R-14). Below the window
+        // (older than `since`) the gate is merely unproved for this round, so it is the phase-2.7
+        // repeat (T-026): the next pass writes a newer summary and that one proves it.
+        let stale_old = "### [SUMMARY-R-2026-07-24T11:00:00Z] previous round — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n";
+        assert_eq!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                stale_old,
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Incomplete
+        );
+        // Above the window, no next pass can help: summaries are append-only, so this mark stays
+        // the chronological maximum forever. Terminal, and the reason names the mark.
         let stale_future = "### [SUMMARY-R-9999-12-31T23:59:59Z] old artifact — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n";
         assert!(matches!(
             task_review_outcome(
@@ -733,8 +812,297 @@ mod tests {
                 "review-head",
             ),
             ReviewOutcome::Escalated { reason }
-                if reason.contains("fresh clean SUMMARY-R gate")
+                if reason.contains("9999-12-31T23:59:59Z") && reason.contains(REVIEW_UNTIL)
         ));
+    }
+
+    // -- Phase 2.7 «reviewer interrupted» on the production path (T-026) ----------------------
+
+    #[test]
+    fn a_report_cut_short_before_its_итог_tail_is_a_bounded_repeat_not_a_terminal_escalation() {
+        // The classic `maxTurns` truncation: the reviewer wrote real prose into `review.md` and
+        // was cut before the mandatory completion tail. `resolvers::review_gate` has always called
+        // this 2.7 (no open `R-`, no fresh `SUMMARY-R`); the production adapter used to escalate
+        // the whole task on «missing machine-readable ИТОГ line», burning a task the contract says
+        // to simply re-run inside `REVIEW_LOOP_MAX`.
+        let truncated = "## Проход 1\nThe diff touches engine/src/processor.rs; checking the\n";
+        assert_eq!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                truncated,
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Incomplete
+        );
+        // Truncated even earlier — nothing at all in the artifact — is the same round state, and
+        // agrees with `finish_task_review`'s own absent/unchanged-artifact shortcut.
+        assert_eq!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "",
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Incomplete
+        );
+        // A truncation that DID leave open findings behind is phase 2.8, exactly as `review_gate`
+        // orders the branches: open `R-` take precedence over the missing tail, and the fixer is
+        // handed a real (if partial) list rather than the reviewer being re-run.
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "### [R-1] missing null check — статус: новая\nЕщё раз проверяю",
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Findings {
+                open_findings: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_round_with_no_open_findings_and_no_fresh_summary_repeats_the_reviewer() {
+        // The second historically divergent shape: the reviewer finished its tail but the artifact
+        // proves neither branch. Whether it claims readiness over a `SUMMARY-R` it never wrote
+        // this invocation, or claims findings that are not open, the round is 2.7 — repeat the
+        // same reviewer. It can never authorize a merge, so a terminal escalation here would only
+        // convert a recoverable round into a lost task.
+        for artifact in [
+            // Ready claim, no `SUMMARY-R` at all.
+            "### [R-1] fixed earlier — статус: исправлено\nИТОГ: готово к слиянию · открытых=0\n",
+            // Ready claim over a summary older than this invocation window.
+            "### [SUMMARY-R-2026-07-24T11:00:00Z] previous round — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+            // Findings claim with no open `R-` behind it.
+            "### [R-1] fixed earlier — статус: исправлено\nИТОГ: открытые находки · открытых=1\n",
+        ] {
+            assert_eq!(
+                task_review_outcome(
+                    &verdict(Reason::Ok),
+                    artifact,
+                    "2026-07-24T12:00:00Z",
+                    REVIEW_UNTIL,
+                    "review-head",
+                ),
+                ReviewOutcome::Incomplete,
+                "an unproved, findings-free round must repeat the reviewer: {artifact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_future_dated_summary_stays_terminal_because_no_later_pass_can_supersede_it() {
+        // R-14: the one shape the 2.7 widening must NOT swallow. `latest_summary` is a chronological
+        // `max` and the reviewer protocol never deletes a `SUMMARY-R`, so a mark dated above the
+        // call window is permanent poison — `is_clean_pass` is false for this round and for every
+        // round after it. Repeating would spend all of `REVIEW_LOOP_MAX` on calls that cannot
+        // converge and end at the anonymous «не сходится ревью»; here the uselessness of a repeat
+        // is PROVABLE, unlike the three shapes above, so the round escalates immediately with the
+        // mark named.
+        const SINCE: &str = "2026-07-24T12:00:00Z";
+        let future = "### [SUMMARY-R-9999-12-31T23:59:59Z] broken clock — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n";
+        assert!(matches!(
+            task_review_outcome(&verdict(Reason::Ok), future, SINCE, REVIEW_UNTIL, "review-head"),
+            ReviewOutcome::Escalated { reason }
+                if reason.contains("9999-12-31T23:59:59Z") && reason.contains(REVIEW_UNTIL)
+        ));
+
+        // The non-convergence itself, made explicit: adding the honest, in-window summary a LATER
+        // reviewer pass would write changes nothing, because the future mark is still the maximum.
+        // This is what distinguishes the shape from a merely stale one and what makes a bounded
+        // repeat pointless rather than merely expensive.
+        let future_plus_honest_retry = "### [SUMMARY-R-9999-12-31T23:59:59Z] broken clock — статус: готово к слиянию\n### [SUMMARY-R-2026-07-24T12:00:01Z] honest retry — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n";
+        assert!(
+            matches!(
+                task_review_outcome(
+                    &verdict(Reason::Ok),
+                    future_plus_honest_retry,
+                    SINCE,
+                    REVIEW_UNTIL,
+                    "review-head",
+                ),
+                ReviewOutcome::Escalated { .. }
+            ),
+            "a repeat that writes a correct fresh summary still cannot prove the gate"
+        );
+
+        // The poison is a property of the ARTIFACT, not of the reviewer's claim, so a truncated
+        // report carrying the same mark is terminal too — the tail is not what decides it.
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "### [SUMMARY-R-9999-12-31T23:59:59Z] broken clock — статус: готово к слиянию\nещё читаю диапазон\n",
+                SINCE,
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Escalated { .. }
+        ));
+
+        // Branch ORDER is untouched: an open `R-` is still phase 2.8 and outranks the artifact's
+        // freshness state, exactly as `review_gate` orders it. The fixer gets its real list; the
+        // poisoned mark is only reached once the findings are gone.
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "### [R-1] missing null check — статус: новая\n### [SUMMARY-R-9999-12-31T23:59:59Z] broken clock — статус: готово к слиянию\nИТОГ: открытые находки · открытых=1\n",
+                SINCE,
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Findings {
+                open_findings: 1,
+                ..
+            }
+        ));
+
+        // The second deliberate divergence from `resolvers::review_gate`, pinned like the first:
+        // the pure resolver decides on the artifact's CURRENT state and calls this `Incomplete`,
+        // which is right for what it can see. Production additionally knows the mark can never be
+        // superseded, so it is stricter here — the opposite direction from the tail divergence
+        // below, and the reason `Incomplete` must not be read as "production will retry".
+        assert_eq!(
+            crate::resolvers::review_gate(&contract::parse_review(future), SINCE, REVIEW_UNTIL),
+            crate::resolvers::ReviewGate::Incomplete,
+            "the pure resolver sees only that no clean pass is proved"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_or_explicit_reviewer_claim_stays_terminal() {
+        // The 2.7 widening is about the ABSENCE of a claim. A reviewer that finished its tail and
+        // made a claim the engine cannot decode — a foreign verdict word, a malformed risk marker
+        // — has no reason to converge on a repeat, and an explicit Codex escalation is a decision,
+        // not an interruption. All three stay terminal exactly as before T-026.
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "ИТОГ: готово · режим=1\n",
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Escalated { reason } if reason.contains("unknown reviewer outcome")
+        ));
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "Риск-повышен: высокий — public API\nИТОГ: готово к слиянию · открытых=0\n",
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Escalated { reason } if reason.contains("marker")
+        ));
+        assert!(matches!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                "ИТОГ: эскалация codex · причина=sandbox denied the review range\n",
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Escalated { reason } if reason.contains("sandbox denied")
+        ));
+    }
+
+    #[test]
+    fn review_gate_and_the_production_adapter_name_the_same_branch() {
+        // The anti-drift net for T-026: for every artifact that carries the completion tail the
+        // engine's reviewer prompt mandates, the compiled resolver and the production adapter must
+        // name the SAME phase-2.6/2.7/2.8 branch. TWO intentional exceptions are pinned separately
+        // instead of being listed here, and in this one gate production is stricter than the
+        // resolver both times, in opposite directions:
+        //   * a tail-less clean-looking artifact — resolver `Clean`, production `Incomplete`
+        //     (`the_clean_branch_stays_strictly_tighter_than_the_pure_gate`, right below);
+        //   * a `SUMMARY-R` dated above the window — resolver `Incomplete`, production `Escalated`
+        //     (`a_future_dated_summary_stays_terminal_because_no_later_pass_can_supersede_it`).
+        // Neither may be added to the table below; adding either would assert the drift instead of
+        // the agreement.
+        use crate::resolvers::{ReviewGate, review_gate};
+        const SINCE: &str = "2026-07-24T12:00:00Z";
+        for (artifact, expected) in [
+            (
+                "### [R-1] missing null check — статус: новая\nИТОГ: открытые находки · открытых=1\n",
+                ReviewGate::Findings,
+            ),
+            (
+                "### [SUMMARY-R-2026-07-24T12:00:01Z] complete — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+                ReviewGate::Clean,
+            ),
+            // Interrupted, in each of the shapes the two implementations used to disagree on.
+            (
+                "### [SUMMARY-R-2026-07-24T11:00:00Z] previous round — статус: готово к слиянию\nИТОГ: готово к слиянию · открытых=0\n",
+                ReviewGate::Incomplete,
+            ),
+            (
+                "### [R-1] done — статус: исправлено\nИТОГ: открытые находки · открытых=1\n",
+                ReviewGate::Incomplete,
+            ),
+            ("", ReviewGate::Incomplete),
+            ("## Проход 1\nещё читаю диапазон\n", ReviewGate::Incomplete),
+        ] {
+            let resolved = review_gate(&contract::parse_review(artifact), SINCE, REVIEW_UNTIL);
+            assert_eq!(resolved, expected, "resolver branch for {artifact:?}");
+            let produced =
+                task_review_outcome(&verdict(Reason::Ok), artifact, SINCE, REVIEW_UNTIL, "head");
+            let matched = matches!(
+                (expected, &produced),
+                (ReviewGate::Findings, ReviewOutcome::Findings { .. })
+                    | (ReviewGate::Clean, ReviewOutcome::Clean { .. })
+                    | (ReviewGate::Incomplete, ReviewOutcome::Incomplete)
+            );
+            assert!(
+                matched,
+                "production adapter named {produced:?} where the resolver named {expected:?} for {artifact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clean_branch_stays_strictly_tighter_than_the_pure_gate() {
+        // The single deliberate divergence from `resolvers::review_gate`, pinned as a test so it
+        // cannot drift back: an artifact whose freshness gate the resolver accepts is NOT promoted
+        // without the mandated completion tail. The resolver would call it `Clean`; production
+        // calls it `Incomplete` — tighter, and only ever at the cost of one bounded repeat.
+        let untailed_clean =
+            "### [SUMMARY-R-2026-07-24T12:00:01Z] complete — статус: готово к слиянию\n";
+        let parsed = contract::parse_review(untailed_clean);
+        assert_eq!(
+            crate::resolvers::review_gate(&parsed, "2026-07-24T12:00:00Z", REVIEW_UNTIL),
+            crate::resolvers::ReviewGate::Clean,
+            "the pure resolver decides on the artifact alone"
+        );
+        assert_eq!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                untailed_clean,
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Incomplete,
+            "production additionally requires the ИТОГ tail before promoting a clean pass"
+        );
+        // With the tail present the two agree again, which is what makes the divergence a
+        // tightening of one branch rather than a second semantics.
+        assert_eq!(
+            task_review_outcome(
+                &verdict(Reason::Ok),
+                &format!("{untailed_clean}ИТОГ: готово к слиянию · открытых=0\n"),
+                "2026-07-24T12:00:00Z",
+                REVIEW_UNTIL,
+                "review-head",
+            ),
+            ReviewOutcome::Clean {
+                review_sha: "review-head".into()
+            }
+        );
     }
 
     #[test]
