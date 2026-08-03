@@ -142,9 +142,14 @@ pub enum Phase {
     Blocked,
 }
 
-/// Per-task state internal to the deterministic engine. `Returned` is terminal for the current
-/// cohort but represents a task re-queued for a later one; `Conflict` is the distinct merger
-/// quarantine state recorded before that requeue. Neither is `Done`.
+/// Per-task state internal to the deterministic engine.
+///
+/// The former `Returned` variant represented a task re-queued for a later cohort, but no active
+/// transition ever constructed it: re-queueing is a control-plane effect while the durable engine
+/// task remains in `Conflict`. Removing that dead state keeps every phase match exhaustive and
+/// prevents it from being projected as an escalation. A legacy checkpoint containing the
+/// kebab-case value `"returned"` now fails native runtime resume with
+/// [`crate::runtime::RuntimeError::CorruptCheckpoint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskPhase {
@@ -160,7 +165,6 @@ pub enum TaskPhase {
     Merged,
     Published,
     Done,
-    Returned,
     Conflict,
     Escalated,
 }
@@ -206,7 +210,6 @@ impl TaskPhase {
             TaskPhase::Ready
             | TaskPhase::ResolvingMerge
             | TaskPhase::Escalated
-            | TaskPhase::Returned
             | TaskPhase::Conflict => Some(ActiveClass::Terminal),
             TaskPhase::Merged | TaskPhase::Published | TaskPhase::Done => None,
         }
@@ -2236,7 +2239,7 @@ impl Processor {
             }
             if !matches!(
                 task.phase,
-                TaskPhase::Done | TaskPhase::Returned | TaskPhase::Conflict | TaskPhase::Escalated
+                TaskPhase::Done | TaskPhase::Conflict | TaskPhase::Escalated
             ) && workspaces_present.contains(&task.id)
             {
                 effects.push(Effect::Reconcile {
@@ -4404,7 +4407,7 @@ impl Processor {
             .state
             .tasks
             .values()
-            .filter(|task| matches!(task.phase, TaskPhase::Conflict | TaskPhase::Returned))
+            .filter(|task| task.phase == TaskPhase::Conflict)
             .map(|task| task.id.clone())
             .collect();
         let escalated_tasks = self
@@ -4515,12 +4518,19 @@ impl Processor {
                         task_id: task.id.clone(),
                     });
                 }
-                TaskPhase::Returned | TaskPhase::Conflict | TaskPhase::Escalated => {
+                TaskPhase::Conflict | TaskPhase::Escalated => {
                     effects.push(Effect::CleanupTaskWorkspace {
                         task_id: task.id.clone(),
                     });
                 }
-                _ => {}
+                TaskPhase::Capturing
+                | TaskPhase::Implementing
+                | TaskPhase::Committing
+                | TaskPhase::Reviewing
+                | TaskPhase::Fixing
+                | TaskPhase::Ready
+                | TaskPhase::ResolvingMerge
+                | TaskPhase::Merged => {}
             }
         }
         effects.push(Effect::CleanupIntegrationWorkspace);
