@@ -55,12 +55,25 @@ transcripts, `events.jsonl`, the Markdown control plane, `config.md`). See
 Mutation testing checks whether the test suite catches deliberately introduced logical
 errors, rather than only measuring whether code was executed. Orchestrail uses
 [`cargo-mutants`](https://mutants.rs/) for deterministic resolver, state, contract, event,
-processor, and time code; expensive process, browser, and VCS boundaries are excluded.
+processor, and time code; expensive process, browser, filesystem, and VCS boundaries are excluded.
 Run it locally with `bash ./scripts/run-mutants.sh` on Linux/macOS or
 `.\scripts\run-mutants.ps1` on Windows. For a verified resolver-only smoke run,
 append `--quick` to either command; it first validates the production
 `.cargo-mutants.toml` selection and integration-boundary exclusions, then mutates
 only `engine/src/resolvers/tiering.rs`.
+
+The production configuration explicitly excludes the following integration boundaries:
+
+- `engine/src/vcs.rs` — VCS operations.
+- `engine/src/headless.rs` and `engine/src/supervise.rs` — headless agent and process supervision.
+- `engine/src/run.rs` — process execution.
+- `engine/src/notification.rs` — external notification dispatch.
+- `engine/src/verification.rs` and `engine/src/legacy_fingerprint.rs` — VCS-backed verification and fingerprinting.
+
+These files remain listed even when current `examine_globs` patterns do not select
+them: explicit denylists guard against a future pattern broadening accidentally
+bringing an integration boundary into the mutation scope. Event and state files
+are likewise listed individually so filesystem adapters remain outside that scope.
 
 A surviving mutant is not automatically a defect: it may affect irrelevant or unused
 utility behavior. Investigate each survivor, then strengthen the tests, exclude a harmless

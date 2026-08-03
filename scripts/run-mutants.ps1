@@ -65,16 +65,67 @@ function Invoke-CleanTests {
 }
 
 function Test-ProductionMutantsConfig {
+    $configPath = Join-Path $repoRoot '.cargo-mutants.toml'
     $requiredFile = 'engine/src/resolvers/tiering.rs'
     $excludedFiles = @(
         'engine/src/vcs.rs'
         'engine/src/headless.rs'
         'engine/src/supervise.rs'
+        'engine/src/run.rs'
+        'engine/src/notification.rs'
+        'engine/src/verification.rs'
+        'engine/src/legacy_fingerprint.rs'
     )
 
-    # --list-files makes cargo-mutants parse and apply the production config
-    # without launching mutation tests. The assertions prove that a deterministic
-    # target remains selected and the named integration boundaries remain absent.
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        Write-Error "production config is missing: $configPath"
+        exit 1
+    }
+
+    # Parse exclude_globs directly so an integration boundary cannot be silently
+    # omitted while examine_globs happens not to select it. This deliberately
+    # accepts the simple string-array form used by this repository's TOML config.
+    $configLines = Get-Content -LiteralPath $configPath
+    $arrayStart = @($configLines | Select-String -Pattern '^\s*exclude_globs\s*=\s*\[\s*$')
+    if ($arrayStart.Count -ne 1) {
+        Write-Error "could not parse exclude_globs from $configPath"
+        exit 1
+    }
+
+    $excludeGlobs = [System.Collections.Generic.List[string]]::new()
+    $arrayClosed = $false
+    for ($index = $arrayStart[0].LineNumber; $index -lt $configLines.Count; $index++) {
+        $line = $configLines[$index]
+        if ($line -match '^\s*\]\s*$') {
+            $arrayClosed = $true
+            break
+        }
+        if ([string]::IsNullOrWhiteSpace($line) -or $line -match '^\s*#') {
+            continue
+        }
+        if ($line -notmatch '^\s*"(?<value>[^"\\]+)"\s*,?\s*(#.*)?$') {
+            Write-Error "could not parse exclude_globs from $configPath"
+            exit 1
+        }
+        $excludeGlobs.Add($Matches['value'])
+    }
+    if (-not $arrayClosed) {
+        Write-Error "could not parse exclude_globs from $configPath"
+        exit 1
+    }
+    Write-Host "Validated TOML exclude_globs: $($excludeGlobs.Count) entries"
+
+    foreach ($excludedFile in $excludedFiles) {
+        if ($excludedFile -notin $excludeGlobs) {
+            Write-Error "production config must explicitly exclude $excludedFile"
+            exit 1
+        }
+        Write-Host "Validated explicit exclusion: $excludedFile"
+    }
+
+    # --list-files parses and applies the complete TOML document without
+    # launching mutation tests. The assertions below also prove a deterministic
+    # target remains selected and every external boundary remains absent.
     $listedFiles = @(& cargo mutants --config .cargo-mutants.toml --list-files 2>&1)
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $listedFiles | ForEach-Object { Write-Host $_ }
@@ -90,6 +141,7 @@ function Test-ProductionMutantsConfig {
             exit 1
         }
     }
+    Write-Host 'Validated cargo-mutants production configuration'
 }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {

@@ -55,6 +55,8 @@ run_clean_tests() {
 }
 
 validate_production_config() {
+  local config_path="$repo_root/.cargo-mutants.toml"
+  local exclude_globs
   local listed_files
   local normalized_files
   local required_file="engine/src/resolvers/tiering.rs"
@@ -63,11 +65,56 @@ validate_production_config() {
     "engine/src/vcs.rs"
     "engine/src/headless.rs"
     "engine/src/supervise.rs"
+    "engine/src/run.rs"
+    "engine/src/notification.rs"
+    "engine/src/verification.rs"
+    "engine/src/legacy_fingerprint.rs"
   )
 
-  # --list-files makes cargo-mutants parse and apply the production config
-  # without launching mutation tests. The assertions prove that a deterministic
-  # target remains selected and the named integration boundaries remain absent.
+  if [[ ! -f "$config_path" ]]; then
+    echo "error: production config is missing: $config_path" >&2
+    return 1
+  fi
+
+  # Extract the TOML array directly, so a boundary cannot be silently omitted
+  # while an examine_globs pattern happens not to select it. This intentionally
+  # accepts the simple string-array form used by this repository's TOML config.
+  if ! exclude_globs=$(awk '
+    /^[[:space:]]*exclude_globs[[:space:]]*=[[:space:]]*\[[[:space:]]*$/ {
+      if (found++) exit 1
+      in_array = 1
+      next
+    }
+    in_array && /^[[:space:]]*\][[:space:]]*$/ {
+      closed = 1
+      exit
+    }
+    in_array {
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+      if ($0 !~ /^[[:space:]]*"[^"]+"[[:space:]]*,?[[:space:]]*(#.*)?$/) exit 1
+      value = $0
+      sub(/^[[:space:]]*"/, "", value)
+      sub(/"[[:space:]]*,?[[:space:]]*(#.*)?$/, "", value)
+      print value
+    }
+    END { if (!found || !closed) exit 1 }
+  ' "$config_path"); then
+    echo "error: could not parse exclude_globs from $config_path" >&2
+    return 1
+  fi
+  printf '%s\n' "validated TOML exclude_globs: $(awk 'NF { count++ } END { print count + 0 }' <<<"$exclude_globs") entries"
+
+  for excluded_file in "${excluded_files[@]}"; do
+    if ! grep -Fxq "$excluded_file" <<<"$exclude_globs"; then
+      echo "error: production config must explicitly exclude $excluded_file" >&2
+      return 1
+    fi
+    echo "validated explicit exclusion: $excluded_file"
+  done
+
+  # cargo-mutants parses the complete TOML document and applies it without
+  # launching mutation tests. The assertions below also prove the selected
+  # targets retain a deterministic file and omit every external boundary.
   listed_files=$(cargo mutants --config .cargo-mutants.toml --list-files)
   normalized_files=${listed_files//\\//}
   printf '%s\n' "$listed_files"
@@ -82,6 +129,7 @@ validate_production_config() {
       return 1
     fi
   done
+  echo "validated cargo-mutants production configuration"
 }
 
 cd "$repo_root"
