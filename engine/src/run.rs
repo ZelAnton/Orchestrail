@@ -1473,9 +1473,9 @@ impl<'a> Runner<'a> {
     /// hard-coded name; the sandbox is Claude-only (`CODEX_REVIEWER=off`), so this resolves to the
     /// base Claude reviewer, deterministically the same every cycle.
     ///
-    /// Each cycle runs a supervised reviewer pass ([`run_review_pass`]) and branches on the
+    /// Each cycle runs a supervised reviewer pass ([`Self::run_review_pass`]) and branches on the
     /// [`review_gate`]: a **clean** pass promotes `in-review -> ready`; **findings** dispatch a
-    /// supervised deterministic coder fix round ([`run_fix_round`]) and re-review; an **incomplete**
+    /// supervised deterministic coder fix round ([`Self::run_fix_round`]) and re-review; an **incomplete**
     /// pass re-runs the reviewer unchanged (phase 2.7 — never hands the coder an empty list). The
     /// loop repeats under [`review_cycle_decision`] (`REVIEW_LOOP_MAX`); exhausting the budget is a
     /// CLEAN terminal escalation (`не сходится ревью после N циклов`) through the SAME
@@ -1840,7 +1840,7 @@ impl<'a> Runner<'a> {
     /// * **4.2/4.3** sequential merge — the merger stand-in writes `merge_report.md`; the engine
     ///   decides merged (`готова к слиянию → слита`) vs quarantined (`→ конфликт`, re-queued via
     ///   `queue-tx return`) per task off that report, never free text.
-    /// * **5.1/5.2** the bounded integration review cycle ([`run_integration_review`]) with the
+    /// * **5.1/5.2** the bounded integration review cycle ([`Self::run_integration_review`]) with the
     ///   `INTEGRATION_LOOP_MAX` cap and the same clean/findings/incomplete gate as the per-task
     ///   cycle (adapted to `F-`/`SUMMARY-F` via [`integration_gate`]).
     /// * **5.3** publish — integration `reviewed → published`, each task `слита → опубликована`,
@@ -2105,7 +2105,7 @@ impl<'a> Runner<'a> {
     }
 
     /// Drive the **integration review fix cycle** (`agents/processor.md` phase 5.2) over the merged
-    /// batch: each cycle runs a supervised `full_reviewer` pass ([`run_integration_review_pass`]) and
+    /// batch: each cycle runs a supervised `full_reviewer` pass ([`Self::run_integration_review_pass`]) and
     /// branches on the [`integration_gate`] — a **clean** pass (fresh `SUMMARY-F`, no open `F-`)
     /// converges; **findings** dispatch a supervised deterministic integration fix (a coder stand-in
     /// in `_integration`) and re-review; an **incomplete** pass re-runs the reviewer unchanged. The

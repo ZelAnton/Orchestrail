@@ -340,7 +340,7 @@ pub struct TaskRuntime {
     /// written before durable sessions simply has no map and re-seeds full context, exactly as
     /// the engine behaved before.
     ///
-    /// [`Processor::record_leaf_session`] keeps at most one entry per lineage: the two providers'
+    /// `Processor::record_leaf_session` keeps at most one entry per lineage: the two providers'
     /// keys for one lineage are mutually exclusive, because only the provider that last ran can
     /// know what the working tree now contains.
     #[serde(default)]
