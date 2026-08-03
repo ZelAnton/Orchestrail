@@ -293,7 +293,7 @@ fn task_status(phase: TaskPhase) -> &'static str {
         TaskPhase::Published => "опубликована",
         TaskPhase::Done => "выполнена",
         TaskPhase::Conflict => "конфликт",
-        TaskPhase::Returned | TaskPhase::Escalated => "эскалирована",
+        TaskPhase::Escalated => "эскалирована",
     }
 }
 

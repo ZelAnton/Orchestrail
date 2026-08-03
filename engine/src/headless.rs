@@ -4378,12 +4378,7 @@ fn knowledge_curator_prompt(
     let quarantined = state
         .tasks
         .values()
-        .filter(|task| {
-            matches!(
-                task.phase,
-                crate::processor::TaskPhase::Conflict | crate::processor::TaskPhase::Returned
-            )
-        })
+        .filter(|task| task.phase == crate::processor::TaskPhase::Conflict)
         .map(|task| task.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
