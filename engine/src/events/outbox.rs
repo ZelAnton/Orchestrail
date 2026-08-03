@@ -25,6 +25,11 @@ static OUTBOX_ACCESS: Mutex<()> = Mutex::new(());
 /// is catching up. This matches the tail reader's per-record ceiling.
 const MAX_EVENT_LINE_BYTES: u64 = 1024 * 1024;
 const MAX_CACHED_OUTBOXES: usize = 16;
+/// Schema version 1 is the first-ever released shape for event rotation metadata.
+/// Event rotation is a greenfield feature in this release; no deployed version has ever written
+/// this metadata. Earlier shapes existed only in unreleased drafts and are not deployed schemas.
+/// Any genuine future format change, including adding or renaming fields or changing
+/// serialization, must assign a new schema version and implement a migration from this baseline.
 const ROTATION_SCHEMA_VERSION: u32 = 1;
 const SEGMENT_DIGITS: usize = 20;
 /// How many times resolving one layout re-reads a control plane that keeps moving underneath it.
@@ -84,6 +89,13 @@ struct CachedIndex {
 /// the archive is committed plus whatever single transfer is in flight. That is what keeps a
 /// long-lived project from reaching a size at which the index can no longer be republished after
 /// its segment has already been renamed into place, which would wedge every future append.
+///
+/// This struct defines schema version 1, the first-ever released shape of this greenfield feature.
+/// No deployed version has ever used event rotation or written rotation metadata before this
+/// release; different shapes from earlier unreleased drafts are not prior deployed formats. Any
+/// genuine future format change, including adding or renaming fields or changing serialization,
+/// must bump the schema version and implement a migration from this baseline so that deployed data
+/// cannot be confused with the no-prior-deployment state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct RotationMetadata {
     schema_version: u32,
