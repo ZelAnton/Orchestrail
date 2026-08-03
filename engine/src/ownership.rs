@@ -9,8 +9,15 @@
 //! sequences indivisible across Orchestrail processes. The sidecar is accepted only when the host
 //! can prove that its storage is local with reliable kernel locking; network, unrecognized, and
 //! known stackable Unix filesystems fail closed because their backing stores cannot be recursively
-//! validated. This module does not invoke the PowerShell script and never recursively removes a
-//! lock directory: a foreign/corrupt lock remains an operator-visible refusal.
+//! validated. Regular-file mutations retain the identity-authorized file handle until the final
+//! pathname syscall returns. That closes the reducible file-ID-reuse interval between validation
+//! and mutation. Rust's standard library has no cross-platform unlink/rename-by-handle operation,
+//! so a nanosecond-scale final check-to-syscall race remains: under the supported local,
+//! cooperative deployment model and standard filesystem caching, exploiting it would require an
+//! external process to time unlink/recreate operations within the corresponding microsecond-scale
+//! filesystem operation. This proportionate residual risk is accepted. This module does not invoke
+//! the PowerShell script and never recursively removes a lock directory: a foreign/corrupt lock
+//! remains an operator-visible refusal.
 
 use std::env;
 use std::fmt;
@@ -1555,6 +1562,8 @@ fn create_transaction_lock(
     // validation so a replacement can never be accepted as the lock we just initialized.
     validate_open_transaction_target_identity(&file, path, created_identity)?;
     lifecycle.validate()?;
+    // `file` intentionally stays in scope until this return, retaining the created filesystem
+    // object throughout initialization even if an external process removes its pathname.
     Ok(true)
 }
 
@@ -1565,14 +1574,37 @@ fn remove_owned_transaction_lock(
 ) -> io::Result<()> {
     // The ownership read in `release` and this removal are one logical filesystem transaction:
     // every code path capable of renaming, creating, or removing the canonical name needs the
-    // same cross-process lifecycle guard. Keep an open handle to the authorized file, then compare
-    // both that handle and the current pathname with the ownership snapshot immediately before
-    // deletion. Rust std has no cross-platform conditional unlink-by-identity operation, so this
-    // is deliberately the final check before the pathname syscall.
+    // same cross-process lifecycle guard. The mutation helper borrows the authorized handle into
+    // the remove callback and drops it only after the syscall returns. This closes the reducible
+    // unlink/recreate + file-ID-reuse gap that would exist if the handle were closed first.
+    //
+    // Rust std has no cross-platform conditional unlink-by-identity operation, so a non-cooperating
+    // external process could still replace the pathname in the nanosecond-scale interval between
+    // the helper's final same-handle check and this path syscall. Requiring microsecond-level timing
+    // on a local filesystem makes that residual race proportionate for cooperative deployments.
+    mutate_transaction_file_if_unchanged(path, expected, lifecycle, |_authorized| {
+        fs::remove_file(path)
+    })
+}
+
+fn mutate_transaction_file_if_unchanged<T>(
+    path: &Path,
+    expected: TransactionFilesystemIdentity,
+    lifecycle: &TransactionLifecycleGuard,
+    mutation: impl FnOnce(&fs::File) -> io::Result<T>,
+) -> io::Result<T> {
     lifecycle.validate()?;
-    let file = work_fs::open_existing_plain_file(path)?;
-    validate_open_transaction_target_identity(&file, path, expected)?;
-    fs::remove_file(path)
+    let authorized = work_fs::open_existing_plain_file(path)?;
+    validate_open_transaction_target_identity(&authorized, path, expected)?;
+
+    // Recheck the lifecycle after opening, then make the same authorized handle the final source
+    // of truth immediately before mutation. Passing it into the callback keeps the OS reference
+    // alive throughout the path-based syscall, preventing its file ID from being recycled first.
+    lifecycle.validate()?;
+    validate_open_transaction_target_identity(&authorized, path, expected)?;
+    let result = mutation(&authorized);
+    drop(authorized);
+    result
 }
 
 fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot> {
@@ -1617,8 +1649,19 @@ fn rename_transaction_lock_if_unchanged(
     lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<()> {
     lifecycle.validate()?;
-    // The sidecar serializes Orchestrail peers only. An unrelated process can still replace this
-    // pathname, so the actual source identity must be the last check before rename re-resolves it.
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() && !work_fs::redirected(&metadata) {
+        // Keep the regular-file source handle alive through rename for the same reason as remove:
+        // otherwise closing it after authorization would permit file-ID reuse before path lookup.
+        return mutate_transaction_file_if_unchanged(path, expected, lifecycle, |_authorized| {
+            fs::rename(path, stale_path)
+        });
+    }
+
+    // The only supported non-file source is the legacy empty-directory lock. The cross-platform
+    // plain-file opener cannot hold a directory handle, so do its final pathname identity check as
+    // close as possible to rename. The lifecycle sidecar excludes cooperating Orchestrail peers;
+    // the same proportionate nanosecond-scale race against an external process remains here.
     validate_transaction_target_identity(path, expected)?;
     fs::rename(path, stale_path)
 }
@@ -1997,7 +2040,7 @@ mod tests {
         assert!(
             rename_error
                 .to_string()
-                .contains("different filesystem entry")
+                .contains("identity is no longer valid")
         );
         assert!(!stale_path.exists());
 
@@ -2012,6 +2055,41 @@ mod tests {
         assert_eq!(fs::read_to_string(&tx).unwrap(), "same-owner");
 
         drop(original_file);
+        drop(lifecycle);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn authorized_transaction_file_handle_stays_live_through_remove_mutation() {
+        let work = work("handle-backed-transaction-remove");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "same-owner").unwrap();
+        let expected = transaction_lock_snapshot(&tx).unwrap().identity;
+        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+            .unwrap()
+            .expect("test owns lifecycle lock");
+
+        let mut mutation_observed = false;
+        mutate_transaction_file_if_unchanged(&tx, expected, &lifecycle, |authorized| {
+            let (before, links) = opened_transaction_target_identity(authorized)?;
+            assert_eq!(before, expected);
+            assert!(links > 0, "authorized file starts linked at its pathname");
+
+            fs::remove_file(&tx)?;
+
+            // The same handle remains usable after unlink while the mutation callback is
+            // active. This proves the OS reference keeps the original file object alive for
+            // the complete critical section, so its file ID cannot be recycled before remove.
+            let (after, _) = opened_transaction_target_identity(authorized)?;
+            assert_eq!(after, expected);
+            mutation_observed = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(mutation_observed);
+        assert!(!tx.exists());
         drop(lifecycle);
         let _ = fs::remove_dir_all(work);
     }
