@@ -21,6 +21,13 @@ cargo build
 cargo test
 ```
 
+Generate a local HTML code coverage report for the entire workspace with
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```sh
+cargo llvm-cov --workspace --html
+```
+
 Run a single test (substring match on the test name) with:
 
 ```sh

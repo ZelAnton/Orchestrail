@@ -1409,7 +1409,7 @@ fn complete_merge_report_document(
                     })?;
                     Some(format!("- [{}] merged={head}", task.id))
                 }
-                TaskPhase::Conflict | TaskPhase::Returned => {
+                TaskPhase::Conflict => {
                     let reason = task.reason.as_deref().ok_or_else(|| {
                         format!(
                             "quarantined task {} has no reason for merge report",
@@ -1423,7 +1423,14 @@ fn complete_merge_report_document(
                     ))
                 }
                 TaskPhase::Escalated => None,
-                _ => return Ok(None),
+                TaskPhase::Capturing
+                | TaskPhase::Implementing
+                | TaskPhase::Committing
+                | TaskPhase::Reviewing
+                | TaskPhase::Fixing
+                | TaskPhase::Ready
+                | TaskPhase::ResolvingMerge
+                | TaskPhase::Done => return Ok(None),
             }
         };
         if let Some(result) = result {
@@ -1686,12 +1693,10 @@ impl<E: ExternalPort> FileVcsPort<E> {
         let has_durable_harvest = fixed_task_finding
             || !state.integration.signatures.is_empty()
             || state.integration.ci_cycles > 0
-            || state.tasks.values().any(|task| {
-                matches!(
-                    task.phase,
-                    TaskPhase::Conflict | TaskPhase::Returned | TaskPhase::Escalated
-                )
-            });
+            || state
+                .tasks
+                .values()
+                .any(|task| matches!(task.phase, TaskPhase::Conflict | TaskPhase::Escalated));
         if has_durable_harvest {
             return Ok(Required);
         }
