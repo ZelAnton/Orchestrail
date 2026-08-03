@@ -58,7 +58,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 # Property tests for parser and state-machine panic-freedom.
-proptest = { version = "=1.0.0", default-features = false, features = ["std"] }
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 # Statistical micro-benchmarks for append-only event and control-plane hot paths.
 criterion = "0.7.0"
 
