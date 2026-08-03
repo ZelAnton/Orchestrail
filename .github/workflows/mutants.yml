@@ -1,0 +1,66 @@
+name: Mutation testing (informational)
+
+on:
+  schedule:
+    # Weekly keeps the expensive mutation sweep useful without loading nightly CI.
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutation-testing:
+    name: cargo-mutants (experimental / informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install Jujutsu
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: jj-cli@0.42.0
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-mutants@27.0.0
+
+      - name: Run informational mutation analysis
+        run: bash ./scripts/run-mutants.sh
+
+      - name: Publish mutation summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f mutants.out/summary.txt ]]; then
+            {
+              echo '## Mutation testing'
+              echo '```text'
+              cat mutants.out/summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' \
+              '## Mutation testing' \
+              'Mutation analysis ended before a summary was produced. See the job log.' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cargo-mutants-results
+          path: mutants.out
+          if-no-files-found: warn
+          retention-days: 14

@@ -50,6 +50,21 @@ workspace) fuzzes the parsers that consume bytes the engine does not control (le
 transcripts, `events.jsonl`, the Markdown control plane, `config.md`). See
 [`engine/fuzz/README.md`](engine/fuzz/README.md) for setup and how to run a target locally.
 
+## Mutation testing
+
+Mutation testing checks whether the test suite catches deliberately introduced logical
+errors, rather than only measuring whether code was executed. Orchestrail uses
+[`cargo-mutants`](https://mutants.rs/) for deterministic resolver, state, contract, event,
+processor, and time code; expensive process, browser, and VCS boundaries are excluded.
+Run it locally with `./scripts/run-mutants.sh` on Linux/macOS or
+`.\scripts\run-mutants.ps1` on Windows.
+
+A surviving mutant is not automatically a defect: it may affect irrelevant or unused
+utility behavior. Investigate each survivor, then strengthen the tests, exclude a harmless
+mutation in the configuration, or document the limitation. See the
+[`cargo-mutants` result guide](https://mutants.rs/using-results.html) for filtering and
+inspection details.
+
 ## Conventions
 
 - **Formatting** is governed by `rustfmt` (run `cargo fmt`); non-Rust files

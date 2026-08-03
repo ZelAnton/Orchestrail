@@ -1,0 +1,31 @@
+# Mutation testing is intentionally limited to deterministic algorithmic code.
+examine_globs = [
+  "engine/src/resolvers/**/*.rs",
+  "engine/src/processor.rs",
+  "engine/src/contract.rs",
+  "engine/src/events/**/*.rs",
+  "engine/src/state/**/*.rs",
+  "engine/src/time.rs",
+]
+
+# Keep process, browser, VCS, CLI, and orchestration boundaries out of mutation runs.
+# Some entries are redundant with examine_globs but make the boundary explicit and
+# protect it if the examined set is broadened later.
+exclude_globs = [
+  "engine/src/headless.rs",
+  "engine/src/native_port.rs",
+  "engine/src/native*.rs",
+  "engine/src/vcs.rs",
+  "engine/src/main.rs",
+  "engine/src/execution.rs",
+  "engine/src/approval.rs",
+]
+
+timeout_multiplier = 5.0
+output = "mutants.out"
+gitignore = true
+copy_vcs = false
+copy_target = true
+
+# cargo-mutants has no min_test_passes config key. The local wrappers run the
+# clean engine tests twice before cargo-mutants performs its own baseline.
