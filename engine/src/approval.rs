@@ -9,9 +9,9 @@
 //!
 //! Every mutation runs inside `.work/approvals/.approval-mutation.lock`, taken through the same
 //! durable transaction-lock primitive as the owner lease's `state-tx.lock`
-//! ([`crate::ownership::acquire_transaction_lock`]). That shared primitive is what makes a killed
+//! (the shared transaction-lock primitive). That shared primitive is what makes a killed
 //! process recoverable: a lock left behind by a holder that died mid-mutation is waited on only
-//! until [`TRANSACTION_LOCK_STALE_AFTER`], then broken by exactly one contender under a kernel
+//! until the configured stale threshold, then broken by exactly one contender under a kernel
 //! lifecycle sidecar, and the mutation proceeds. An approval mutation therefore cannot be wedged
 //! forever by a crash, a power loss, or a killed supervisor child. A holder that is still live is
 //! still refused — with [`ApprovalError::Busy`] naming the holder and its age, so an operator can
