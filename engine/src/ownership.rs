@@ -2040,11 +2040,7 @@ fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot>
     } else if metadata.is_file() {
         let owner = work_fs::read_plain_text(path, MAX_LEASE_BYTES)?;
         TransactionLockKind::File {
-            owner: owner
-                .trim()
-                .chars()
-                .take(TRANSACTION_OWNER_MAX_CHARS)
-                .collect(),
+            owner: owner.chars().take(TRANSACTION_OWNER_MAX_CHARS).collect(),
         }
     } else if metadata.is_dir() {
         work_fs::require_plain_directory(path)?;
@@ -2876,6 +2872,31 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&tx).unwrap(), "123:new");
         obsolete.armed = false;
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn newline_suffixed_transaction_owner_token_is_corrupt_on_release() {
+        let work = work("newline-suffixed-transaction-owner");
+        let tx = work.join(TRANSACTION_LOCK);
+        let store = LeaseStore::new(&work);
+
+        let error = store
+            .with_transaction_policy(Duration::ZERO, TRANSACTION_LOCK_STALE_AFTER, || {
+                let owner = fs::read_to_string(&tx).unwrap();
+                fs::write(&tx, format!("{owner}\n")).unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, LeaseError::Corrupt { .. }),
+            "a trailing byte changes the lock owner and must fail closed: {error:?}"
+        );
+        assert!(
+            fs::read_to_string(&tx).unwrap().ends_with('\n'),
+            "a corrupted lock must remain in place for operator-visible recovery"
+        );
         let _ = fs::remove_dir_all(work);
     }
 
