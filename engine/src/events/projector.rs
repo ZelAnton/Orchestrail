@@ -388,13 +388,23 @@ fn event_with_payload(
     coordinate: String,
     occurred_at: &str,
 ) -> Event {
-    let identity = format!(
+    let payload_version = match event_type {
+        EventType::CohortClosed => 2,
+        _ => 1,
+    };
+    let mut identity = format!(
         "{}|{}|{}|{}",
         event_type.as_str(),
         batch_id.unwrap_or_default(),
         task_id.unwrap_or_default(),
         coordinate
     );
+    // Preserve every v1 UUID byte-for-byte while giving a changed payload contract its own
+    // deterministic identity. Otherwise an upgraded replay would reuse the v1 cohort-close UUID
+    // for different semantic content and the outbox would correctly reject it as a collision.
+    if payload_version > 1 {
+        identity.push_str(&format!("|payload:v{payload_version}"));
+    }
     Event {
         schema_version: SCHEMA_VERSION,
         event_id: deterministic_event_id(&identity),
@@ -406,7 +416,7 @@ fn event_with_payload(
         },
         batch_id: batch_id.map(str::to_string),
         task_id: task_id.map(str::to_string),
-        payload_version: 1,
+        payload_version,
         payload,
     }
 }
@@ -1142,6 +1152,16 @@ mod tests {
             .iter()
             .find(|event| event.event_type == EventType::CohortClosed)
             .expect("cleanup projects cohort.closed");
+        assert_eq!(closed.payload_version, 2);
+        assert_eq!(
+            closed.event_id,
+            deterministic_event_id("cohort.closed|B-1||close|payload:v2")
+        );
+        assert_ne!(
+            closed.event_id,
+            deterministic_event_id("cohort.closed|B-1||close"),
+            "the v2 close must not reuse the historical empty-payload v1 identity"
+        );
         assert_eq!(
             closed.payload,
             serde_json::json!({"merged": 1, "quarantined": 1, "escalated": 1})

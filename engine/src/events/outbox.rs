@@ -1454,6 +1454,49 @@ mod tests {
     }
 
     #[test]
+    fn versioned_cohort_close_upgrade_does_not_collide_with_v1_history() {
+        let work = temp_work("versioned-close-upgrade");
+        let outbox = Outbox::new(&work);
+        let old = event_of_type("cohort.closed|B-1||close", EventType::CohortClosed);
+        let mut upgraded = event_of_type(
+            "cohort.closed|B-1||close|payload:v2",
+            EventType::CohortClosed,
+        );
+        upgraded.payload_version = 2;
+        upgraded.payload = serde_json::json!({
+            "merged": 1,
+            "quarantined": 1,
+            "escalated": 1
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert_eq!(old.payload_version, 1);
+        assert!(old.payload.is_empty());
+        assert_ne!(old.event_id, upgraded.event_id);
+        assert_ne!(semantic_fingerprint(&old), semantic_fingerprint(&upgraded));
+        assert_eq!(
+            outbox.append_idempotent(&old).unwrap(),
+            AppendOutcome::Appended
+        );
+        assert_eq!(
+            outbox.append_idempotent(&upgraded).unwrap(),
+            AppendOutcome::Appended
+        );
+        assert_eq!(
+            TailReader::new(outbox.path())
+                .poll_all()
+                .unwrap()
+                .into_iter()
+                .map(|event| event.payload_version)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
     fn committed_invalid_line_fails_closed_before_append() {
         let work = temp_work("invalid");
         fs::create_dir_all(&work).unwrap();
