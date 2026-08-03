@@ -765,8 +765,15 @@ pub(crate) fn read_required_text(work: &Path, path: &Path, max_bytes: u64) -> io
     })
 }
 
+/// Flush the directory entry for a newly-created or renamed control-plane artifact.
+///
+/// Unix uses a directory `fsync`, and returns an error when that durability boundary cannot be
+/// established. Windows has no portable directory flush in `std`; the caller therefore relies on
+/// the documented local-filesystem rename/flush semantics after the same confinement checks. A
+/// caller must treat an error as a failed publication and must not launch an effect that depends
+/// on the entry being durable.
 #[cfg(unix)]
-fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
     ensure_plain_parent(work, path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "artifact path has no parent")
@@ -790,7 +797,7 @@ fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_directory(work: &Path, path: &Path) -> io::Result<()> {
     // `std` has no portable directory fsync on Windows. Keep the no-op explicit and retain both
     // post-rename confinement checks so callers do not mistake a redirected parent for success.
     ensure_plain_parent(work, path)

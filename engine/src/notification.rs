@@ -4,6 +4,11 @@
 //! durable claim before launching its one contained ProcessKit child; a resumed effect therefore
 //! observes the claim instead of sending a duplicate message. A fresh interrupted claim is
 //! reported as in progress, while a stale one is finalized as unknown without a second launch.
+//! Claim publication flushes both the receipt and its parent directory entry before the child is
+//! launched. Unix requires the directory flush; Windows has no portable directory flush in `std`,
+//! so the supported local-filesystem contract relies on its documented rename/flush semantics.
+//! The notification mutation lock rejects unsupported storage and every publication error is
+//! fail-closed: the child is not launched and the pending marker remains retryable.
 //! It deliberately persists neither command output nor the underlying VCS/approval payload.
 
 use std::fmt;
@@ -15,6 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::ownership::{
+    TRANSACTION_LOCK_STALE_AFTER, TRANSACTION_LOCK_TIMEOUT, TransactionLockError,
+    TransactionLockPolicy, acquire_transaction_lock,
+};
 use crate::supervise::{self, Reason, SpawnSpec};
 use crate::task_id::is_task_id;
 use crate::work_fs;
@@ -26,12 +35,14 @@ const NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
 const NOTIFICATION_CLAIM_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const NOTIFICATION_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const NOTIFICATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
+const NOTIFICATION_MUTATION_LOCK: &str = ".notification-mutation.lock";
+const NOTIFICATION_MUTATION_LIFECYCLE_LOCK: &str = ".notification-mutation.lifecycle.lock";
 
 #[derive(Debug)]
 enum NotificationError {
     Io(io::Error),
+    Lock(String),
     Serialize(serde_json::Error),
-    Deserialize(serde_json::Error),
     Invalid(String),
 }
 
@@ -39,10 +50,10 @@ impl fmt::Display for NotificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "notification receipt I/O error: {error}"),
+            Self::Lock(message) => write!(f, "notification receipt lock error: {message}"),
             Self::Serialize(error) => {
                 write!(f, "notification receipt serialization error: {error}")
             }
-            Self::Deserialize(error) => write!(f, "notification receipt JSON error: {error}"),
             Self::Invalid(message) => f.write_str(message),
         }
     }
@@ -52,7 +63,8 @@ impl std::error::Error for NotificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Serialize(error) | Self::Deserialize(error) => Some(error),
+            Self::Lock(_) => None,
+            Self::Serialize(error) => Some(error),
             Self::Invalid(_) => None,
         }
     }
@@ -79,8 +91,9 @@ impl NotificationError {
                 NotificationErrorClass::Redirected
             }
             Self::Io(_) => NotificationErrorClass::Io,
+            Self::Lock(_) => NotificationErrorClass::Lock,
             Self::Serialize(_) => NotificationErrorClass::Serialize,
-            Self::Deserialize(_) | Self::Invalid(_) => NotificationErrorClass::SchemaMismatch,
+            Self::Invalid(_) => NotificationErrorClass::SchemaMismatch,
         }
     }
 }
@@ -172,6 +185,7 @@ enum NotificationResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationErrorClass {
     Redirected,
+    Lock,
     SchemaMismatch,
     Serialize,
     Io,
@@ -181,6 +195,7 @@ impl NotificationErrorClass {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Redirected => "redirected",
+            Self::Lock => "lock",
             Self::SchemaMismatch => "schema_mismatch",
             Self::Serialize => "serialize",
             Self::Io => "io",
@@ -246,6 +261,7 @@ enum NotificationReason {
     ProcessKitError,
     InvalidOrUnavailable,
     ClaimInProgress,
+    CorruptClaim,
     StaleClaim,
 }
 
@@ -260,12 +276,13 @@ impl NotificationReason {
             Self::ProcessKitError => "processkit_error",
             Self::InvalidOrUnavailable => "invalid_or_unavailable",
             Self::ClaimInProgress => "claim_in_progress",
+            Self::CorruptClaim => "corrupt_claim",
             Self::StaleClaim => "stale_claim",
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NotificationReceipt {
     schema: String,
     id: String,
@@ -323,9 +340,9 @@ impl NotificationDispatcher {
             return Some(self.retryable_outcome(event, subject, NotificationStatus::Failed, 0));
         }
         let receipt = self.receipt_path(event, subject);
-        match self.claim_or_load(&receipt, event, subject) {
+        let claimed = match self.claim_or_load(&receipt, event, subject) {
             Ok(Claim::Final(outcome)) => return Some(outcome),
-            Ok(Claim::InProgress) => {
+            Ok(Claim::InProgress(_claim)) => {
                 return Some(self.retryable_outcome(
                     event,
                     subject,
@@ -333,18 +350,31 @@ impl NotificationDispatcher {
                     0,
                 ));
             }
-            Ok(Claim::Stale) => {
+            Ok(Claim::Stale(claim)) => {
                 let outcome = self.outcome(event, subject, NotificationStatus::Unknown, 0);
-                return Some(match self.save_final_receipt(&receipt, subject, &outcome) {
-                    Ok(()) => outcome,
-                    Err(error) => self.failure_outcome(event, subject, 0, &error),
-                });
+                #[cfg(test)]
+                tests::run_stale_recovery_hook();
+                return Some(
+                    match self.save_final_receipt(&receipt, subject, &claim, &outcome) {
+                        Ok(outcome) => outcome,
+                        Err(error) => self.failure_outcome(event, subject, 0, &error),
+                    },
+                );
             }
-            Ok(Claim::Claimed) => {}
+            Ok(Claim::Corrupt) => {
+                let outcome = self.corrupt_claim_outcome(event, subject);
+                return Some(
+                    match self.finalize_corrupt_receipt(&receipt, subject, &outcome) {
+                        Ok(outcome) => outcome,
+                        Err(error) => self.failure_outcome(event, subject, 0, &error),
+                    },
+                );
+            }
+            Ok(Claim::Claimed(claim)) => claim,
             Err(error) => {
                 return Some(self.failure_outcome(event, subject, 0, &error));
             }
-        }
+        };
 
         let context = safe_context(event, subject);
         let verdict = supervise::run(
@@ -370,10 +400,10 @@ impl NotificationDispatcher {
         let outcome = self.outcome(event, subject, status, verdict.duration_ms);
         // A failed finalization must remain an unfinished claim.  Retrying the effect then skips
         // rather than duplicating a notification whose child may already have delivered it.
-        if let Err(error) = self.save_final_receipt(&receipt, subject, &outcome) {
-            return Some(self.failure_outcome(event, subject, verdict.duration_ms, &error));
+        match self.save_final_receipt(&receipt, subject, &claimed, &outcome) {
+            Ok(outcome) => Some(outcome),
+            Err(error) => Some(self.failure_outcome(event, subject, verdict.duration_ms, &error)),
         }
-        Some(outcome)
     }
 
     fn outcome(
@@ -419,6 +449,16 @@ impl NotificationDispatcher {
         outcome
     }
 
+    fn corrupt_claim_outcome(
+        &self,
+        event: NotificationEvent,
+        subject: &str,
+    ) -> NotificationOutcome {
+        let mut outcome = self.outcome(event, subject, NotificationStatus::Unknown, 0);
+        outcome.reason = NotificationReason::CorruptClaim;
+        outcome
+    }
+
     fn receipt_path(&self, event: NotificationEvent, subject: &str) -> PathBuf {
         self.work
             .join("notifications")
@@ -426,6 +466,17 @@ impl NotificationDispatcher {
     }
 
     fn claim_or_load(
+        &self,
+        path: &Path,
+        event: NotificationEvent,
+        subject: &str,
+    ) -> NotificationResult<Claim> {
+        self.with_notification_lock(path, |dispatcher| {
+            dispatcher.claim_or_load_locked(path, event, subject)
+        })
+    }
+
+    fn claim_or_load_locked(
         &self,
         path: &Path,
         event: NotificationEvent,
@@ -450,15 +501,17 @@ impl NotificationDispatcher {
             Ok(mut file) => {
                 file.write_all(&content)?;
                 file.sync_all()?;
-                Ok(Claim::Claimed)
+                work_fs::sync_parent_directory(&self.work, path)?;
+                Ok(Claim::Claimed(receipt))
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                self.load_existing_receipt(path, event, subject, expected_id)
+                self.load_existing_receipt_locked(path, event, subject, expected_id)
             }
             Err(error) => Err(error.into()),
         }
     }
 
+    #[cfg(test)]
     fn load_existing_receipt(
         &self,
         path: &Path,
@@ -466,9 +519,23 @@ impl NotificationDispatcher {
         subject: &str,
         expected_id: String,
     ) -> NotificationResult<Claim> {
+        self.with_notification_lock(path, |dispatcher| {
+            dispatcher.load_existing_receipt_locked(path, event, subject, expected_id)
+        })
+    }
+
+    fn load_existing_receipt_locked(
+        &self,
+        path: &Path,
+        event: NotificationEvent,
+        subject: &str,
+        expected_id: String,
+    ) -> NotificationResult<Claim> {
         let text = work_fs::read_required_text(&self.work, path, NOTIFICATION_RECEIPT_MAX_BYTES)?;
-        let existing: NotificationReceipt =
-            serde_json::from_str(&text).map_err(NotificationError::Deserialize)?;
+        let existing: NotificationReceipt = match serde_json::from_str(&text) {
+            Ok(existing) => existing,
+            Err(_error) => return Ok(Claim::Corrupt),
+        };
         if existing.schema != NOTIFICATION_SCHEMA
             || existing.id != expected_id
             || existing.event != event
@@ -492,8 +559,8 @@ impl NotificationDispatcher {
                 error_class: None,
                 resolution: NotificationResolution::Resolved,
             })),
-            (None, None) if claim_is_stale(existing.claimed_at_secs) => Ok(Claim::Stale),
-            (None, None) => Ok(Claim::InProgress),
+            (None, None) if claim_is_stale(existing.claimed_at_secs) => Ok(Claim::Stale(existing)),
+            (None, None) => Ok(Claim::InProgress(existing)),
             _ => Err(NotificationError::Invalid(format!(
                 "notification receipt has inconsistent completion fields: {}",
                 path.display()
@@ -502,6 +569,66 @@ impl NotificationDispatcher {
     }
 
     fn save_final_receipt(
+        &self,
+        path: &Path,
+        subject: &str,
+        expected_claim: &NotificationReceipt,
+        outcome: &NotificationOutcome,
+    ) -> NotificationResult<NotificationOutcome> {
+        self.with_notification_lock(path, |dispatcher| {
+            let current = dispatcher.load_existing_receipt_locked(
+                path,
+                outcome.event,
+                subject,
+                outcome.id.clone(),
+            )?;
+            match current {
+                Claim::Final(existing) => Ok(existing),
+                Claim::Claimed(claim) | Claim::InProgress(claim) | Claim::Stale(claim)
+                    if claim == *expected_claim =>
+                {
+                    dispatcher.write_final_receipt_locked(path, subject, outcome)?;
+                    Ok(outcome.clone())
+                }
+                Claim::Corrupt => Err(NotificationError::Invalid(format!(
+                    "notification receipt became corrupt before finalization: {}",
+                    path.display()
+                ))),
+                _ => Err(NotificationError::Invalid(format!(
+                    "notification claim changed before finalization: {}",
+                    path.display()
+                ))),
+            }
+        })
+    }
+
+    fn finalize_corrupt_receipt(
+        &self,
+        path: &Path,
+        subject: &str,
+        outcome: &NotificationOutcome,
+    ) -> NotificationResult<NotificationOutcome> {
+        self.with_notification_lock(path, |dispatcher| {
+            match dispatcher.load_existing_receipt_locked(
+                path,
+                outcome.event,
+                subject,
+                outcome.id.clone(),
+            )? {
+                Claim::Final(existing) => Ok(existing),
+                Claim::Corrupt => {
+                    dispatcher.write_final_receipt_locked(path, subject, outcome)?;
+                    Ok(outcome.clone())
+                }
+                _ => Err(NotificationError::Invalid(format!(
+                    "corrupt notification receipt changed before recovery: {}",
+                    path.display()
+                ))),
+            }
+        })
+    }
+
+    fn write_final_receipt_locked(
         &self,
         path: &Path,
         subject: &str,
@@ -527,13 +654,48 @@ impl NotificationDispatcher {
         work_fs::require_plain_file(path, &final_metadata)?;
         Ok(())
     }
+
+    fn with_notification_lock<T>(
+        &self,
+        path: &Path,
+        operation: impl FnOnce(&Self) -> NotificationResult<T>,
+    ) -> NotificationResult<T> {
+        ensure_receipt_location(&self.work, path)?;
+        let lock = self.work.join(NOTIFICATION_MUTATION_LOCK);
+        let policy = TransactionLockPolicy::new(
+            &self.work,
+            &lock,
+            NOTIFICATION_MUTATION_LIFECYCLE_LOCK,
+            TRANSACTION_LOCK_TIMEOUT,
+            TRANSACTION_LOCK_STALE_AFTER,
+        );
+        let mut guard = acquire_transaction_lock(&policy, uuid::Uuid::new_v4().to_string())
+            .map_err(notification_lock_error)?;
+        let result = operation(self);
+        match guard.release() {
+            Ok(()) => result,
+            Err(error) => Err(NotificationError::Lock(format!(
+                "notification mutation lock release failed: {error}"
+            ))),
+        }
+    }
 }
 
 enum Claim {
-    Claimed,
-    InProgress,
-    Stale,
+    Claimed(NotificationReceipt),
+    InProgress(NotificationReceipt),
+    Stale(NotificationReceipt),
+    Corrupt,
     Final(NotificationOutcome),
+}
+
+fn notification_lock_error(error: TransactionLockError) -> NotificationError {
+    match error {
+        TransactionLockError::Io(error) => NotificationError::Io(error),
+        TransactionLockError::Busy { age_ms, kind } => NotificationError::Lock(format!(
+            "notification mutation lock is busy (age_ms={age_ms:?}, kind={kind})"
+        )),
+    }
 }
 
 fn now_secs() -> u64 {
@@ -595,11 +757,33 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::*;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static STALE_RECOVERY_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    fn set_stale_recovery_hook(hook: impl FnOnce() + 'static) {
+        STALE_RECOVERY_HOOK.with(|slot| {
+            assert!(slot.replace(Some(Box::new(hook))).is_none());
+        });
+    }
+
+    pub(super) fn run_stale_recovery_hook() {
+        STALE_RECOVERY_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
 
     fn work(label: &str) -> PathBuf {
         let work = std::env::current_dir()
@@ -726,7 +910,7 @@ mod tests {
         let receipt = dispatcher.receipt_path(event, subject);
         assert!(matches!(
             dispatcher.claim_or_load(&receipt, event, subject),
-            Ok(Claim::Claimed)
+            Ok(Claim::Claimed(_))
         ));
 
         let outcome = dispatcher.dispatch(event, subject).unwrap();
@@ -808,6 +992,90 @@ mod tests {
         let outcome = dispatcher.dispatch(event, subject).unwrap();
         assert!(outcome.journal_entry().contains("status=unknown"));
         assert!(outcome.resolves_notification_pending());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn truncated_claim_is_finalized_as_unknown_without_relaunching_the_child() {
+        let work = work("truncated-claim");
+        let dispatcher =
+            NotificationDispatcher::new(&work, Some(vec!["orchestrail-no-such-notifier".into()]));
+        let event = NotificationEvent::TaskEscalated;
+        let subject = "T-17";
+        let receipt = dispatcher.receipt_path(event, subject);
+        fs::create_dir(receipt.parent().unwrap()).unwrap();
+        fs::write(&receipt, br#"{"schema":"orchestrail/notification@1","id":"#).unwrap();
+
+        let recovered = dispatcher.dispatch(event, subject).unwrap();
+        assert!(
+            recovered
+                .journal_entry()
+                .contains("status=unknown reason=corrupt_claim")
+        );
+        assert!(recovered.resolves_notification_pending());
+        let persisted: NotificationReceipt =
+            serde_json::from_str(&fs::read_to_string(&receipt).unwrap()).unwrap();
+        assert_eq!(persisted.status, Some(NotificationStatus::Unknown));
+        assert_eq!(persisted.reason, Some(NotificationReason::CorruptClaim));
+
+        let resumed = dispatcher.dispatch(event, subject).unwrap();
+        assert_eq!(resumed, recovered);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn stale_recovery_does_not_overwrite_a_concurrent_final_receipt() {
+        let work = work("stale-race");
+        let dispatcher =
+            NotificationDispatcher::new(&work, Some(vec!["orchestrail-no-such-notifier".into()]));
+        let event = NotificationEvent::TaskEscalated;
+        let subject = "T-17";
+        let receipt = dispatcher.receipt_path(event, subject);
+        let stale = NotificationReceipt {
+            schema: NOTIFICATION_SCHEMA.into(),
+            id: notification_id(event, subject),
+            event,
+            subject: subject.into(),
+            status: None,
+            reason: None,
+            duration_ms: None,
+            claimed_at_secs: Some(
+                now_secs().saturating_sub(NOTIFICATION_CLAIM_STALE_AFTER.as_secs() + 1),
+            ),
+        };
+        fs::create_dir(receipt.parent().unwrap()).unwrap();
+        fs::write(&receipt, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let finalizer = dispatcher.clone();
+        let expected_claim = stale.clone();
+        let final_receipt_path = receipt.clone();
+        let final_subject = subject.to_string();
+        let sent = dispatcher.outcome(event, subject, NotificationStatus::Sent, 1);
+        let sent_for_finalizer = sent.clone();
+        let barrier_for_hook = barrier.clone();
+        set_stale_recovery_hook(move || {
+            let barrier_for_finalizer = barrier_for_hook.clone();
+            let handle = thread::spawn(move || {
+                barrier_for_finalizer.wait();
+                finalizer
+                    .save_final_receipt(
+                        &final_receipt_path,
+                        &final_subject,
+                        &expected_claim,
+                        &sent_for_finalizer,
+                    )
+                    .unwrap()
+            });
+            barrier_for_hook.wait();
+            handle.join().unwrap();
+        });
+
+        let recovered = dispatcher.dispatch(event, subject).unwrap();
+        assert_eq!(recovered, sent);
+        let persisted: NotificationReceipt =
+            serde_json::from_str(&fs::read_to_string(&receipt).unwrap()).unwrap();
+        assert_eq!(persisted.status, Some(NotificationStatus::Sent));
         let _ = fs::remove_dir_all(work);
     }
 
@@ -934,7 +1202,7 @@ mod tests {
         let receipt = dispatcher.receipt_path(event, subject);
         assert!(matches!(
             dispatcher.claim_or_load(&receipt, event, subject),
-            Ok(Claim::Claimed)
+            Ok(Claim::Claimed(_))
         ));
 
         let original_notifications = work.join("notifications-original");
@@ -976,8 +1244,7 @@ mod tests {
         fs::write(&receipt, "{}\n").unwrap();
 
         let journal = dispatcher.dispatch(event, subject).unwrap().journal_entry();
-        assert!(journal.contains("status=failed"));
-        assert!(journal.contains("error_class=schema_mismatch"));
+        assert!(journal.contains("status=unknown reason=corrupt_claim"));
         assert!(!journal.contains(&work.display().to_string()));
         let _ = fs::remove_dir_all(work);
     }
