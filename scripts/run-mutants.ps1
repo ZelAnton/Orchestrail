@@ -170,6 +170,10 @@ try {
     Invoke-CleanTests
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    # Reports below this boundary can only belong to the invocation that follows.
+    if (Test-Path -LiteralPath $outputDir) {
+        Remove-Item -LiteralPath $outputDir -Recurse -Force
+    }
     Write-Host "==> Running cargo-mutants against $runLabel" -ForegroundColor Cyan
     & cargo mutants --config $configFile @CargoMutantsArgs
     $mutantsStatus = $LASTEXITCODE

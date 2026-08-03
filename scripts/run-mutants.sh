@@ -153,6 +153,8 @@ run_clean_tests
 echo "==> Verifying the clean engine tests (pass 2 of 2)"
 run_clean_tests
 
+# Reports below this boundary can only belong to the invocation that follows.
+rm -rf -- "$output_dir"
 echo "==> Running cargo-mutants against $run_label"
 set +e
 cargo mutants --config "$config_file" "$@"
