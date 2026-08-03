@@ -1257,16 +1257,6 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
-        std::os::windows::fs::symlink_file(target, link)
-    }
-
-    #[cfg(unix)]
-    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
-        std::os::unix::fs::symlink(target, link)
-    }
-
-    #[cfg(windows)]
     fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
         use std::process::{Command, Stdio};
 
@@ -1498,14 +1488,10 @@ mod tests {
         let source = inbox.join("bad.json");
         fs::write(&source, "invalid\n").unwrap();
         let occupied = rejected.join("20260725T120000Z-bad.json");
-        let missing = rejected.join("missing-target.json");
-        #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_file(&missing, &occupied).is_ok();
-        #[cfg(unix)]
-        let linked = std::os::unix::fs::symlink(&missing, &occupied).is_ok();
-        if !linked {
-            return;
-        }
+        let external = work.path.with_extension("occupied-quarantine-entry");
+        fs::create_dir(&external).unwrap();
+        symlink_directory(&external, &occupied)
+            .expect("the occupied reparse fixture must be available on this host");
 
         move_to_quarantine(
             &work.path,
@@ -1518,10 +1504,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            fs::symlink_metadata(&occupied)
-                .unwrap()
-                .file_type()
-                .is_symlink()
+            work_fs::redirected(&fs::symlink_metadata(&occupied).unwrap()),
+            "the occupied reparse entry must not be replaced"
         );
         assert_eq!(
             fs::read_to_string(rejected.join("20260725T120000Z-bad-1.json")).unwrap(),
@@ -1532,6 +1516,9 @@ mod tests {
                 .join("20260725T120000Z-bad-1.metadata.txt")
                 .is_file()
         );
+
+        remove_directory_link(&occupied).unwrap();
+        fs::remove_dir_all(external).unwrap();
     }
 
     #[test]
@@ -1540,23 +1527,23 @@ mod tests {
         let inbox = work.path.join(INBOX_DIRECTORY);
         fs::create_dir(&inbox).unwrap();
         let entry = inbox.join("redirected.json");
-        let external = work.path.with_extension("external-record.json");
-        fs::write(&external, "external sentinel\n").unwrap();
-        if symlink_file(&external, &entry).is_err() {
-            fs::remove_file(external).unwrap();
-            return;
-        }
+        let external = work.path.with_extension("external-record");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, "external sentinel\n").unwrap();
+        symlink_directory(&external, &entry)
+            .expect("the final-entry reparse fixture must be available on this host");
 
         let error = drain(&work.path, "2026-07-25T12:00:00Z").unwrap_err();
         assert!(error.to_string().contains("not a plain file"));
         assert_eq!(
-            fs::read_to_string(&external).unwrap(),
+            fs::read_to_string(&sentinel).unwrap(),
             "external sentinel\n"
         );
         assert!(!work.path.join(QUEUE_FILE).exists());
 
-        fs::remove_file(entry).unwrap();
-        fs::remove_file(external).unwrap();
+        remove_directory_link(&entry).unwrap();
+        fs::remove_dir_all(external).unwrap();
     }
 
     #[test]

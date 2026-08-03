@@ -24,6 +24,8 @@ type CreateNewPlainFileHook = Box<dyn FnOnce() -> io::Result<()>>;
 thread_local! {
     static CREATE_NEW_PLAIN_FILE_HOOK: RefCell<Option<CreateNewPlainFileHook>> =
         const { RefCell::new(None) };
+    static CREATE_NEW_PLAIN_FILE_POST_HOOK: RefCell<Option<CreateNewPlainFileHook>> =
+        const { RefCell::new(None) };
 }
 
 /// Default ceiling for one authority-bearing control-plane artifact.
@@ -253,11 +255,15 @@ pub(crate) fn create_new_plain_file(path: &Path) -> io::Result<File> {
 /// Create a new confined control-plane file and reject a parent redirect installed around the
 /// creation attempt.
 pub(crate) fn create_new_plain_file_rooted(work: &Path, path: &Path) -> io::Result<File> {
-    ensure_plain_parent(work, path)?;
+    let parent_identity = ensure_plain_parent_identity(work, path)?;
     #[cfg(test)]
     run_create_new_plain_file_hook()?;
-    let file = create_new_plain_file(path)?;
-    assert_plain_parent(work, path)?;
+    let file = create_new_plain_file(path);
+    #[cfg(test)]
+    run_create_new_plain_file_post_hook()?;
+    let file = file?;
+    assert_plain_parent(work, path, Some(&parent_identity))?;
+    assert_plain_file_identity(path, &file)?;
     Ok(file)
 }
 
@@ -272,8 +278,26 @@ fn set_create_new_plain_file_hook(hook: impl FnOnce() -> io::Result<()> + 'stati
 }
 
 #[cfg(test)]
+fn set_create_new_plain_file_post_hook(hook: impl FnOnce() -> io::Result<()> + 'static) {
+    CREATE_NEW_PLAIN_FILE_POST_HOOK.with(|slot| {
+        assert!(
+            slot.replace(Some(Box::new(hook))).is_none(),
+            "create-new post test hook is already installed"
+        );
+    });
+}
+
+#[cfg(test)]
 fn run_create_new_plain_file_hook() -> io::Result<()> {
     CREATE_NEW_PLAIN_FILE_HOOK.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn run_create_new_plain_file_post_hook() -> io::Result<()> {
+    CREATE_NEW_PLAIN_FILE_POST_HOOK.with(|slot| match slot.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
@@ -341,25 +365,173 @@ fn relative_below<'a>(work: &Path, path: &'a Path) -> io::Result<&'a Path> {
 /// Prove the work root and every existing directory below it without following redirects.
 /// Missing directories are created one component at a time and then re-proved.
 pub(crate) fn ensure_plain_parent(work: &Path, path: &Path) -> io::Result<()> {
+    ensure_plain_parent_identity(work, path).map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainDirectoryIdentity(u64, u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlainParentIdentity(Vec<(PathBuf, PlainDirectoryIdentity)>);
+
+#[cfg(unix)]
+fn plain_file_identity(file: &File) -> io::Result<PlainDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(PlainDirectoryIdentity(metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn plain_directory_identity(path: &Path) -> io::Result<PlainDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !redirected(&metadata) {
+        Ok(PlainDirectoryIdentity(metadata.dev(), metadata.ino()))
+    } else {
+        Err(plain_read_error(PlainReadViolation::ParentNotPlain {
+            path: path.to_path_buf(),
+        }))
+    }
+}
+
+#[cfg(windows)]
+fn plain_file_identity(file: &File) -> io::Result<PlainDirectoryIdentity> {
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+    // SAFETY: `file` owns a live Windows handle and `information` points to writable storage
+    // with the exact layout required by `GetFileInformationByHandle`.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a nonzero return guarantees that Windows initialized the output structure.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Ok(PlainDirectoryIdentity(
+        u64::from(information.volume_serial_number),
+        file_index,
+    ))
+}
+
+#[cfg(windows)]
+fn plain_directory_identity(path: &Path) -> io::Result<PlainDirectoryIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let directory = options.open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || redirected(&metadata) {
+        return Err(plain_read_error(PlainReadViolation::ParentNotPlain {
+            path: path.to_path_buf(),
+        }));
+    }
+    plain_file_identity(&directory)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn plain_directory_identity(path: &Path) -> io::Result<PlainDirectoryIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "control-plane parent identity is unsupported on this platform: {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn plain_file_identity(_file: &File) -> io::Result<PlainDirectoryIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "control-plane file identity is unsupported on this platform",
+    ))
+}
+
+fn assert_plain_file_identity(path: &Path, expected: &File) -> io::Result<()> {
+    let observed = open_existing_plain_file(path)?;
+    if plain_file_identity(&observed)? == plain_file_identity(expected)? {
+        Ok(())
+    } else {
+        Err(plain_read_error(PlainReadViolation::NotPlain {
+            path: path.to_path_buf(),
+        }))
+    }
+}
+
+fn ensure_plain_parent_identity(work: &Path, path: &Path) -> io::Result<PlainParentIdentity> {
     let relative = relative_below(work, path)?;
-    require_plain_directory(work)?;
     let mut current = PathBuf::from(work);
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut identities = vec![(current.clone(), plain_directory_identity(&current)?)];
     for component in parent.components() {
         let Component::Normal(name) = component else {
             unreachable!("relative_below rejected non-normal components")
         };
         current.push(name);
         match fs::symlink_metadata(&current) {
-            Ok(_) => require_plain_directory(&current)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&current)?;
-                require_plain_directory(&current)?;
-            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
             Err(error) => return Err(error),
         }
+        identities.push((current.clone(), plain_directory_identity(&current)?));
     }
-    Ok(())
+    Ok(PlainParentIdentity(identities))
+}
+
+fn plain_parent_identity(work: &Path, path: &Path) -> io::Result<PlainParentIdentity> {
+    let relative = relative_below(work, path)?;
+    let mut current = PathBuf::from(work);
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut identities = vec![(current.clone(), plain_directory_identity(&current)?)];
+    for component in parent.components() {
+        let Component::Normal(name) = component else {
+            unreachable!("relative_below rejected non-normal components")
+        };
+        current.push(name);
+        identities.push((current.clone(), plain_directory_identity(&current)?));
+    }
+    Ok(PlainParentIdentity(identities))
 }
 
 fn plain_parent_exists(work: &Path, path: &Path) -> io::Result<bool> {
@@ -397,15 +569,34 @@ pub fn entry_exists(work: &Path, path: &Path) -> io::Result<bool> {
     }
 }
 
-fn assert_plain_parent(work: &Path, path: &Path) -> io::Result<()> {
-    if plain_parent_exists(work, path)? {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+fn assert_plain_parent(
+    work: &Path,
+    path: &Path,
+    expected_identity: Option<&PlainParentIdentity>,
+) -> io::Result<()> {
+    if !plain_parent_exists(work, path)? {
+        return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("control-plane parent is absent: {}", path.display()),
-        ))
+        ));
     }
+    if let Some(expected) = expected_identity {
+        let observed = plain_parent_identity(work, path)?;
+        if &observed != expected {
+            let changed = expected
+                .0
+                .iter()
+                .zip(&observed.0)
+                .find_map(|((expected_path, expected_id), (_, observed_id))| {
+                    (expected_id != observed_id).then_some(expected_path.as_path())
+                })
+                .unwrap_or(path);
+            return Err(plain_read_error(PlainReadViolation::ParentNotPlain {
+                path: changed.to_path_buf(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn read_optional_bytes(
@@ -422,7 +613,7 @@ pub(crate) fn read_optional_bytes(
         Err(error) => return Err(error),
     }
     let bytes = read_plain_bytes(path, max_bytes)?;
-    assert_plain_parent(work, path)?;
+    assert_plain_parent(work, path, None)?;
     Ok(Some(bytes))
 }
 
@@ -470,7 +661,7 @@ pub fn optional_plain_file_stamp(
         len: metadata.len(),
         modified: metadata.modified().ok(),
     };
-    assert_plain_parent(work, path)?;
+    assert_plain_parent(work, path, None)?;
     require_plain_file(path, &fs::symlink_metadata(path)?)?;
     Ok(Some(stamp))
 }
@@ -560,6 +751,7 @@ pub fn replace_file(work: &Path, path: &Path, payload: &[u8], max_bytes: u64) ->
         name.to_string_lossy(),
         std::process::id()
     ));
+    ensure_plain_parent(work, &temp)?;
     let mut file = create_new_plain_file(&temp)?;
     let result = (|| {
         file.write_all(payload)?;
@@ -613,7 +805,7 @@ pub fn plain_directory_entries_bounded(
         entries.push(entry?);
     }
     require_plain_directory(path)?;
-    assert_plain_parent(work, path)?;
+    assert_plain_parent(work, path, None)?;
     Ok(Some(entries))
 }
 
@@ -627,7 +819,7 @@ pub fn remove_plain_file(work: &Path, path: &Path) -> io::Result<bool> {
         Err(error) => return Err(error),
     }
     fs::remove_file(path)?;
-    assert_plain_parent(work, path)?;
+    assert_plain_parent(work, path, None)?;
     Ok(true)
 }
 
@@ -641,7 +833,7 @@ pub(crate) fn remove_plain_directory_all(work: &Path, path: &Path) -> io::Result
         Err(error) => return Err(error),
     }
     fs::remove_dir_all(path)?;
-    assert_plain_parent(work, path)?;
+    assert_plain_parent(work, path, None)?;
     Ok(true)
 }
 
@@ -748,6 +940,92 @@ mod tests {
 
         remove_directory_link(&parent).unwrap();
         fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn rooted_creation_rejects_a_transient_parent_redirect_restored_as_plain() {
+        let work = temp_root("create-transient-parent-swap");
+        let external = temp_root("create-transient-parent-external");
+        let parent = work.join("claims");
+        let original_parent = work.join("claims-original");
+        let path = parent.join("claim.lock");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir(&external).unwrap();
+
+        let hook_parent = parent.clone();
+        let hook_original_parent = original_parent.clone();
+        let hook_external = external.clone();
+        set_create_new_plain_file_hook(move || {
+            fs::rename(&hook_parent, &hook_original_parent)?;
+            symlink_directory(&hook_external, &hook_parent)
+        });
+        let post_hook_parent = parent.clone();
+        set_create_new_plain_file_post_hook(move || {
+            remove_directory_link(&post_hook_parent)?;
+            fs::create_dir(&post_hook_parent)
+        });
+
+        let error = create_new_plain_file_rooted(&work, &path).unwrap_err();
+
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::ParentNotPlain { path: violation_path })
+                if violation_path == &parent
+        ));
+        assert!(
+            require_plain_directory(&parent).is_ok(),
+            "the post-create check must reject even after the path becomes plain again"
+        );
+        assert!(
+            external.join("claim.lock").is_file(),
+            "the fixture must exercise creation through the transient redirect"
+        );
+
+        fs::remove_dir_all(work).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn rooted_creation_rejects_a_transient_redirect_restored_to_the_same_parent() {
+        let work = temp_root("create-restored-parent-swap");
+        let external = temp_root("create-restored-parent-external");
+        let parent = work.join("claims");
+        let original_parent = work.join("claims-original");
+        let path = parent.join("claim.lock");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir(&external).unwrap();
+
+        let hook_parent = parent.clone();
+        let hook_original_parent = original_parent.clone();
+        let hook_external = external.clone();
+        set_create_new_plain_file_hook(move || {
+            fs::rename(&hook_parent, &hook_original_parent)?;
+            symlink_directory(&hook_external, &hook_parent)
+        });
+        let post_hook_parent = parent.clone();
+        let post_hook_original_parent = original_parent.clone();
+        let post_hook_path = path.clone();
+        set_create_new_plain_file_post_hook(move || {
+            remove_directory_link(&post_hook_parent)?;
+            fs::rename(&post_hook_original_parent, &post_hook_parent)?;
+            fs::write(&post_hook_path, "decoy\n")
+        });
+
+        let error = create_new_plain_file_rooted(&work, &path).unwrap_err();
+
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::NotPlain { path: violation_path })
+                if violation_path == &path
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "decoy\n");
+        assert!(
+            external.join("claim.lock").is_file(),
+            "the fixture must exercise creation through the transient redirect"
+        );
+
+        fs::remove_dir_all(work).unwrap();
+        fs::remove_dir_all(external).unwrap();
     }
 
     #[test]

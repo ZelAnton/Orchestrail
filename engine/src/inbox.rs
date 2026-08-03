@@ -220,7 +220,7 @@ pub fn reconcile(root: &Path, occurred_at: &str) -> Result<ReconcileResult> {
     let Some(paths) = paths(root)? else {
         return Ok(ReconcileResult::Absent);
     };
-    let _lock = InboxLock::acquire(&paths.lock)?;
+    let _lock = InboxLock::acquire(root, &paths.lock)?;
     let links = task_links(root)?;
     let mut updated = Vec::new();
     for mut record in load_messages(&paths)? {
@@ -358,7 +358,7 @@ fn deliver_final_reply(
         ))
     })?;
     let target_path = message_path(&target_paths, &reply_id)?;
-    let _target_lock = InboxLock::acquire(&target_paths.lock)?;
+    let _target_lock = InboxLock::acquire(&sender.root, &target_paths.lock)?;
     match fs::symlink_metadata(&target_path) {
         Ok(metadata) => {
             assert_plain_file(&target_path, &metadata)?;
@@ -372,7 +372,7 @@ fn deliver_final_reply(
     }
     drop(_target_lock);
 
-    let _source_lock = InboxLock::acquire(&source_paths.lock)?;
+    let _source_lock = InboxLock::acquire(root, &source_paths.lock)?;
     let mut current_source = load_message(message_path(&source_paths, message_id)?)?;
     if !matches!(
         current_source.message.processing_status,
@@ -664,6 +664,7 @@ pub(crate) struct InboxPaths {
 }
 
 pub(crate) struct InboxLock {
+    work: PathBuf,
     path: PathBuf,
     token: String,
 }
@@ -672,24 +673,22 @@ impl InboxLock {
     /// Compatible with Orchestra's `Acquire-Lock`: create a single-owner sentinel and never
     /// delete a lock we did not create. The processor treats a live foreign lock as a retryable
     /// boundary instead of racing a sender/curator over message JSON.
-    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(work: &Path, path: &Path) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            match work_fs::create_new_plain_file(path) {
+            match work_fs::create_new_plain_file_rooted(work, path) {
                 Ok(mut file) => {
                     let token = format!("{}\n", Uuid::new_v4());
                     file.write_all(token.as_bytes())?;
                     file.sync_all()?;
-                    let parent = path.parent().ok_or_else(|| {
-                        InboxError::Malformed("inbox lock has no parent directory".into())
-                    })?;
-                    let observed = work_fs::read_required_text(parent, path, 1_024)?;
+                    let observed = work_fs::read_required_text(work, path, 1_024)?;
                     if observed != token {
                         return Err(InboxError::Malformed(
                             "inbox lock ownership changed before use".into(),
                         ));
                     }
                     return Ok(Self {
+                        work: work.to_owned(),
                         path: path.to_owned(),
                         token,
                     });
@@ -722,7 +721,7 @@ pub(crate) fn deliver_release_message(
         ))
     })?;
     let target_path = message_path(&target_paths, id)?;
-    let _lock = InboxLock::acquire(&target_paths.lock)?;
+    let _lock = InboxLock::acquire(root, &target_paths.lock)?;
     if cancelled() {
         return Err(InboxError::Malformed(
             "release delivery lost owner authority while waiting for the target inbox lock".into(),
@@ -749,13 +748,10 @@ pub(crate) fn deliver_release_message(
 
 impl Drop for InboxLock {
     fn drop(&mut self) {
-        let Some(parent) = self.path.parent() else {
-            return;
-        };
-        if work_fs::read_optional_text(parent, &self.path, 1_024)
+        if work_fs::read_optional_text(&self.work, &self.path, 1_024)
             .is_ok_and(|value| value.as_deref() == Some(self.token.as_str()))
         {
-            let _ = work_fs::remove_plain_file(parent, &self.path);
+            let _ = work_fs::remove_plain_file(&self.work, &self.path);
         }
     }
 }
@@ -1555,16 +1551,6 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
-        std::os::windows::fs::symlink_file(target, link)
-    }
-
-    #[cfg(unix)]
-    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
-        std::os::unix::fs::symlink(target, link)
-    }
-
-    #[cfg(windows)]
     fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
         use std::process::{Command, Stdio};
 
@@ -1753,12 +1739,12 @@ mod tests {
         root.message(id, "new", "none", &[]);
         let message = root.path.join(format!(".inbox/messages/{id}.json"));
         fs::remove_file(&message).unwrap();
-        let external = root.path.with_extension("external-message.json");
-        fs::write(&external, "external sentinel\n").unwrap();
-        if symlink_file(&external, &message).is_err() {
-            fs::remove_file(external).unwrap();
-            return;
-        }
+        let external = root.path.with_extension("external-message");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, "external sentinel\n").unwrap();
+        symlink_directory(&external, &message)
+            .expect("the final-entry reparse fixture must be available on this host");
 
         let error = inspect(&root.path).unwrap_err();
         assert!(matches!(
@@ -1767,12 +1753,35 @@ mod tests {
                 if diagnostic.contains("not a plain file") && diagnostic.contains(id)
         ));
         assert_eq!(
-            fs::read_to_string(&external).unwrap(),
+            fs::read_to_string(&sentinel).unwrap(),
             "external sentinel\n"
         );
 
-        fs::remove_file(&message).unwrap();
-        fs::remove_file(external).unwrap();
+        remove_directory_link(&message).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn redirected_inbox_cannot_divert_lock_creation() {
+        let root = Root::new();
+        root.message("msg-00000001", "new", "none", &[]);
+        let inbox = root.path.join(INBOX_DIRECTORY);
+        fs::remove_dir_all(&inbox).unwrap();
+        let external = root.path.with_extension("external-lock-inbox");
+        fs::create_dir(&external).unwrap();
+        symlink_directory(&external, &inbox)
+            .expect("the inbox reparse fixture must be available on this host");
+
+        let lock = inbox.join(LOCK_FILE);
+        let error = match InboxLock::acquire(&root.path, &lock) {
+            Ok(_) => panic!("redirected inbox unexpectedly accepted lock creation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not a plain directory"));
+        assert!(!external.join(LOCK_FILE).exists());
+
+        remove_directory_link(&inbox).unwrap();
+        fs::remove_dir_all(external).unwrap();
     }
 
     #[test]
