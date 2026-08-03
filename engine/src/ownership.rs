@@ -71,9 +71,17 @@ const STAGING_FILE: &str = "lease.json.tmp";
 const TRANSACTION_LOCK: &str = "state-tx.lock";
 const TRANSACTION_LIFECYCLE_LOCK: &str = ".state-tx.lifecycle.lock";
 const MAX_LEASE_BYTES: u64 = 64 * 1024;
-const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+/// How long an acquisition waits for a live holder before refusing with a diagnosed `Busy`.
+pub(crate) const TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// The age past which an unreleased lock is treated as orphaned by a crashed holder.
+///
+/// Deliberately shared by every user of this primitive: two durable control-plane locks with
+/// independently chosen recovery thresholds are exactly the divergence this module now prevents.
+pub(crate) const TRANSACTION_LOCK_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSACTION_LOCK_RETRY: Duration = Duration::from_millis(50);
+/// The holder identity is read back through a bounded projection, so a token longer than this
+/// could never compare equal to itself. See [`validate_transaction_owner_token`].
+const TRANSACTION_OWNER_MAX_CHARS: usize = 128;
 static TRANSACTION_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_STALE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -700,7 +708,14 @@ impl LeaseStore {
             Err(error) => return Err(error.into()),
         }
         let tx = self.work.join(TRANSACTION_LOCK);
-        let mut guard = acquire_transaction_lock(&self.work, &tx, timeout, stale_after)?;
+        let policy = TransactionLockPolicy::new(
+            &self.work,
+            &tx,
+            TRANSACTION_LIFECYCLE_LOCK,
+            timeout,
+            stale_after,
+        );
+        let mut guard = acquire_transaction_lock(&policy, transaction_owner_token())?;
         let result = operation();
         // A failure to remove our owner-checked CreateNew file is surfaced only when the operation
         // itself succeeded; otherwise preserve the primary error. Drop is a best-effort panic path.
@@ -728,6 +743,71 @@ impl LeaseStore {
 
     fn lease_path(&self) -> PathBuf {
         self.lock_directory().join(LEASE_FILE)
+    }
+}
+
+/// The complete addressing and timing policy for one CreateNew transaction lock.
+///
+/// The lease's `state-tx.lock` and the approval store's `.approval-mutation.lock` are the same
+/// durable primitive under different names, not two implementations of one idea. They were two
+/// implementations once, and the copy silently lost crash recovery: a holder that died mid-mutation
+/// left a lock nobody would ever break, so every later approval mutation refused forever. Naming
+/// the per-lock parts explicitly here keeps the recovery, identity-revalidation, and stale-break
+/// rules below single-sourced.
+pub(crate) struct TransactionLockPolicy<'a> {
+    /// Confinement root every rooted `work_fs` primitive validates this lock against.
+    work: &'a Path,
+    /// The canonical lock pathname.
+    path: &'a Path,
+    /// File name of the persistent kernel-locked sidecar, resolved in the lock's own directory.
+    /// Each lock needs its own sidecar: sharing one would serialize unrelated critical sections.
+    lifecycle_name: &'a str,
+    /// How long acquisition may wait for a live holder before reporting `Busy`.
+    timeout: Duration,
+    /// The age past which an unreleased lock is treated as orphaned and broken.
+    stale_after: Duration,
+}
+
+impl<'a> TransactionLockPolicy<'a> {
+    pub(crate) fn new(
+        work: &'a Path,
+        path: &'a Path,
+        lifecycle_name: &'a str,
+        timeout: Duration,
+        stale_after: Duration,
+    ) -> Self {
+        Self {
+            work,
+            path,
+            lifecycle_name,
+            timeout,
+            stale_after,
+        }
+    }
+}
+
+/// Why a bounded transaction-lock acquisition did not produce a guard.
+///
+/// `Busy` carries the observed holder and its age so no caller has to report a mute refusal: an
+/// operator can tell a live peer from a lock that is merely still short of `stale_after`.
+#[derive(Debug)]
+pub(crate) enum TransactionLockError {
+    Io(io::Error),
+    Busy { age_ms: Option<u128>, kind: String },
+}
+
+impl From<io::Error> for TransactionLockError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<TransactionLockError> for LeaseError {
+    fn from(error: TransactionLockError) -> Self {
+        match error {
+            TransactionLockError::Io(error) => Self::Io(error),
+            TransactionLockError::Busy { age_ms, kind } => Self::Busy { age_ms, kind },
+        }
     }
 }
 
@@ -782,6 +862,7 @@ struct TransactionFilesystemIdentity {
     file: u64,
 }
 
+#[derive(Debug)]
 struct TransactionLifecycleGuard {
     file: fs::File,
     path: PathBuf,
@@ -796,17 +877,18 @@ impl TransactionLifecycleGuard {
 
 fn try_acquire_transaction_lifecycle(
     transaction_path: &Path,
+    lifecycle_name: &str,
 ) -> io::Result<Option<TransactionLifecycleGuard>> {
     let parent = transaction_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "state transaction lock has no parent: {}",
+                "transaction lock has no parent directory: {}",
                 transaction_path.display()
             ),
         )
     })?;
-    let lifecycle_path = parent.join(TRANSACTION_LIFECYCLE_LOCK);
+    let lifecycle_path = parent.join(lifecycle_name);
     let file = work_fs::open_plain_file_read_write(&lifecycle_path, true)?;
     validate_filesystem_supports_kernel_locking(&lifecycle_path)?;
     let Some(identity) = try_lock_transaction_lifecycle_file(&file, &lifecycle_path)? else {
@@ -898,7 +980,7 @@ fn lifecycle_identity_error(path: &Path, reason: impl fmt::Display) -> io::Error
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "state transaction lifecycle lock identity is no longer valid at {}: {reason}; \
+            "transaction lifecycle lock identity is no longer valid at {}: {reason}; \
              refusing control-plane mutation",
             path.display()
         ),
@@ -1049,7 +1131,7 @@ fn transaction_target_identity_error(path: &Path, reason: impl fmt::Display) -> 
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "state transaction lock identity is no longer valid at {}: {reason}; refusing mutation",
+            "transaction lock identity is no longer valid at {}: {reason}; refusing mutation",
             path.display()
         ),
     )
@@ -1425,7 +1507,10 @@ fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
     ))
 }
 
-struct TransactionLockGuard {
+/// A held transaction lock. `release` is owner-conditional; `Drop` retries it best-effort so a
+/// panicking critical section still frees the lock rather than leaving it for stale recovery.
+#[derive(Debug)]
+pub(crate) struct TransactionLockGuard {
     path: PathBuf,
     owner: String,
     armed: bool,
@@ -1433,13 +1518,16 @@ struct TransactionLockGuard {
 }
 
 impl TransactionLockGuard {
-    fn release(&mut self) -> io::Result<()> {
+    /// Remove the lock only while it still records this guard's own holder token. A lock that was
+    /// replaced by anyone else is left exactly as found and reported, never silently removed.
+    pub(crate) fn release(&mut self) -> io::Result<()> {
         if !self.armed {
             return Ok(());
         }
-        let lifecycle = self.lifecycle.as_ref().ok_or_else(|| {
-            io::Error::other("armed state transaction lock has no lifecycle guard")
-        })?;
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| io::Error::other("armed transaction lock has no lifecycle guard"))?;
         lifecycle.validate()?;
         let snapshot = transaction_lock_snapshot(&self.path)?;
         let expected_identity = snapshot.identity;
@@ -1453,7 +1541,8 @@ impl TransactionLockGuard {
             kind => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "refusing to release replaced state transaction lock: {}",
+                    "refusing to release replaced transaction lock {}: {}",
+                    self.path.display(),
                     kind.describe()
                 ),
             )),
@@ -1467,26 +1556,61 @@ impl Drop for TransactionLockGuard {
     }
 }
 
-fn acquire_transaction_lock(
-    work: &Path,
-    path: &Path,
-    timeout: Duration,
-    stale_after: Duration,
-) -> Result<TransactionLockGuard> {
-    let owner = format!(
+/// The process-scoped holder identity used by the lease's own transaction lock.
+fn transaction_owner_token() -> String {
+    format!(
         "{}:{}",
         process::id(),
         TRANSACTION_OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-    let deadline = Instant::now() + timeout;
+    )
+}
+
+/// Reject an owner token this primitive could not round-trip through its own ownership check.
+///
+/// [`transaction_lock_snapshot`] reads the recorded holder back through `trim` and a
+/// [`TRANSACTION_OWNER_MAX_CHARS`] ceiling, so a token with surrounding whitespace, an embedded
+/// line break, or more characters than that ceiling would never compare equal to itself. The
+/// owner-conditional release would then refuse to remove the caller's *own* lock and leak it until
+/// the stale threshold expired — the precise failure this primitive exists to prevent. Refusing
+/// such a token up front keeps that impossible instead of latent.
+fn validate_transaction_owner_token(owner: &str) -> io::Result<()> {
+    if owner.is_empty()
+        || owner.trim() != owner
+        || owner.contains(['\0', '\n', '\r'])
+        || owner.chars().count() > TRANSACTION_OWNER_MAX_CHARS
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid transaction lock owner token {owner:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Take the named CreateNew lock, waiting a bounded time for a live holder and recovering an
+/// orphaned one.
+///
+/// Contention is never terminal on its own: a holder younger than `stale_after` is waited out
+/// until `timeout`, and only a holder that has outlived `stale_after` is broken — under the
+/// lifecycle sidecar, with the observed filesystem identity carried to the final syscall, so
+/// exactly one contender can quarantine it and no second contender can enter the critical section
+/// behind that break. A refusal is reported as [`TransactionLockError::Busy`] carrying the holder
+/// and its age, never as a mute failure.
+pub(crate) fn acquire_transaction_lock(
+    policy: &TransactionLockPolicy<'_>,
+    owner: String,
+) -> std::result::Result<TransactionLockGuard, TransactionLockError> {
+    validate_transaction_owner_token(&owner)?;
+    let (work, path) = (policy.work, policy.path);
+    let deadline = Instant::now() + policy.timeout;
     loop {
-        let lifecycle = match try_acquire_transaction_lifecycle(path)? {
+        let lifecycle = match try_acquire_transaction_lifecycle(path, policy.lifecycle_name)? {
             Some(lifecycle) => lifecycle,
             None => {
                 if Instant::now() >= deadline {
                     match transaction_lock_snapshot(path) {
                         Ok(snapshot) => {
-                            return Err(LeaseError::Busy {
+                            return Err(TransactionLockError::Busy {
                                 age_ms: snapshot.age_ms,
                                 kind: snapshot.kind.describe(),
                             });
@@ -1495,7 +1619,7 @@ fn acquire_transaction_lock(
                             // The releasing owner removes the canonical entry before dropping the
                             // lifecycle guard. Report the still-held cross-process boundary rather
                             // than misclassifying that bounded hand-off as an I/O failure.
-                            return Err(LeaseError::Busy {
+                            return Err(TransactionLockError::Busy {
                                 age_ms: None,
                                 kind: "cross-process lifecycle transition".into(),
                             });
@@ -1532,11 +1656,11 @@ fn acquire_transaction_lock(
             }
             Err(error) => return Err(error.into()),
         };
-        if break_stale_transaction_lock(path, &snapshot, stale_after, &lifecycle)? {
+        if break_stale_transaction_lock(path, &snapshot, policy.stale_after, &lifecycle)? {
             continue;
         }
         if Instant::now() >= deadline {
-            return Err(LeaseError::Busy {
+            return Err(TransactionLockError::Busy {
                 age_ms: snapshot.age_ms,
                 kind: snapshot.kind.describe(),
             });
@@ -1660,7 +1784,11 @@ fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot>
     } else if metadata.is_file() {
         let owner = work_fs::read_plain_text(path, MAX_LEASE_BYTES)?;
         TransactionLockKind::File {
-            owner: owner.trim().chars().take(128).collect(),
+            owner: owner
+                .trim()
+                .chars()
+                .take(TRANSACTION_OWNER_MAX_CHARS)
+                .collect(),
         }
     } else if metadata.is_dir() {
         work_fs::require_plain_directory(path)?;
@@ -1766,7 +1894,7 @@ fn break_stale_transaction_lock(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "state transaction lock identity changed while quarantining {}",
+                "transaction lock identity changed while quarantining {}",
                 path.display()
             ),
         ));
@@ -1996,7 +2124,7 @@ mod tests {
         fs::write(tx.join("foreign-entry"), "do not move").unwrap();
         thread::sleep(Duration::from_millis(2));
 
-        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
         let decided = transaction_lock_snapshot(&tx).unwrap();
@@ -2029,14 +2157,14 @@ mod tests {
         let work = work("recreated-lifecycle-sidecar");
         fs::create_dir_all(&work).unwrap();
         let tx = work.join(TRANSACTION_LOCK);
-        let original = try_acquire_transaction_lifecycle(&tx)
+        let original = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns original lifecycle lock");
         let lifecycle_path = original.path.clone();
 
         fs::remove_file(&lifecycle_path).unwrap();
         fs::write(&lifecycle_path, "replacement").unwrap();
-        let replacement = try_acquire_transaction_lifecycle(&tx)
+        let replacement = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("replacement inode has an independent kernel lock");
 
@@ -2062,7 +2190,7 @@ mod tests {
         fs::write(&tx, "same-owner").unwrap();
         let original_file = work_fs::open_existing_plain_file(&tx).unwrap();
         let (original_identity, _) = opened_transaction_target_identity(&original_file).unwrap();
-        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
 
@@ -2105,7 +2233,7 @@ mod tests {
         let tx = work.join(TRANSACTION_LOCK);
         fs::write(&tx, "same-owner").unwrap();
         let expected = transaction_lock_snapshot(&tx).unwrap().identity;
-        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
 
@@ -2216,7 +2344,7 @@ mod tests {
             snapshot.age_ms.is_some_and(|age| age < 60_000),
             "staleness must use the fresh last-write time, not the tunneled creation time"
         );
-        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
         assert!(
@@ -2254,9 +2382,15 @@ mod tests {
                 let peak = Arc::clone(&peak);
                 handles.push(scope.spawn(move || {
                     start.wait();
+                    let policy = TransactionLockPolicy::new(
+                        &work,
+                        &tx,
+                        TRANSACTION_LIFECYCLE_LOCK,
+                        Duration::from_secs(2),
+                        stale_after,
+                    );
                     let mut guard =
-                        acquire_transaction_lock(&work, &tx, Duration::from_secs(2), stale_after)
-                            .unwrap();
+                        acquire_transaction_lock(&policy, transaction_owner_token()).unwrap();
                     let owner = guard.owner.clone();
                     let entrants = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(entrants, Ordering::SeqCst);
@@ -2289,6 +2423,45 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_token_the_ownership_check_cannot_round_trip_is_refused() {
+        let work = work("owner-token");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        let policy = || {
+            TransactionLockPolicy::new(
+                &work,
+                &tx,
+                TRANSACTION_LIFECYCLE_LOCK,
+                Duration::ZERO,
+                TRANSACTION_LOCK_STALE_AFTER,
+            )
+        };
+
+        let overlong = "x".repeat(TRANSACTION_OWNER_MAX_CHARS + 1);
+        for rejected in ["", " padded ", "two\nlines", overlong.as_str()] {
+            let error = acquire_transaction_lock(&policy(), rejected.to_string()).unwrap_err();
+            assert!(
+                matches!(&error, TransactionLockError::Io(error)
+                    if error.kind() == io::ErrorKind::InvalidInput),
+                "{rejected:?} is not round-trippable through the ownership check: {error:?}"
+            );
+            assert!(
+                !tx.exists(),
+                "a token refused up front must not leave a lock nobody can release"
+            );
+        }
+
+        let mut guard =
+            acquire_transaction_lock(&policy(), "x".repeat(TRANSACTION_OWNER_MAX_CHARS)).unwrap();
+        guard.release().unwrap();
+        assert!(
+            !tx.exists(),
+            "the longest accepted token still releases its own lock"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
     fn obsolete_same_process_guard_cannot_release_a_recreated_transaction_lock() {
         let work = work("recreated-transaction-lock");
         fs::create_dir_all(&work).unwrap();
@@ -2299,7 +2472,7 @@ mod tests {
             owner: "123:old".into(),
             armed: true,
             lifecycle: Some(
-                try_acquire_transaction_lifecycle(&tx)
+                try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
                     .unwrap()
                     .expect("test owns lifecycle lock"),
             ),
