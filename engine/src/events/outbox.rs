@@ -875,9 +875,8 @@ fn rotation_state_from(work: &Path, metadata: RotationMetadata) -> io::Result<Ro
     }
     let mut committed = listed;
     let uncommitted = committed.split_off(count);
-    let mut expected_sequence = 1_u64;
     let mut expected_start = 0_u64;
-    for segment in &committed {
+    for (expected_sequence, segment) in (1_u64..).zip(committed.iter()) {
         if segment.sequence != expected_sequence
             || segment.start_offset != expected_start
             || segment.end_offset <= segment.start_offset
@@ -888,7 +887,6 @@ fn rotation_state_from(work: &Path, metadata: RotationMetadata) -> io::Result<Ro
                 format!("invalid events archive segment {:?}", segment.name),
             ));
         }
-        expected_sequence += 1;
         expected_start = segment.end_offset;
     }
     if expected_start != metadata.archived_len {
