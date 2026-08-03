@@ -194,17 +194,51 @@ pub fn project_processor_transition(
         && after.phase == Phase::Idle
         && let Some(batch_id) = batch_id
     {
-        events.push(event(
+        // The native reducer owns cohort outcome accounting: each counter is derived from its
+        // terminal task-ID set at the closure boundary, so consumers never need to infer it.
+        events.push(event_with_payload(
             EventType::CohortClosed,
             Some(batch_id),
             None,
-            None,
-            None,
-            "close",
+            cohort_close_payload(after),
+            "close".into(),
             occurred_at,
         ));
     }
     events
+}
+
+fn cohort_close_payload(after: &ProcessorState) -> Map<String, Value> {
+    let mut merged_ids = std::collections::BTreeSet::new();
+    let mut quarantined_ids = std::collections::BTreeSet::new();
+    let mut escalated_ids = std::collections::BTreeSet::new();
+
+    for task in after.tasks.values() {
+        match task.phase {
+            TaskPhase::Done => {
+                merged_ids.insert(task.id.as_str());
+            }
+            TaskPhase::Conflict => {
+                quarantined_ids.insert(task.id.as_str());
+            }
+            TaskPhase::Escalated => {
+                escalated_ids.insert(task.id.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    // The payload exposes counts only, but construct them directly from the disjoint ID sets so
+    // a producer cannot report a count that disagrees with the tasks it classified.
+    let merged = merged_ids.len();
+    let quarantined = quarantined_ids.len();
+    let escalated = escalated_ids.len();
+
+    let mut payload = Map::new();
+    payload.insert("merged".into(), Value::from(merged));
+    payload.insert("quarantined".into(), Value::from(quarantined));
+    payload.insert("escalated".into(), Value::from(escalated));
+    payload
 }
 
 /// Reconstruct the one deterministic `published -> done` fact needed by Phase-6 archive
@@ -1043,6 +1077,77 @@ mod tests {
                 "cohort.closed|B-1||".to_string(),
                 "task.status_changed||T-1|опубликована>выполнена".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn cohort_closed_payload_counts_mixed_terminal_task_sets() {
+        let mut before = ProcessorState {
+            phase: Phase::Cleaning,
+            batch: Some(CohortRuntime {
+                id: "B-1".into(),
+                base: "base".into(),
+                started_at_secs: 1,
+                wave: 1,
+                admitted_total: 3,
+                admission_closed: None,
+                cohort_budget_secs: None,
+                cohort_token_budget: None,
+                cohort_token_budget_strict: false,
+                token_budget_actual_tokens: None,
+                events_outbox_enabled: true,
+            }),
+            ..ProcessorState::default()
+        };
+        for (id, phase) in [
+            ("T-1", TaskPhase::Done),
+            ("T-2", TaskPhase::Conflict),
+            ("T-3", TaskPhase::Escalated),
+        ] {
+            before.tasks.insert(
+                id.into(),
+                crate::processor::TaskRuntime {
+                    id: id.into(),
+                    conflict_domain: "engine/**".into(),
+                    level: Some(Level::Coder),
+                    risk: Some(crate::resolvers::Risk::Medium),
+                    wave: 1,
+                    phase,
+                    leaf_attempts: Default::default(),
+                    review_cycles: 0,
+                    review_signatures: Vec::new(),
+                    pending_fix_open_findings: None,
+                    pending_fix_open_finding_ids: None,
+                    dimensions_with_findings_last_round: Vec::new(),
+                    implementation_author: None,
+                    previous_review_sha: None,
+                    review_sha: None,
+                    reason: None,
+                    imported_recovery_intent: None,
+                    leaf_sessions: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        let mut after = before.clone();
+        after.batch = None;
+        after.phase = Phase::Idle;
+
+        let events = project_processor_transition(
+            &before,
+            &after,
+            &ProcessorCommand::CleanupComplete,
+            "2026-07-24T12:00:00Z",
+        );
+        let closed = events
+            .iter()
+            .find(|event| event.event_type == EventType::CohortClosed)
+            .expect("cleanup projects cohort.closed");
+        assert_eq!(
+            closed.payload,
+            serde_json::json!({"merged": 1, "quarantined": 1, "escalated": 1})
+                .as_object()
+                .unwrap()
+                .clone()
         );
     }
 
