@@ -1238,6 +1238,14 @@ impl HeadlessExternalPort {
         // findings nor a complete clean pass (notably a report cut short before its `ИТОГ:` tail)
         // as the same bounded phase-2.7 repeat. Both routes mean one thing — this reviewer pass is
         // not done — and both are spent against `REVIEW_LOOP_MAX` by the reducer.
+        //
+        // The shortcut deliberately keeps precedence over the adapter's own classification,
+        // including its terminal future-dated-`SUMMARY-R` carve-out (R-14). The fact it reports is
+        // about the CALL, not the artifact: a reviewer that wrote nothing has not yet made any
+        // claim about a file it may never have read, so its round is the transient one worth
+        // repeating even when the leftover artifact happens to be unprovable. The carve-out applies
+        // as soon as any reviewer actually writes — which, being terminal, is what bounds the
+        // combination.
         let no_new_report = match (&artifact, &review.artifact_before) {
             (None, _) => true,
             (Some(artifact), Some(before)) => &sha256_hex(artifact.as_bytes()) == before,

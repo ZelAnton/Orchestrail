@@ -16,29 +16,45 @@
 //!
 //! This tree is the whole contract, and the production path
 //! ([`crate::outcome_adapter::task_review_outcome`] + `headless::finish_task_review`) implements
-//! the same three branches in the same order over the same parsed artifact. Two documented
-//! differences follow from the extra inputs the production path has, and neither redefines a
-//! branch:
+//! the same three branches in the same order over the same parsed artifact. Three documented
+//! differences separate them: two follow from inputs the production path has and a pure function
+//! over the artifact cannot, the third is a deliberate policy choice over evidence BOTH can see.
+//! All three make production STRICTER, none reorders a branch, and none promotes anything this
+//! resolver would not:
 //!
 //! * **The `Clean` branch is strictly tighter there.** The engine's own reviewer prompt requires
 //!   `review.md` to END with an exact `ИТОГ: готово к слиянию · открытых=0`, so the adapter needs
 //!   that decodable completion tail on top of the freshness gate this resolver checks. An artifact
 //!   this resolver calls `Clean` but that lacks the tail is **not** promoted there — it falls into
-//!   `Incomplete` (a bounded re-run inside `REVIEW_LOOP_MAX`), never into a terminal escalation.
-//!   `Incomplete` is therefore WIDER on the production path than here, never narrower, and the
-//!   difference can only cost a repeat pass, never a merge authorization.
+//!   `Incomplete` (a bounded re-run inside `REVIEW_LOOP_MAX`). That direction only ever costs a
+//!   repeat pass, never a merge authorization.
+//! * **The `Incomplete` branch is tighter there in exactly one shape** (T-026, finding R-14): an
+//!   artifact whose freshest `SUMMARY-R` is dated ABOVE the invocation window
+//!   ([`ReviewParse::summary_after_window`]) escalates terminally in production instead of
+//!   repeating. This resolver still calls it `Incomplete`, and correctly so for what it can see —
+//!   the deviation is not about the artifact's CURRENT state, which really is "no proved clean
+//!   pass", but about its FUTURE: `SUMMARY-R` entries are append-only by protocol, so a
+//!   future-dated mark stays [`ReviewParse::latest_summary`]'s chronological maximum forever and
+//!   no later pass can re-prove `is_clean_pass` — not even one whose reviewer honestly stamps a
+//!   fresh, in-window summary. A repeat there is provably useless, and spending `REVIEW_LOOP_MAX`
+//!   reviewer calls to discover that replaces a precise diagnosis with an anonymous «не сходится
+//!   ревью». So `Incomplete` is WIDER in production for the tail-less shape above and NARROWER for
+//!   this one; a caller of this resolver must not read `Incomplete` as "production will retry".
 //! * **Escalation has no analogue here at all**, because its inputs are not in [`ReviewParse`]:
 //!   a supervision failure (timeout/crash/cancel), an explicit `ИТОГ: эскалация codex`, or an
 //!   undecodable positive claim by a reviewer that did finish (unknown `ИТОГ:` verdict word,
 //!   malformed `Риск-повышен:` marker). A pure function over the artifact cannot observe any of
-//!   them, so nothing in this file is expected to produce them.
+//!   them, so nothing in this file is expected to produce them. The future-dated-summary
+//!   escalation above is the one case whose evidence IS visible here — it is a deliberate policy
+//!   choice of the adapter, not a fact this resolver lacks, which is why it is named as a
+//!   divergence rather than folded into this bullet.
 //!
-//! Before T-026 the production adapter instead escalated the task terminally for three artifact
-//! shapes this resolver calls `Incomplete` (no tail at all, a `готово к слиянию` tail over a
-//! stale/absent `SUMMARY-R`, an `открытые находки` tail with no open `R-`), which made
+//! Before T-026 the production adapter escalated the task terminally for all FOUR of the artifact
+//! shapes this resolver calls `Incomplete` (no tail at all, a `готово к слиянию` tail over an
+//! absent/stale/future-dated `SUMMARY-R`, an `открытые находки` tail with no open `R-`), which made
 //! `ReviewOutcome::Incomplete` practically unreachable in production and burned a whole task on a
-//! transient reviewer truncation. The branches are now one semantics with the one tightening
-//! stated above.
+//! transient reviewer truncation. The three CONVERGING shapes now repeat as this tree says; only
+//! the non-convergent fourth kept its terminal treatment, with a reason that names it.
 
 use crate::contract::ReviewParse;
 
@@ -50,9 +66,11 @@ pub enum ReviewGate {
     /// 2.8 — open `R-` findings: dispatch a fix, then re-review.
     Findings,
     /// 2.7 — no open `R-` and no fresh `SUMMARY-R`: reviewer interrupted, re-run it unchanged.
-    /// The production twin ([`crate::processor::ReviewOutcome::Incomplete`]) means exactly this
-    /// and is spent against `REVIEW_LOOP_MAX`; see the module docs for the one shape it covers in
-    /// addition (a clean-looking artifact without the required `ИТОГ:` completion tail).
+    /// The production twin ([`crate::processor::ReviewOutcome::Incomplete`]) means the same and is
+    /// spent against `REVIEW_LOOP_MAX`, but the two sets are not identical in either direction —
+    /// see the module docs for the one shape it covers in ADDITION (a clean-looking artifact
+    /// without the required `ИТОГ:` completion tail) and the one it EXCLUDES as terminal (a
+    /// `SUMMARY-R` dated above the window, which no later pass can supersede).
     Incomplete,
 }
 

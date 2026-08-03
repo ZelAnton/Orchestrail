@@ -1613,8 +1613,10 @@ impl<'a> Runner<'a> {
     /// branch off the parsed `review.md` — the terminal `ИТОГ:` line is NOT what decides
     /// clean/with-findings here. (The production adapter reads the same three branches in the same
     /// order and additionally requires that tail before promoting a CLEAN pass; an artifact
-    /// without it is `Incomplete` there — a bounded re-run — never a terminal escalation. See
-    /// [`crate::resolvers::gate`]'s module docs for the full statement of that one divergence.)
+    /// without it is `Incomplete` there — a bounded re-run. It is stricter than this gate in one
+    /// further point: a `SUMMARY-R` dated ABOVE the window is terminal there, because no later
+    /// pass could supersede it. See [`crate::resolvers::gate`]'s module docs for the full
+    /// statement of both divergences.)
     /// The `inject_findings` task yields findings until it converges
     /// (`converge_after_cycles`), the deterministic "the fix worked at cycle N" (or never) knob.
     /// Robust to a live child that does not speak stream-json: the gate reads `review.md` from
