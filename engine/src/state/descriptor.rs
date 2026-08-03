@@ -61,7 +61,7 @@ pub struct Descriptor {
 /// Decode one planner-provided conflict-domain into individual relative glob/path patterns.
 /// A descriptor with an absent, empty, or non-path-shaped field stays unknown so admission fails
 /// closed rather than packing it as conflict-free.
-fn parse_conflict_domain(value: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_conflict_domain(value: &str) -> Option<Vec<String>> {
     let globs: Vec<String> = value
         .split([',', ' ', '\t'])
         .map(str::trim)
