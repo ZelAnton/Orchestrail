@@ -7,9 +7,10 @@
 //! protocol, so concurrent lease mutation by the two control planes is not supported. A
 //! persistent, kernel-locked lifecycle sidecar makes identity-check + create/rename/remove
 //! sequences indivisible across Orchestrail processes. The sidecar is accepted only when the host
-//! can classify its storage as local with reliable kernel locking; network and unrecognized Unix
-//! filesystems fail closed. This module does not invoke the PowerShell script and never recursively
-//! removes a lock directory: a foreign/corrupt lock remains an operator-visible refusal.
+//! can prove that its storage is local with reliable kernel locking; network, unrecognized, and
+//! known stackable Unix filesystems fail closed because their backing stores cannot be recursively
+//! validated. This module does not invoke the PowerShell script and never recursively removes a
+//! lock directory: a foreign/corrupt lock remains an operator-visible refusal.
 
 use std::env;
 use std::fmt;
@@ -722,11 +723,12 @@ struct TransactionLockSnapshot {
     kind: TransactionLockKind,
     stamp: Option<SystemTime>,
     age_ms: Option<u128>,
+    identity: TransactionFilesystemIdentity,
 }
 
 impl TransactionLockSnapshot {
     fn same_identity_as(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.stamp == other.stamp
+        self.identity == other.identity && self.kind == other.kind && self.stamp == other.stamp
     }
 }
 
@@ -737,10 +739,11 @@ impl TransactionLockSnapshot {
 /// identity check plus rename, and owner check plus removal requires this guard. `flock` and
 /// `LockFileEx` are released by the kernel when a process exits, which gives the whole lifecycle
 /// one filesystem-backed critical section shared by threads and independent processes. The open
-/// file's identity is revalidated against the sidecar path before every mutation so external
-/// unlink/recreate cannot silently split that critical section across two file identities.
+/// sidecar identity is revalidated before every mutation. The actual `state-tx.lock` identity is
+/// separately revalidated at each pathname syscall boundary because the lifecycle guard only
+/// serializes cooperating Orchestrail processes and cannot prevent an external unlink/recreate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TransactionLifecycleIdentity {
+struct TransactionFilesystemIdentity {
     filesystem: u64,
     file: u64,
 }
@@ -748,7 +751,7 @@ struct TransactionLifecycleIdentity {
 struct TransactionLifecycleGuard {
     file: fs::File,
     path: PathBuf,
-    identity: TransactionLifecycleIdentity,
+    identity: TransactionFilesystemIdentity,
 }
 
 impl TransactionLifecycleGuard {
@@ -785,7 +788,7 @@ fn try_acquire_transaction_lifecycle(
 fn try_lock_transaction_lifecycle_file(
     file: &fs::File,
     path: &Path,
-) -> io::Result<Option<TransactionLifecycleIdentity>> {
+) -> io::Result<Option<TransactionFilesystemIdentity>> {
     if !try_lock_transaction_lifecycle_file_os(file)? {
         return Ok(None);
     }
@@ -869,11 +872,11 @@ fn lifecycle_identity_error(path: &Path, reason: impl fmt::Display) -> io::Error
 }
 
 #[cfg(unix)]
-fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionLifecycleIdentity> {
+fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionFilesystemIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
-    Ok(TransactionLifecycleIdentity {
+    Ok(TransactionFilesystemIdentity {
         filesystem: metadata.dev(),
         file: metadata.ino(),
     })
@@ -883,7 +886,7 @@ fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionLife
 fn validate_transaction_lifecycle_identity(
     file: &fs::File,
     path: &Path,
-    expected: TransactionLifecycleIdentity,
+    expected: TransactionFilesystemIdentity,
 ) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -899,11 +902,11 @@ fn validate_transaction_lifecycle_identity(
     work_fs::require_plain_file(path, &current)
         .map_err(|error| lifecycle_identity_error(path, error))?;
 
-    let opened_identity = TransactionLifecycleIdentity {
+    let opened_identity = TransactionFilesystemIdentity {
         filesystem: opened.dev(),
         file: opened.ino(),
     };
-    let current_identity = TransactionLifecycleIdentity {
+    let current_identity = TransactionFilesystemIdentity {
         filesystem: current.dev(),
         file: current.ino(),
     };
@@ -923,10 +926,9 @@ fn validate_transaction_lifecycle_identity(
 }
 
 #[cfg(windows)]
-fn windows_lifecycle_file_identity(
+fn windows_transaction_file_identity(
     file: &fs::File,
-    path: &Path,
-) -> io::Result<(TransactionLifecycleIdentity, u64)> {
+) -> io::Result<(TransactionFilesystemIdentity, u64)> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{
@@ -937,12 +939,12 @@ fn windows_lifecycle_file_identity(
     // SAFETY: `file` owns a live handle and `information` points to writable storage for the
     // complete BY_HANDLE_FILE_INFORMATION result.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
-        return Err(lifecycle_identity_error(path, io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: a successful GetFileInformationByHandle call initialized the result structure.
     let information = unsafe { information.assume_init() };
     Ok((
-        TransactionLifecycleIdentity {
+        TransactionFilesystemIdentity {
             filesystem: u64::from(information.dwVolumeSerialNumber),
             file: (u64::from(information.nFileIndexHigh) << 32)
                 | u64::from(information.nFileIndexLow),
@@ -952,18 +954,18 @@ fn windows_lifecycle_file_identity(
 }
 
 #[cfg(windows)]
-fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionLifecycleIdentity> {
-    windows_lifecycle_file_identity(file, Path::new("<open lifecycle lock>"))
-        .map(|(identity, _)| identity)
+fn transaction_lifecycle_identity(file: &fs::File) -> io::Result<TransactionFilesystemIdentity> {
+    windows_transaction_file_identity(file).map(|(identity, _)| identity)
 }
 
 #[cfg(windows)]
 fn validate_transaction_lifecycle_identity(
     file: &fs::File,
     path: &Path,
-    expected: TransactionLifecycleIdentity,
+    expected: TransactionFilesystemIdentity,
 ) -> io::Result<()> {
-    let (opened_identity, opened_links) = windows_lifecycle_file_identity(file, path)?;
+    let (opened_identity, opened_links) = windows_transaction_file_identity(file)
+        .map_err(|error| lifecycle_identity_error(path, error))?;
     if opened_links == 0 {
         return Err(lifecycle_identity_error(
             path,
@@ -972,7 +974,8 @@ fn validate_transaction_lifecycle_identity(
     }
     let current = work_fs::open_existing_plain_file(path)
         .map_err(|error| lifecycle_identity_error(path, error))?;
-    let (current_identity, current_links) = windows_lifecycle_file_identity(&current, path)?;
+    let (current_identity, current_links) = windows_transaction_file_identity(&current)
+        .map_err(|error| lifecycle_identity_error(path, error))?;
     if opened_identity != expected {
         return Err(lifecycle_identity_error(
             path,
@@ -989,7 +992,7 @@ fn validate_transaction_lifecycle_identity(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn transaction_lifecycle_identity(_file: &fs::File) -> io::Result<TransactionLifecycleIdentity> {
+fn transaction_lifecycle_identity(_file: &fs::File) -> io::Result<TransactionFilesystemIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "transaction lifecycle file identity is unavailable on this platform",
@@ -1000,12 +1003,139 @@ fn transaction_lifecycle_identity(_file: &fs::File) -> io::Result<TransactionLif
 fn validate_transaction_lifecycle_identity(
     _file: &fs::File,
     _path: &Path,
-    _expected: TransactionLifecycleIdentity,
+    _expected: TransactionFilesystemIdentity,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "transaction lifecycle file identity is unavailable on this platform",
     ))
+}
+
+fn transaction_target_identity_error(path: &Path, reason: impl fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "state transaction lock identity is no longer valid at {}: {reason}; refusing mutation",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn transaction_target_identity_from_metadata(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> io::Result<TransactionFilesystemIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(TransactionFilesystemIdentity {
+        filesystem: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn transaction_target_identity_from_metadata(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> io::Result<TransactionFilesystemIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    windows_transaction_file_identity(&file).map(|(identity, _)| identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn transaction_target_identity_from_metadata(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> io::Result<TransactionFilesystemIdentity> {
+    Err(transaction_target_identity_error(
+        path,
+        "filesystem identity is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn opened_transaction_target_identity(
+    file: &fs::File,
+) -> io::Result<(TransactionFilesystemIdentity, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok((
+        TransactionFilesystemIdentity {
+            filesystem: metadata.dev(),
+            file: metadata.ino(),
+        },
+        metadata.nlink(),
+    ))
+}
+
+#[cfg(windows)]
+fn opened_transaction_target_identity(
+    file: &fs::File,
+) -> io::Result<(TransactionFilesystemIdentity, u64)> {
+    windows_transaction_file_identity(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_transaction_target_identity(
+    _file: &fs::File,
+) -> io::Result<(TransactionFilesystemIdentity, u64)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem identity is unavailable on this platform",
+    ))
+}
+
+fn validate_transaction_target_identity(
+    path: &Path,
+    expected: TransactionFilesystemIdentity,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if work_fs::redirected(&metadata) {
+        return Err(transaction_target_identity_error(
+            path,
+            "the current path is redirected",
+        ));
+    }
+    let current = transaction_target_identity_from_metadata(path, &metadata)?;
+    if current != expected {
+        return Err(transaction_target_identity_error(
+            path,
+            "the current path names a different filesystem entry",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_open_transaction_target_identity(
+    file: &fs::File,
+    path: &Path,
+    expected: TransactionFilesystemIdentity,
+) -> io::Result<()> {
+    let (opened, links) = opened_transaction_target_identity(file)
+        .map_err(|error| transaction_target_identity_error(path, error))?;
+    if links == 0 {
+        return Err(transaction_target_identity_error(
+            path,
+            "the open file has no directory link",
+        ));
+    }
+    if opened != expected {
+        return Err(transaction_target_identity_error(
+            path,
+            "the open file changed identity",
+        ));
+    }
+    validate_transaction_target_identity(path, expected)
 }
 
 fn unsupported_locking_filesystem(path: &Path, reason: impl fmt::Display) -> io::Error {
@@ -1125,9 +1255,31 @@ fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
     let filesystem = unsafe { CStr::from_ptr(statistics.f_fstypename.as_ptr()) }
         .to_string_lossy()
         .to_ascii_lowercase();
-    match filesystem.as_str() {
+    validate_named_unix_filesystem_type(path, &filesystem)
+}
+
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn validate_named_unix_filesystem_type(path: &Path, filesystem: &str) -> io::Result<()> {
+    match filesystem {
         "apfs" | "exfat" | "ext2fs" | "ffs" | "hammer" | "hammer2" | "hfs" | "lfs" | "msdos"
-        | "ntfs" | "nullfs" | "tmpfs" | "ufs" | "unionfs" | "zfs" => Ok(()),
+        | "ntfs" | "tmpfs" | "ufs" | "zfs" => Ok(()),
+        // Fail closed: nullfs and unionfs are stackable, and this code cannot recursively prove
+        // that their backing stores provide local, reliable kernel-lock semantics.
+        "nullfs" | "unionfs" => Err(unsupported_locking_filesystem(
+            path,
+            format_args!(
+                "filesystem type {filesystem:?} is not supported because its stackable backing \
+                 store cannot be validated"
+            ),
+        )),
         _ => Err(unsupported_locking_filesystem(
             path,
             format_args!("filesystem type {filesystem:?} is not in the local-filesystem allowlist"),
@@ -1256,9 +1408,10 @@ impl TransactionLockGuard {
         })?;
         lifecycle.validate()?;
         let snapshot = transaction_lock_snapshot(&self.path)?;
+        let expected_identity = snapshot.identity;
         match snapshot.kind {
             TransactionLockKind::File { owner } if owner == self.owner => {
-                remove_owned_transaction_lock(&self.path, lifecycle)?;
+                remove_owned_transaction_lock(&self.path, expected_identity, lifecycle)?;
                 self.armed = false;
                 self.lifecycle.take();
                 Ok(())
@@ -1376,34 +1529,55 @@ fn create_transaction_lock(
         }
         Err(error) => return Err(error),
     };
+    let (created_identity, created_links) = opened_transaction_target_identity(&file)
+        .map_err(|error| transaction_target_identity_error(path, error))?;
+    if created_links == 0 {
+        return Err(transaction_target_identity_error(
+            path,
+            "the newly created file has no directory link",
+        ));
+    }
+    // CreateNew returns a handle to the entry it created. Keep that handle and prove the pathname
+    // still names the same volume/file-index before trusting the lifecycle validation or contents.
+    validate_open_transaction_target_identity(&file, path, created_identity)?;
     lifecycle.validate()?;
     if let Err(error) = (|| -> io::Result<()> {
         file.write_all(owner.as_bytes())?;
         file.sync_all()
     })() {
-        drop(file);
         lifecycle.validate()?;
+        validate_open_transaction_target_identity(&file, path, created_identity)?;
         let _ = fs::remove_file(path);
         return Err(error);
     }
+    // An external process is not bound by the lifecycle sidecar and may unlink/recreate the
+    // pathname. Revalidate the open file against that path immediately before the final guard
+    // validation so a replacement can never be accepted as the lock we just initialized.
+    validate_open_transaction_target_identity(&file, path, created_identity)?;
     lifecycle.validate()?;
     Ok(true)
 }
 
 fn remove_owned_transaction_lock(
     path: &Path,
+    expected: TransactionFilesystemIdentity,
     lifecycle: &TransactionLifecycleGuard,
 ) -> io::Result<()> {
     // The ownership read in `release` and this removal are one logical filesystem transaction:
     // every code path capable of renaming, creating, or removing the canonical name needs the
-    // same cross-process lifecycle guard. There is no pathname lookup between a second ownership
-    // check and deletion that could accidentally authorize a replacement lock.
+    // same cross-process lifecycle guard. Keep an open handle to the authorized file, then compare
+    // both that handle and the current pathname with the ownership snapshot immediately before
+    // deletion. Rust std has no cross-platform conditional unlink-by-identity operation, so this
+    // is deliberately the final check before the pathname syscall.
     lifecycle.validate()?;
+    let file = work_fs::open_existing_plain_file(path)?;
+    validate_open_transaction_target_identity(&file, path, expected)?;
     fs::remove_file(path)
 }
 
 fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot> {
     let metadata = fs::symlink_metadata(path)?;
+    let identity = transaction_target_identity_from_metadata(path, &metadata)?;
     // NTFS file-name tunneling may copy the previous occupant's creation time to a newly created
     // lock at the same path. Last-write time belongs to the new contents and is the only safe age
     // source for stale-lock recovery.
@@ -1432,7 +1606,21 @@ fn transaction_lock_snapshot(path: &Path) -> io::Result<TransactionLockSnapshot>
         kind,
         stamp,
         age_ms,
+        identity,
     })
+}
+
+fn rename_transaction_lock_if_unchanged(
+    path: &Path,
+    stale_path: &Path,
+    expected: TransactionFilesystemIdentity,
+    lifecycle: &TransactionLifecycleGuard,
+) -> io::Result<()> {
+    lifecycle.validate()?;
+    // The sidecar serializes Orchestrail peers only. An unrelated process can still replace this
+    // pathname, so the actual source identity must be the last check before rename re-resolves it.
+    validate_transaction_target_identity(path, expected)?;
+    fs::rename(path, stale_path)
 }
 
 fn break_stale_transaction_lock(
@@ -1448,9 +1636,9 @@ fn break_stale_transaction_lock(
         return Ok(false);
     }
     lifecycle.validate()?;
-    // The lifecycle guard makes this final content/metadata check and the following atomic rename
-    // one identity-conditional operation with respect to every Orchestrail process. Create and
-    // release take the same OS file lock, so the canonical name cannot be replaced in this gap.
+    // The lifecycle guard serializes this final content/metadata check with every Orchestrail
+    // create and release. An unrelated process does not honor that boundary, so the confirmed
+    // filesystem identity is carried to the final source-path check immediately before rename.
     let confirmed = match transaction_lock_snapshot(path) {
         Ok(snapshot) => snapshot,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
@@ -1478,8 +1666,7 @@ fn break_stale_transaction_lock(
         TRANSACTION_STALE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let stale_path = PathBuf::from(stale_path);
-    lifecycle.validate()?;
-    match fs::rename(path, &stale_path) {
+    match rename_transaction_lock_if_unchanged(path, &stale_path, confirmed.identity, lifecycle) {
         Ok(()) => {}
         Err(error)
             if matches!(
@@ -1492,6 +1679,7 @@ fn break_stale_transaction_lock(
         Err(error) => return Err(error),
     }
 
+    validate_transaction_target_identity(&stale_path, confirmed.identity)?;
     let quarantined = transaction_lock_snapshot(&stale_path)?;
     if !confirmed.same_identity_as(&quarantined) {
         return Err(io::Error::new(
@@ -1503,12 +1691,17 @@ fn break_stale_transaction_lock(
         ));
     }
 
-    // The canonical lock name is now free and this unique quarantine name is owned by the
-    // successful renamer, so cleanup cannot delete a replacement transaction lock.
-    lifecycle.validate()?;
+    // The canonical lock name is now free. Revalidate the quarantine identity at the cleanup
+    // syscall too, because an unrelated process could replace even this process-unique pathname.
     let removal = match confirmed.kind {
-        TransactionLockKind::File { .. } => fs::remove_file(&stale_path),
-        TransactionLockKind::EmptyDirectory => fs::remove_dir(&stale_path),
+        TransactionLockKind::File { .. } => {
+            remove_owned_transaction_lock(&stale_path, quarantined.identity, lifecycle)
+        }
+        TransactionLockKind::EmptyDirectory => {
+            lifecycle.validate()?;
+            validate_transaction_target_identity(&stale_path, quarantined.identity)?;
+            fs::remove_dir(&stale_path)
+        }
         TransactionLockKind::NonEmptyDirectory
         | TransactionLockKind::Redirected
         | TransactionLockKind::Other => return Ok(false),
@@ -1777,6 +1970,66 @@ mod tests {
         drop(replacement);
         drop(original);
         let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn target_identity_checks_reject_unlink_and_recreate_before_rename_or_remove() {
+        let work = work("recreated-transaction-target");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "same-owner").unwrap();
+        let original_file = work_fs::open_existing_plain_file(&tx).unwrap();
+        let (original_identity, _) = opened_transaction_target_identity(&original_file).unwrap();
+        let lifecycle = try_acquire_transaction_lifecycle(&tx)
+            .unwrap()
+            .expect("test owns lifecycle lock");
+
+        // Holding the deleted file open prevents its filesystem identity from being recycled,
+        // making the unlink/recreate race deterministic on both Unix and Windows.
+        fs::remove_file(&tx).unwrap();
+        fs::write(&tx, "same-owner").unwrap();
+        let stale_path = work.join("state-tx.lock.test.stale");
+
+        let rename_error =
+            rename_transaction_lock_if_unchanged(&tx, &stale_path, original_identity, &lifecycle)
+                .unwrap_err();
+        assert_eq!(rename_error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            rename_error
+                .to_string()
+                .contains("different filesystem entry")
+        );
+        assert!(!stale_path.exists());
+
+        let remove_error =
+            remove_owned_transaction_lock(&tx, original_identity, &lifecycle).unwrap_err();
+        assert_eq!(remove_error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            remove_error
+                .to_string()
+                .contains("identity is no longer valid")
+        );
+        assert_eq!(fs::read_to_string(&tx).unwrap(), "same-owner");
+
+        drop(original_file);
+        drop(lifecycle);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn stackable_named_filesystems_fail_closed() {
+        let path = Path::new("/test/.state-tx.lifecycle.lock");
+        for filesystem in ["nullfs", "unionfs"] {
+            let error = validate_named_unix_filesystem_type(path, filesystem).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("filesystem type {filesystem:?} is not supported"))
+            );
+            assert!(error.to_string().contains("stackable backing store"));
+        }
+        validate_named_unix_filesystem_type(path, "ufs").unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
