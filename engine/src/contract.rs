@@ -128,6 +128,31 @@ impl ReviewParse {
         summary_in_call_window && self.open_review_findings().is_empty()
     }
 
+    /// The freshest `SUMMARY-R` when it lies ABOVE the invocation window — the exact complement of
+    /// the upper bound [`Self::is_clean_pass`] applies, exposed as a fact (never a decision) so a
+    /// consumer can tell the two ways that bound fails APART. Returns the offending timestamp, or
+    /// `None` when the freshest summary is absent, inside the window, or below it.
+    ///
+    /// The two directions are not equally recoverable, which is the whole reason this predicate
+    /// exists next to the gate rather than inside it. A summary OLDER than `since` merely fails to
+    /// prove THIS round: the next reviewer pass stamps a newer one, that one becomes
+    /// [`Self::latest_summary`]'s chronological `max`, and the gate is proved. A summary NEWER than
+    /// `until` can never be superseded that way, because `SUMMARY-R` entries are append-only by
+    /// protocol (`agents/reviewer.md`: the summary «не удаляется», several may accumulate and the
+    /// old ones are never removed). A future-dated mark therefore stays the `max` forever, and
+    /// every later pass — including one that honestly stamps a fresh, correct, in-window summary —
+    /// keeps failing `is_clean_pass` on the same stale poison. Repeating the reviewer over such an
+    /// artifact is provably, not probabilistically, unable to converge.
+    ///
+    /// There is deliberately no `SUMMARY-F` twin: the integration gate
+    /// (`outcome_adapter::integration_review_outcome`) already treats an unproved ready claim as
+    /// terminal, so it never needed the distinction.
+    pub fn summary_after_window(&self, until: &str) -> Option<&str> {
+        self.latest_summary()
+            .and_then(|f| f.summary_timestamp())
+            .filter(|ts| iso_chrono_cmp(ts, until) == Ordering::Greater)
+    }
+
     /// The freshest `SUMMARY-F` (integration-review clean-pass summary), the latest by true
     /// chronological order via `iso_chrono_cmp` — the batch-level twin of
     /// [`Self::latest_summary`]
@@ -511,6 +536,64 @@ mod tests {
         // But a STALE summary (review started at 19:00, after the summary) is NOT clean:
         // this is exactly the "fresh, not any historical SUMMARY-R" rule (phase 2.6).
         assert!(!p.is_clean_pass("2026-07-10T19:00:00Z", REVIEW_UNTIL));
+    }
+
+    #[test]
+    fn a_summary_above_the_window_is_reported_apart_from_one_below_it() {
+        // `is_clean_pass` rejects both directions identically, but they differ in whether a LATER
+        // pass can ever fix them, so `summary_after_window` separates them for the consumer that
+        // must choose between repeating the reviewer and escalating (T-026 / R-14).
+        const SINCE: &str = "2026-07-10T17:00:00Z";
+
+        // Below the window: unproved for this round, recoverable by the next one.
+        let below = parse_review(
+            "### [SUMMARY-R-2026-07-10T16:00:00Z] previous round — статус: готово к слиянию\n",
+        );
+        assert!(!below.is_clean_pass(SINCE, REVIEW_UNTIL));
+        assert_eq!(below.summary_after_window(REVIEW_UNTIL), None);
+
+        // Inside the window, and no summary at all: likewise nothing above the bound.
+        assert_eq!(
+            parse_review(REVIEW_CLEAN).summary_after_window(REVIEW_UNTIL),
+            None
+        );
+        assert_eq!(
+            parse_review(REVIEW_DIRTY).summary_after_window(REVIEW_UNTIL),
+            None
+        );
+
+        // Above the window: reported, with the exact offending mark so a caller can name it.
+        let above = parse_review(
+            "### [SUMMARY-R-9999-12-31T23:59:59Z] broken clock — статус: готово к слиянию\n",
+        );
+        assert!(!above.is_clean_pass(SINCE, REVIEW_UNTIL));
+        assert_eq!(
+            above.summary_after_window(REVIEW_UNTIL),
+            Some("9999-12-31T23:59:59Z")
+        );
+
+        // The property that makes the distinction load-bearing: a later pass that stamps a correct,
+        // in-window summary does NOT clear it, because `latest_summary` is a chronological max over
+        // an append-only list. This is why repeating the reviewer cannot converge.
+        let repaired = parse_review(
+            "### [SUMMARY-R-9999-12-31T23:59:59Z] broken clock — статус: готово к слиянию\n\
+### [SUMMARY-R-2026-07-10T18:00:00Z] honest retry — статус: готово к слиянию\n",
+        );
+        assert!(!repaired.is_clean_pass(SINCE, REVIEW_UNTIL));
+        assert_eq!(
+            repaired.summary_after_window(REVIEW_UNTIL),
+            Some("9999-12-31T23:59:59Z")
+        );
+
+        // A fractional mark in the window's own second stays INSIDE it: `review_window_end` ends the
+        // bound at `.999Z` precisely so a real `.5Z` report is not mistaken for a future-dated one.
+        let fractional = parse_review(
+            "### [SUMMARY-R-2026-07-10T18:00:00.5Z] Итог — статус: готово к слиянию\n",
+        );
+        assert_eq!(
+            fractional.summary_after_window("2026-07-10T18:00:00.999Z"),
+            None
+        );
     }
 
     #[test]
