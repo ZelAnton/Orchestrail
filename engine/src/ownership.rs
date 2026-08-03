@@ -18,6 +18,33 @@
 //! filesystem operation. This proportionate residual risk is accepted. This module does not invoke
 //! the PowerShell script and never recursively removes a lock directory: a foreign/corrupt lock
 //! remains an operator-visible refusal.
+//!
+//! # Known limitation: residual authorization-snapshot-to-handle window (R-7)
+//!
+//! The authorization snapshots used by `TransactionLockGuard::release` and
+//! `break_stale_transaction_lock` are taken before the retained-handle helper,
+//! `mutate_transaction_file_if_unchanged`, opens its own handle. An external unlink and recreate
+//! between a snapshot and that open could theoretically reuse the file ID. Closing this gap
+//! completely would require either a wholesale handle-relative redesign of the acquire, release,
+//! and stale-break lifecycle or platform-specific atomic file-identity primitives beyond the API
+//! surface currently used here. This is accepted as proportionate residual risk for the
+//! primitive's local, cooperative control-plane deployment model.
+//!
+//! # Platform limitation: Windows ReFS requires 128-bit file identity
+//!
+//! Windows identity tracking currently uses the 64-bit file index exposed by
+//! `BY_HANDLE_FILE_INFORMATION`. ReFS does not guarantee uniqueness at 64 bits; proper ReFS
+//! identity tracking requires the 128-bit identifier from `FILE_ID_INFO`. Supporting it would
+//! require additional Windows API surface, specifically `GetFileInformationByHandleEx` with the
+//! `FileIdInfo` class, which this module does not currently use. ReFS volumes should therefore be
+//! treated as potentially unsafe for this transaction-lock primitive until that upgrade is made.
+//!
+//! # Filesystem limitation: FAT file IDs can change on rename
+//!
+//! FAT filesystems can change a file ID during rename operations, particularly when a file is
+//! renamed to a longer name. This is a pre-existing characteristic of FAT's directory-entry-based
+//! identification, not behavior introduced by this transaction-lock implementation. Hosts using
+//! FAT for system-critical paths should account for possible identity-tracking edge-case failures.
 
 use std::env;
 use std::fmt;
@@ -1174,7 +1201,6 @@ fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Resu
         0x5265_4975, // ReiserFS v3
         0x5346_544E, // NTFS
         0x5846_5342, // XFS
-        0x6175_6673, // AUFS
         0x794C_7630, // overlayfs
         0x8584_58F6, // ramfs
         0x9123_683E, // Btrfs
@@ -1192,6 +1218,7 @@ fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Resu
         0x4750_4653, // GPFS
         0x5346_414F, // AFS
         0x6573_5546, // FUSE (backing store cannot be established)
+        0x6175_6673, // AUFS (stackable filesystem, cannot validate backing store)
         0x7375_7245, // Coda
         0x7461_636F, // OCFS2
         0xAAD7_AAEA, // PanFS
@@ -1278,9 +1305,9 @@ fn validate_named_unix_filesystem_type(path: &Path, filesystem: &str) -> io::Res
     match filesystem {
         "apfs" | "exfat" | "ext2fs" | "ffs" | "hammer" | "hammer2" | "hfs" | "lfs" | "msdos"
         | "ntfs" | "tmpfs" | "ufs" | "zfs" => Ok(()),
-        // Fail closed: nullfs and unionfs are stackable, and this code cannot recursively prove
-        // that their backing stores provide local, reliable kernel-lock semantics.
-        "nullfs" | "unionfs" => Err(unsupported_locking_filesystem(
+        // Fail closed: nullfs, unionfs, and aufs are stackable, and this code cannot recursively
+        // prove that their backing stores provide local, reliable kernel-lock semantics.
+        "nullfs" | "unionfs" | "aufs" => Err(unsupported_locking_filesystem(
             path,
             format_args!(
                 "filesystem type {filesystem:?} is not supported because its stackable backing \
@@ -2097,7 +2124,7 @@ mod tests {
     #[test]
     fn stackable_named_filesystems_fail_closed() {
         let path = Path::new("/test/.state-tx.lifecycle.lock");
-        for filesystem in ["nullfs", "unionfs"] {
+        for filesystem in ["nullfs", "unionfs", "aufs"] {
             let error = validate_named_unix_filesystem_type(path, filesystem).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Unsupported);
             assert!(
