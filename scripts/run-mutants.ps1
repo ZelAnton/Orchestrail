@@ -6,10 +6,12 @@
 .DESCRIPTION
     Runs the clean engine tests twice because cargo-mutants has no
     min_test_passes configuration setting, then runs cargo-mutants with the
-    repository configuration. Pass --quick for the proven narrow tiering
-    resolver smoke run. Other arguments are passed through to cargo-mutants;
-    --list/--json are dry-run output overrides and do not satisfy analysis
-    verification because they do not produce result reports.
+    repository configuration. Pass --quick for a two-stage smoke run: first
+    validate the production .cargo-mutants.toml file list and its explicit
+    integration-boundary exclusions, then analyze the narrow tiering resolver
+    subset. Other arguments are passed through to cargo-mutants; --list/--json
+    are dry-run output overrides and do not satisfy analysis verification
+    because they do not produce result reports.
 
     Exit 0 means mutation analysis completed; surviving mutants remain
     informational. Setup, configuration, baseline, and internal errors fail.
@@ -62,6 +64,34 @@ function Invoke-CleanTests {
     }
 }
 
+function Test-ProductionMutantsConfig {
+    $requiredFile = 'engine/src/resolvers/tiering.rs'
+    $excludedFiles = @(
+        'engine/src/vcs.rs'
+        'engine/src/headless.rs'
+        'engine/src/supervise.rs'
+    )
+
+    # --list-files makes cargo-mutants parse and apply the production config
+    # without launching mutation tests. The assertions prove that a deterministic
+    # target remains selected and the named integration boundaries remain absent.
+    $listedFiles = @(& cargo mutants --config .cargo-mutants.toml --list-files 2>&1)
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $listedFiles | ForEach-Object { Write-Host $_ }
+    $normalizedFiles = @($listedFiles | ForEach-Object { "$($_)".Replace('\', '/') })
+
+    if (-not ($normalizedFiles | Where-Object { $_.Contains($requiredFile) })) {
+        Write-Error "production config did not examine $requiredFile"
+        exit 1
+    }
+    foreach ($excludedFile in $excludedFiles) {
+        if ($normalizedFiles | Where-Object { $_.Contains($excludedFile) }) {
+            Write-Error "production config unexpectedly examined $excludedFile"
+            exit 1
+        }
+    }
+}
+
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error 'cargo is not on PATH'
     exit 1
@@ -75,6 +105,11 @@ if ($LASTEXITCODE -ne 0) {
 
 Push-Location $repoRoot
 try {
+    if ($quickMode) {
+        Write-Host '==> Validating production cargo-mutants configuration and boundary exclusions' -ForegroundColor Cyan
+        Test-ProductionMutantsConfig
+    }
+
     Write-Host '==> Verifying the clean engine tests (pass 1 of 2)' -ForegroundColor Cyan
     Invoke-CleanTests
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

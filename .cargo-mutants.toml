@@ -15,6 +15,7 @@ exclude_globs = [
   "engine/src/headless.rs",
   "engine/src/native_port.rs",
   "engine/src/native*.rs",
+  "engine/src/supervise.rs",
   "engine/src/vcs.rs",
   "engine/src/main.rs",
   "engine/src/execution.rs",

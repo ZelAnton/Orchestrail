@@ -2,10 +2,12 @@
 #
 # Runs mutation testing for Orchestrail's deterministic algorithmic layers.
 # The clean engine test suite is run twice first because cargo-mutants has no
-# min_test_passes configuration setting. Pass --quick for the proven, narrow
-# tiering resolver smoke run: ./scripts/run-mutants.sh --quick. Other arguments
-# are passed to cargo-mutants; --list/--json are dry-run output overrides and
-# intentionally fail this wrapper because they do not produce analysis reports.
+# min_test_passes configuration setting. Pass --quick for a two-stage smoke run:
+# first validate the production .cargo-mutants.toml file list and its explicit
+# integration-boundary exclusions, then analyze the narrow tiering resolver
+# subset. Other arguments are passed to cargo-mutants; --list/--json are dry-run
+# output overrides and intentionally fail this wrapper because they do not
+# produce analysis reports.
 #
 # Exit 0 means mutation analysis completed; surviving mutants remain
 # informational. Setup, configuration, baseline, and internal errors fail.
@@ -52,6 +54,36 @@ run_clean_tests() {
   fi
 }
 
+validate_production_config() {
+  local listed_files
+  local normalized_files
+  local required_file="engine/src/resolvers/tiering.rs"
+  local excluded_file
+  local excluded_files=(
+    "engine/src/vcs.rs"
+    "engine/src/headless.rs"
+    "engine/src/supervise.rs"
+  )
+
+  # --list-files makes cargo-mutants parse and apply the production config
+  # without launching mutation tests. The assertions prove that a deterministic
+  # target remains selected and the named integration boundaries remain absent.
+  listed_files=$(cargo mutants --config .cargo-mutants.toml --list-files)
+  normalized_files=${listed_files//\\//}
+  printf '%s\n' "$listed_files"
+
+  if ! grep -Fq "$required_file" <<<"$normalized_files"; then
+    echo "error: production config did not examine $required_file" >&2
+    return 1
+  fi
+  for excluded_file in "${excluded_files[@]}"; do
+    if grep -Fq "$excluded_file" <<<"$normalized_files"; then
+      echo "error: production config unexpectedly examined $excluded_file" >&2
+      return 1
+    fi
+  done
+}
+
 cd "$repo_root"
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -61,6 +93,11 @@ fi
 if ! cargo mutants --version >/dev/null 2>&1; then
   echo "error: cargo-mutants is not installed; run 'cargo install --locked cargo-mutants'" >&2
   exit 1
+fi
+
+if [[ "$quick_mode" == true ]]; then
+  echo "==> Validating production cargo-mutants configuration and boundary exclusions"
+  validate_production_config
 fi
 
 echo "==> Verifying the clean engine tests (pass 1 of 2)"

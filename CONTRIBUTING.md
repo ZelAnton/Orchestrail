@@ -58,7 +58,9 @@ errors, rather than only measuring whether code was executed. Orchestrail uses
 processor, and time code; expensive process, browser, and VCS boundaries are excluded.
 Run it locally with `bash ./scripts/run-mutants.sh` on Linux/macOS or
 `.\scripts\run-mutants.ps1` on Windows. For a verified resolver-only smoke run,
-append `--quick` to either command; it mutates only `engine/src/resolvers/tiering.rs`.
+append `--quick` to either command; it first validates the production
+`.cargo-mutants.toml` selection and integration-boundary exclusions, then mutates
+only `engine/src/resolvers/tiering.rs`.
 
 A surviving mutant is not automatically a defect: it may affect irrelevant or unused
 utility behavior. Investigate each survivor, then strengthen the tests, exclude a harmless
