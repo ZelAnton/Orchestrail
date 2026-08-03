@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::codex::Sandbox;
 use crate::command_line::{parse_typed_argv, validate_direct_program};
+use crate::events::RotationPolicy;
 use crate::forge_ci::Forge;
 use crate::processor::{ProcessorConfig, ProcessorError};
 use crate::resolvers::{CodexCoder, CodexReviewer};
@@ -21,6 +22,15 @@ use crate::work_fs::{self, MAX_CONTROL_BYTES};
 pub struct EngineConfig {
     pub processor: ProcessorConfig,
     pub events_outbox: bool,
+    /// Rotate complete published-cohort event prefixes into immutable archive segments. Off by
+    /// default so existing repositories retain their single-file layout until explicitly opted in.
+    pub events_rotation_enabled: bool,
+    /// Smallest active event segment, in bytes, that a safe cohort boundary may archive. Without
+    /// a threshold every eligible cohort close would rotate whatever the active file happened to
+    /// hold, so a low-volume project would spend one immutable segment per cohort and bound
+    /// nothing; the boundary decides when rotation is *safe*, this key decides when it is worth
+    /// doing.
+    pub events_rotation_min_bytes: u64,
     pub knowledge_base: bool,
     /// Expire unconfirmed singleton knowledge entries after this many completed cohorts.
     pub knowledge_ttl_batches: u64,
@@ -142,11 +152,24 @@ pub fn mode_with_required_policy_commands(
     }
 }
 
+impl EngineConfig {
+    /// The decoded storage policy the event outbox enforces at a safe cohort boundary. Both keys
+    /// are resolved together so a caller cannot bind the switch without its threshold.
+    pub fn events_rotation_policy(&self) -> RotationPolicy {
+        RotationPolicy {
+            enabled: self.events_rotation_enabled,
+            min_segment_bytes: self.events_rotation_min_bytes,
+        }
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             processor: ProcessorConfig::default(),
             events_outbox: true,
+            events_rotation_enabled: false,
+            events_rotation_min_bytes: RotationPolicy::DEFAULT_MIN_SEGMENT_BYTES,
             knowledge_base: true,
             knowledge_ttl_batches: 8,
             knowledge_cap_per_area: 12,
@@ -284,6 +307,10 @@ fn parse_with_environment(
         optional_true_false(&fields, "COHORT_TOKEN_BUDGET_STRICT")?
             .unwrap_or(config.processor.cohort_token_budget_strict);
     config.events_outbox = optional_bool(&fields, "EVENTS_OUTBOX")?.unwrap_or(config.events_outbox);
+    config.events_rotation_enabled = optional_bool(&fields, "EVENTS_ROTATION_ENABLED")?
+        .unwrap_or(config.events_rotation_enabled);
+    config.events_rotation_min_bytes = optional_positive_u64(&fields, "EVENTS_ROTATION_MIN_BYTES")?
+        .unwrap_or(config.events_rotation_min_bytes);
     config.processor.events_outbox_enabled = config.events_outbox;
     config.knowledge_base = resolve_knowledge_base(&fields, &environment)?;
     config.knowledge_ttl_batches =
@@ -886,10 +913,11 @@ mod tests {
     #[test]
     fn parser_handles_documented_boolean_spellings_and_zero_budget() {
         let parsed = parse(
-            "EVENTS_OUTBOX: off # disabled\nKB: on\nKB_TTL: 5\nKB_CAP: 7\nPUSH: false\nCI_WATCH: true\nPUBLISH_LINEAR_HISTORY: on\nCOHORT_BUDGET_SEC: 0\nCOHORT_TOKEN_BUDGET: 0\n",
+            "EVENTS_OUTBOX: off # disabled\nEVENTS_ROTATION_ENABLED: on\nKB: on\nKB_TTL: 5\nKB_CAP: 7\nPUSH: false\nCI_WATCH: true\nPUBLISH_LINEAR_HISTORY: on\nCOHORT_BUDGET_SEC: 0\nCOHORT_TOKEN_BUDGET: 0\n",
         )
         .unwrap();
         assert!(!parsed.events_outbox);
+        assert!(parsed.events_rotation_enabled);
         assert!(parsed.knowledge_base);
         assert_eq!(parsed.knowledge_ttl_batches, 5);
         assert_eq!(parsed.knowledge_cap_per_area, 7);
@@ -899,6 +927,50 @@ mod tests {
         assert_eq!(parsed.processor.cohort_budget_secs, None);
         assert_eq!(parsed.processor.cohort_token_budget, None);
         assert!(!parsed.processor.events_outbox_enabled);
+        assert!(!EngineConfig::default().events_rotation_enabled);
+        assert!(parse("EVENTS_ROTATION_ENABLED: maybe\n").is_err());
+    }
+
+    #[test]
+    fn rotation_threshold_defaults_and_binds_into_the_storage_policy() {
+        // Enabling rotation without a threshold must not mean "archive every cohort close": the
+        // documented default is a real size, and it travels with the switch into one policy.
+        let enabled = parse("EVENTS_ROTATION_ENABLED: on\n").unwrap();
+        assert_eq!(
+            enabled.events_rotation_min_bytes,
+            RotationPolicy::DEFAULT_MIN_SEGMENT_BYTES
+        );
+        assert_eq!(
+            enabled.events_rotation_policy(),
+            RotationPolicy::enabled_above(RotationPolicy::DEFAULT_MIN_SEGMENT_BYTES)
+        );
+        assert_eq!(
+            EngineConfig::default().events_rotation_policy(),
+            RotationPolicy::disabled()
+        );
+
+        let configured =
+            parse("EVENTS_ROTATION_ENABLED: on\nEVENTS_ROTATION_MIN_BYTES: 262144\n").unwrap();
+        assert_eq!(configured.events_rotation_min_bytes, 262_144);
+        assert_eq!(
+            configured.events_rotation_policy(),
+            RotationPolicy::enabled_above(262_144)
+        );
+        // The threshold is decoded even while rotation is off, so enabling it later cannot
+        // silently pick up a different policy than the one the operator wrote down.
+        assert_eq!(
+            parse("EVENTS_ROTATION_MIN_BYTES: 4096\n")
+                .unwrap()
+                .events_rotation_policy(),
+            RotationPolicy {
+                enabled: false,
+                min_segment_bytes: 4096,
+            }
+        );
+
+        assert!(parse("EVENTS_ROTATION_MIN_BYTES: 0\n").is_err());
+        assert!(parse("EVENTS_ROTATION_MIN_BYTES: -1\n").is_err());
+        assert!(parse("EVENTS_ROTATION_MIN_BYTES: 8 MiB\n").is_err());
     }
 
     #[test]

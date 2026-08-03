@@ -44,6 +44,18 @@ vcs-gitea.workspace = true
 # deterministic event identities use the legacy contract's standard URL-namespace UUIDv5.
 uuid = { version = "1", features = ["v4", "v5"] }
 
+[target.'cfg(unix)'.dependencies]
+# Cross-process lease lifecycle serialization uses the host filesystem's advisory `flock`.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Cross-process lease lifecycle serialization uses `LockFileEx` on a persistent sidecar file.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 [dev-dependencies]
 # Property tests for parser and state-machine panic-freedom.
 proptest = { version = "=1.0.0", default-features = false, features = ["std"] }

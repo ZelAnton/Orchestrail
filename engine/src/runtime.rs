@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::{CheckpointError, CheckpointStore};
-use crate::events::{Event, Outbox, OutboxError, project_processor_transition};
+use crate::events::{Event, Outbox, OutboxError, RotationPolicy, project_processor_transition};
 use crate::processor::{
     CiFixPreparationOutcome, CiOutcome, Effect, LeafKind, LeafOutcome, MergeOutcome, Processor,
     ProcessorCommand, ProcessorConfig, ProcessorError, ProcessorState, ReviewOutcome, TaskPhase,
@@ -157,7 +157,16 @@ impl ProcessorRuntime {
     /// cannot dispatch a leaf before recovery has run again.
     pub fn resume(config: ProcessorConfig, work: impl Into<PathBuf>) -> Result<Self> {
         let store = CheckpointStore::for_file(work, RUNTIME_CHECKPOINT_FILE)?;
-        let Some(checkpoint) = store.load_json::<RuntimeCheckpoint>()? else {
+        let Some(checkpoint) =
+            store
+                .load_json::<RuntimeCheckpoint>()
+                .map_err(|error| match error {
+                    CheckpointError::Json(error) => RuntimeError::CorruptCheckpoint(format!(
+                        "cannot deserialize runtime checkpoint: {error}"
+                    )),
+                    error => RuntimeError::Checkpoint(error),
+                })?
+        else {
             return Self::new(config, store_work(&store));
         };
         if checkpoint.schema_version != RUNTIME_STATE_VERSION {
@@ -231,6 +240,14 @@ impl ProcessorRuntime {
 
     pub fn pending_effects(&self) -> &BTreeMap<String, Effect> {
         &self.pending
+    }
+
+    /// Bind the operator's non-semantic storage policy after configuration has been decoded.
+    /// Rotation is deliberately not part of the reducer checkpoint: archives preserve the same
+    /// logical event stream and may be enabled, disabled, or re-thresholded between otherwise
+    /// identical runs.
+    pub fn set_events_rotation_policy(&mut self, policy: RotationPolicy) {
+        self.outbox.set_rotation_policy(policy);
     }
 
     /// Return the durable ledger key associated with an effect. Effects without a key are
@@ -2497,6 +2514,35 @@ mod tests {
             ProcessorRuntime::resume(config(), &work),
             Err(RuntimeError::CorruptCheckpoint(message)) if message.contains("does not match effect key")
         ));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn resume_rejects_the_removed_returned_phase_as_a_corrupt_checkpoint() {
+        let work = temp_work("removed-returned-phase");
+        let runtime = ProcessorRuntime::import_legacy(config(), &work, imported_ready_state())
+            .expect("write a valid runtime checkpoint");
+        drop(runtime);
+
+        let path = work.join(RUNTIME_CHECKPOINT_FILE);
+        let checkpoint = fs::read_to_string(&path).expect("read the valid runtime checkpoint");
+        let legacy = checkpoint.replacen(r#""phase": "ready""#, r#""phase": "returned""#, 1);
+        assert_ne!(
+            legacy, checkpoint,
+            "the fixture must replace the task phase, not silently preserve it"
+        );
+        fs::write(&path, legacy).expect("write the legacy runtime checkpoint");
+
+        let error = ProcessorRuntime::resume(config(), &work)
+            .expect_err("the removed phase must not deserialize");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::CorruptCheckpoint(message)
+                    if message.contains("unknown variant `returned`")
+            ),
+            "legacy returned must be reported as explicit checkpoint corruption"
+        );
         let _ = fs::remove_dir_all(work);
     }
 }

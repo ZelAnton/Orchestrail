@@ -543,7 +543,7 @@ pub fn canonical_release_fingerprint(
     let release_path = inbox_root
         .join("releases")
         .join(format!("{release_id}.json"));
-    let _lock = InboxLock::acquire(&inbox_paths.lock)?;
+    let _lock = InboxLock::acquire(source_root, &inbox_paths.lock)?;
     let Some(record) = read_record(inbox_root, &release_path)? else {
         return Ok(None);
     };
@@ -663,7 +663,7 @@ pub fn distribute_with_cancellation(
         .join(format!("{release_id}.json"));
 
     let mut record = {
-        let _lock = InboxLock::acquire(&inbox_paths.lock)?;
+        let _lock = InboxLock::acquire(&request.source_root, &inbox_paths.lock)?;
         if cancelled() {
             return Err(ReleaseError::Invalid(
                 "release delivery lost owner authority while waiting for the source inbox lock"
@@ -797,7 +797,7 @@ pub fn distribute_with_cancellation(
                             .into(),
                     ));
                 }
-                let _lock = InboxLock::acquire(&inbox_paths.lock)?;
+                let _lock = InboxLock::acquire(&request.source_root, &inbox_paths.lock)?;
                 if cancelled() {
                     return Err(ReleaseError::Invalid(
                         "release delivery lost owner authority while waiting to record delivery"
