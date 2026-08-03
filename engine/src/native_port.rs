@@ -2362,10 +2362,18 @@ impl<E: ExternalPort> FileVcsPort<E> {
         Ok(())
     }
 
-    fn notify_best_effort(&self, event: NotificationEvent, subject: &str) {
-        if let Some(outcome) = self.notifier.dispatch(event, subject) {
-            let _ = self.control.append_notification_journal(&outcome);
-        }
+    fn notify_best_effort(
+        &self,
+        event: NotificationEvent,
+        subject: &str,
+    ) -> Option<crate::notification::NotificationOutcome> {
+        let outcome = self.notifier.dispatch(event, subject)?;
+        // A final receipt without its journal entry is not enough to consume an approval marker:
+        // the operator would otherwise lose the only diagnostic for an unknown/recovery result.
+        self.control
+            .append_notification_journal(&outcome)
+            .ok()
+            .map(|()| outcome)
     }
 
     /// Materialize the legacy-compatible merger report only once every non-escalated task in the
@@ -3737,11 +3745,14 @@ impl<E: ExternalPort> ProcessorPort for FileVcsPort<E> {
                         ApprovalStatus::Pending {
                             deadline_at_secs, ..
                         } => {
-                            if approval.notification_pending {
-                                self.notify_best_effort(
-                                    NotificationEvent::ApprovalPending,
-                                    &approval.id,
-                                );
+                            if approval.notification_pending
+                                && self
+                                    .notify_best_effort(
+                                        NotificationEvent::ApprovalPending,
+                                        &approval.id,
+                                    )
+                                    .is_some_and(|outcome| outcome.resolves_notification_pending())
+                            {
                                 store
                                     .clear_notification_pending(&approval.id)
                                     .map_err(NativePortError::Approval)?;

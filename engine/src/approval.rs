@@ -323,8 +323,9 @@ impl ApprovalStore {
     }
 
     /// Mark the creation notification as consumed. This is idempotent and is deliberately
-    /// separate from a decision: a crash after child launch is recovered through the dispatcher's
-    /// receipt, then clears this durable marker without launching a duplicate child.
+    /// separate from a decision. The dispatcher clears this marker only after it has journaled a
+    /// durable delivery result or a fail-closed stale-claim `unknown` recovery; a fresh unfinished
+    /// claim remains pending and is diagnosed on the next retry instead of being silently lost.
     pub fn clear_notification_pending(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         self.with_mutation_lock(|| {

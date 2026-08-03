@@ -2,14 +2,15 @@
 //!
 //! A notification must never become another orchestration gate.  The dispatcher records a
 //! durable claim before launching its one contained ProcessKit child; a resumed effect therefore
-//! observes the claim instead of sending a duplicate message.  It deliberately persists neither
-//! command output nor the underlying VCS/approval payload.
+//! observes the claim instead of sending a duplicate message. A fresh interrupted claim is
+//! reported as in progress, while a stale one is finalized as unknown without a second launch.
+//! It deliberately persists neither command output nor the underlying VCS/approval payload.
 
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,9 @@ use crate::work_fs;
 
 const NOTIFICATION_SCHEMA: &str = "orchestrail/notification@1";
 const NOTIFICATION_DEADLINE: Duration = Duration::from_secs(30);
+/// A claim older than this has no trustworthy delivery owner. Recovery finalizes it as
+/// `unknown` without launching another child, preserving the at-most-once boundary.
+const NOTIFICATION_CLAIM_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const NOTIFICATION_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const NOTIFICATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 
@@ -131,6 +135,7 @@ pub struct NotificationOutcome {
     reason: NotificationReason,
     duration_ms: u128,
     error_class: Option<NotificationErrorClass>,
+    resolution: NotificationResolution,
 }
 
 impl NotificationOutcome {
@@ -149,6 +154,19 @@ impl NotificationOutcome {
         }
         entry
     }
+
+    /// Whether the outcome is durable enough for an approval's pending marker to be consumed.
+    /// An unfinished claim, an unavailable receipt, or a failed journal append must leave that
+    /// marker in place so a later processor turn can retry the diagnostic/recovery path.
+    pub fn resolves_notification_pending(&self) -> bool {
+        matches!(self.resolution, NotificationResolution::Resolved)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationResolution {
+    Resolved,
+    Retry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +198,11 @@ enum NotificationStatus {
     Crash,
     Error,
     Failed,
+    /// A live claim is intentionally not re-run; the approval marker remains pending until the
+    /// claim becomes stale or the original child finalizes its receipt.
+    InProgress,
+    /// A stale claim was finalized without a second child launch because delivery is unknowable.
+    Unknown,
 }
 
 impl NotificationStatus {
@@ -192,6 +215,8 @@ impl NotificationStatus {
             Self::Crash => "crash",
             Self::Error => "error",
             Self::Failed => "failed",
+            Self::InProgress => "in_progress",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -204,6 +229,8 @@ impl NotificationStatus {
             Self::Crash => NotificationReason::ProcessKitCrash,
             Self::Error => NotificationReason::ProcessKitError,
             Self::Failed => NotificationReason::InvalidOrUnavailable,
+            Self::InProgress => NotificationReason::ClaimInProgress,
+            Self::Unknown => NotificationReason::StaleClaim,
         }
     }
 }
@@ -218,6 +245,8 @@ enum NotificationReason {
     ProcessKitCrash,
     ProcessKitError,
     InvalidOrUnavailable,
+    ClaimInProgress,
+    StaleClaim,
 }
 
 impl NotificationReason {
@@ -230,6 +259,8 @@ impl NotificationReason {
             Self::ProcessKitCrash => "processkit_crash",
             Self::ProcessKitError => "processkit_error",
             Self::InvalidOrUnavailable => "invalid_or_unavailable",
+            Self::ClaimInProgress => "claim_in_progress",
+            Self::StaleClaim => "stale_claim",
         }
     }
 }
@@ -243,6 +274,10 @@ struct NotificationReceipt {
     status: Option<NotificationStatus>,
     reason: Option<NotificationReason>,
     duration_ms: Option<u128>,
+    /// Present only on an unfinished claim. Missing timestamps are legacy claims whose age
+    /// cannot be proven; they are recovered fail-closed as `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claimed_at_secs: Option<u64>,
 }
 
 /// Contained dispatcher for one configured, typed argv command.  `None` is a successful no-op
@@ -261,9 +296,10 @@ impl NotificationDispatcher {
         }
     }
 
-    /// Send one notification at most once. `None` means another process (or an interrupted
-    /// predecessor) already holds an unfinished durable claim, so this caller must not infer a
-    /// delivery result or launch a second child.
+    /// Send one notification at most once. An unfinished claim is never re-launched: while it is
+    /// fresh, the dispatcher returns an `in_progress` diagnostic; once it is stale (or has no
+    /// timestamp from the legacy format), it records an `unknown` recovery outcome. This keeps
+    /// retrying finite and preserves the at-most-once boundary when child delivery is unknowable.
     pub fn dispatch(&self, event: NotificationEvent, subject: &str) -> Option<NotificationOutcome> {
         if !valid_subject(event, subject) {
             return Some(self.outcome(event, subject, NotificationStatus::Failed, 0));
@@ -277,15 +313,33 @@ impl NotificationDispatcher {
             } else {
                 NotificationStatus::Failed
             };
-            return Some(self.outcome(event, subject, status, 0));
+            return Some(if self.command.is_none() {
+                self.outcome(event, subject, status, 0)
+            } else {
+                self.retryable_outcome(event, subject, status, 0)
+            });
         };
         if command[0].is_empty() {
-            return Some(self.outcome(event, subject, NotificationStatus::Failed, 0));
+            return Some(self.retryable_outcome(event, subject, NotificationStatus::Failed, 0));
         }
         let receipt = self.receipt_path(event, subject);
         match self.claim_or_load(&receipt, event, subject) {
             Ok(Claim::Final(outcome)) => return Some(outcome),
-            Ok(Claim::InProgress) => return None,
+            Ok(Claim::InProgress) => {
+                return Some(self.retryable_outcome(
+                    event,
+                    subject,
+                    NotificationStatus::InProgress,
+                    0,
+                ));
+            }
+            Ok(Claim::Stale) => {
+                let outcome = self.outcome(event, subject, NotificationStatus::Unknown, 0);
+                return Some(match self.save_final_receipt(&receipt, subject, &outcome) {
+                    Ok(()) => outcome,
+                    Err(error) => self.failure_outcome(event, subject, 0, &error),
+                });
+            }
             Ok(Claim::Claimed) => {}
             Err(error) => {
                 return Some(self.failure_outcome(event, subject, 0, &error));
@@ -336,7 +390,20 @@ impl NotificationDispatcher {
             reason: status.reason(),
             duration_ms,
             error_class: None,
+            resolution: NotificationResolution::Resolved,
         }
+    }
+
+    fn retryable_outcome(
+        &self,
+        event: NotificationEvent,
+        subject: &str,
+        status: NotificationStatus,
+        duration_ms: u128,
+    ) -> NotificationOutcome {
+        let mut outcome = self.outcome(event, subject, status, duration_ms);
+        outcome.resolution = NotificationResolution::Retry;
+        outcome
     }
 
     fn failure_outcome(
@@ -346,7 +413,8 @@ impl NotificationDispatcher {
         duration_ms: u128,
         error: &NotificationError,
     ) -> NotificationOutcome {
-        let mut outcome = self.outcome(event, subject, NotificationStatus::Failed, duration_ms);
+        let mut outcome =
+            self.retryable_outcome(event, subject, NotificationStatus::Failed, duration_ms);
         outcome.error_class = Some(error.class());
         outcome
     }
@@ -372,6 +440,7 @@ impl NotificationDispatcher {
             status: None,
             reason: None,
             duration_ms: None,
+            claimed_at_secs: Some(now_secs()),
         };
         let mut content =
             serde_json::to_vec_pretty(&receipt).map_err(NotificationError::Serialize)?;
@@ -421,7 +490,9 @@ impl NotificationDispatcher {
                 reason: existing.reason.unwrap_or_else(|| status.reason()),
                 duration_ms,
                 error_class: None,
+                resolution: NotificationResolution::Resolved,
             })),
+            (None, None) if claim_is_stale(existing.claimed_at_secs) => Ok(Claim::Stale),
             (None, None) => Ok(Claim::InProgress),
             _ => Err(NotificationError::Invalid(format!(
                 "notification receipt has inconsistent completion fields: {}",
@@ -444,6 +515,7 @@ impl NotificationDispatcher {
             status: Some(outcome.status),
             reason: Some(outcome.reason),
             duration_ms: Some(outcome.duration_ms),
+            claimed_at_secs: None,
         })
         .map_err(NotificationError::Serialize)?;
         content.push(b'\n');
@@ -460,7 +532,25 @@ impl NotificationDispatcher {
 enum Claim {
     Claimed,
     InProgress,
+    Stale,
     Final(NotificationOutcome),
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn claim_is_stale(claimed_at_secs: Option<u64>) -> bool {
+    let Some(claimed_at_secs) = claimed_at_secs else {
+        // A v1 receipt created before claim timestamps were persisted cannot establish that a
+        // child is still live. Do not wait forever and do not launch a potentially duplicate one.
+        return true;
+    };
+    let now = now_secs();
+    now < claimed_at_secs
+        || now.saturating_sub(claimed_at_secs) >= NOTIFICATION_CLAIM_STALE_AFTER.as_secs()
 }
 
 fn notification_id(event: NotificationEvent, subject: &str) -> String {
@@ -624,6 +714,132 @@ mod tests {
         );
         assert!(!work.join("notifications").exists());
         let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn fresh_claim_is_reported_and_keeps_the_pending_retry_marker() {
+        let work = work("fresh-claim");
+        let dispatcher =
+            NotificationDispatcher::new(&work, Some(vec!["orchestrail-no-such-notifier".into()]));
+        let event = NotificationEvent::TaskEscalated;
+        let subject = "T-17";
+        let receipt = dispatcher.receipt_path(event, subject);
+        assert!(matches!(
+            dispatcher.claim_or_load(&receipt, event, subject),
+            Ok(Claim::Claimed)
+        ));
+
+        let outcome = dispatcher.dispatch(event, subject).unwrap();
+        assert!(
+            outcome
+                .journal_entry()
+                .contains("status=in_progress reason=claim_in_progress")
+        );
+        assert!(!outcome.resolves_notification_pending());
+        let receipt_text = fs::read_to_string(receipt).unwrap();
+        assert!(receipt_text.contains("\"status\": null"));
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn stale_claim_is_finalized_as_unknown_without_relaunching_the_child() {
+        let work = work("stale-claim");
+        let dispatcher =
+            NotificationDispatcher::new(&work, Some(vec!["orchestrail-no-such-notifier".into()]));
+        let event = NotificationEvent::TaskEscalated;
+        let subject = "T-17";
+        let receipt = dispatcher.receipt_path(event, subject);
+        fs::create_dir(receipt.parent().unwrap()).unwrap();
+        let stale = NotificationReceipt {
+            schema: NOTIFICATION_SCHEMA.into(),
+            id: notification_id(event, subject),
+            event,
+            subject: subject.into(),
+            status: None,
+            reason: None,
+            duration_ms: None,
+            claimed_at_secs: Some(
+                now_secs().saturating_sub(NOTIFICATION_CLAIM_STALE_AFTER.as_secs() + 1),
+            ),
+        };
+        fs::write(&receipt, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let recovered = dispatcher.dispatch(event, subject).unwrap();
+        assert!(
+            recovered
+                .journal_entry()
+                .contains("status=unknown reason=stale_claim")
+        );
+        assert!(recovered.resolves_notification_pending());
+        let persisted: NotificationReceipt =
+            serde_json::from_str(&fs::read_to_string(&receipt).unwrap()).unwrap();
+        assert_eq!(persisted.status, Some(NotificationStatus::Unknown));
+        assert_eq!(persisted.claimed_at_secs, None);
+
+        let resumed = dispatcher.dispatch(event, subject).unwrap();
+        assert_eq!(resumed, recovered);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn legacy_incomplete_receipt_is_recovered_fail_closed() {
+        let work = work("legacy-incomplete-claim");
+        let dispatcher =
+            NotificationDispatcher::new(&work, Some(vec!["orchestrail-no-such-notifier".into()]));
+        let event = NotificationEvent::TaskEscalated;
+        let subject = "T-17";
+        let receipt = dispatcher.receipt_path(event, subject);
+        fs::create_dir(receipt.parent().unwrap()).unwrap();
+        fs::write(
+            &receipt,
+            serde_json::json!({
+                "schema": NOTIFICATION_SCHEMA,
+                "id": notification_id(event, subject),
+                "event": event,
+                "subject": subject,
+                "status": null,
+                "reason": null,
+                "duration_ms": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = dispatcher.dispatch(event, subject).unwrap();
+        assert!(outcome.journal_entry().contains("status=unknown"));
+        assert!(outcome.resolves_notification_pending());
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn successful_notification_is_deduplicated_after_finalization() {
+        let work = work("successful-dedup");
+        let dispatcher = NotificationDispatcher::new(&work, Some(successful_command()));
+        let first = dispatcher
+            .dispatch(NotificationEvent::TaskEscalated, "T-17")
+            .unwrap();
+        assert!(
+            first
+                .journal_entry()
+                .contains("status=sent reason=exit_zero")
+        );
+        let resumed = dispatcher
+            .dispatch(NotificationEvent::TaskEscalated, "T-17")
+            .unwrap();
+        assert_eq!(resumed, first);
+        assert_eq!(fs::read_dir(work.join("notifications")).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    fn successful_command() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd.exe".into(), "/d".into(), "/c".into(), "exit 0".into()]
+        }
+        #[cfg(unix)]
+        {
+            vec!["sh".into(), "-c".into(), "exit 0".into()]
+        }
     }
 
     #[test]
