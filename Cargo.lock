@@ -611,7 +611,7 @@ version = "0.0.1"
 dependencies = [
  "criterion",
  "libc",
- "processkit",
+ "processkit 3.1.0",
  "proptest",
  "serde",
  "serde_json",
@@ -725,6 +725,23 @@ name = "processkit"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04a36b0693b29abe10b6a70a96ab7d9f16cfdd59131f4213a10bdeb2b3eb6de1"
+dependencies = [
+ "async-trait",
+ "encoding_rs",
+ "libc",
+ "mutants",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "processkit"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1728d92a6cfe686aacdaef7a81c3f2364dbf005fa86cf4c3b5b005039cf6e157"
 dependencies = [
  "async-trait",
  "encoding_rs",
@@ -1249,7 +1266,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e263f22f2c301f1e3c4c511620a61da62e74fb679853c4a066e543600beaef12"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "serde",
  "serde_json",
  "tokio",
@@ -1262,7 +1279,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bae2c41eb632d4ba5707ee70a49ffc83c612f6a6fcfb3397fb743982db76f102"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "vcs-cli-support",
  "vcs-diff",
  "vcs-git",
@@ -1282,7 +1299,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00cf1f8593939c1e1d9289fa6c013359c7bbbdbef0c8529399af883245826e2e"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "vcs-cli-support",
  "vcs-diff",
 ]
@@ -1294,7 +1311,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "543e91db52b5a7722082fc30384c637f0db990001e5df6a92f276354da29f501"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "serde",
  "serde_json",
  "vcs-cli-support",
@@ -1308,7 +1325,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20d71699addda8c70d0144e67b81b1a2f05113950a859fefda7a8ae90740b39b"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "serde",
  "serde_json",
  "vcs-cli-support",
@@ -1322,7 +1339,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e318bca0234a71ae4ca50612779a228525a9e726460f641a73a99b174d9712a"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "serde",
  "serde_json",
  "vcs-cli-support",
@@ -1336,7 +1353,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e44796e4e176b95e3604d61737ecc026a6d9454a0fd736f4b628c9a59f0c8754"
 dependencies = [
  "async-trait",
- "processkit",
+ "processkit 2.3.2",
  "vcs-cli-support",
  "vcs-diff",
 ]
