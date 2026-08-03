@@ -6,15 +6,17 @@
 .DESCRIPTION
     Runs the clean engine tests twice because cargo-mutants has no
     min_test_passes configuration setting, then runs cargo-mutants with the
-    repository configuration. Additional arguments are passed through to
-    cargo-mutants.
+    repository configuration. Pass --quick for the proven narrow tiering
+    resolver smoke run. Other arguments are passed through to cargo-mutants;
+    --list/--json are dry-run output overrides and do not satisfy analysis
+    verification because they do not produce result reports.
 
     Exit 0 means mutation analysis completed; surviving mutants remain
     informational. Setup, configuration, baseline, and internal errors fail.
 
     Examples:
         ./scripts/run-mutants.ps1
-        ./scripts/run-mutants.ps1 --file engine/src/resolvers/**/*.rs
+        ./scripts/run-mutants.ps1 --quick
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -25,6 +27,21 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $outputDir = Join-Path $repoRoot 'mutants.out'
+$configFile = '.cargo-mutants.toml'
+$runLabel = 'configured pure layers'
+$quickMode = $false
+
+if ($CargoMutantsArgs.Count -gt 0 -and $CargoMutantsArgs[0] -eq '--quick') {
+    $CargoMutantsArgs = @($CargoMutantsArgs | Select-Object -Skip 1)
+    $configFile = '.cargo-mutants-quick.toml'
+    $runLabel = 'quick tiering resolver subset'
+    $quickMode = $true
+}
+
+if ($CargoMutantsArgs | Where-Object { $_ -in '--list', '--list-files', '--json' }) {
+    Write-Error 'cargo-mutants dry-run output modes cannot verify analysis reports'
+    exit 1
+}
 
 function Get-NonEmptyLineCount {
     param([Parameter(Mandatory)][string] $Path)
@@ -35,6 +52,14 @@ function Get-NonEmptyLineCount {
     return @(
         Get-Content -LiteralPath $Path | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     ).Count
+}
+
+function Invoke-CleanTests {
+    if ($quickMode) {
+        & cargo test --package orchestrail-engine --lib -- resolvers::tiering
+    } else {
+        & cargo test --package orchestrail-engine
+    }
 }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
@@ -51,15 +76,15 @@ if ($LASTEXITCODE -ne 0) {
 Push-Location $repoRoot
 try {
     Write-Host '==> Verifying the clean engine tests (pass 1 of 2)' -ForegroundColor Cyan
-    & cargo test --package orchestrail-engine
+    Invoke-CleanTests
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     Write-Host '==> Verifying the clean engine tests (pass 2 of 2)' -ForegroundColor Cyan
-    & cargo test --package orchestrail-engine
+    Invoke-CleanTests
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    Write-Host '==> Running cargo-mutants against configured pure layers' -ForegroundColor Cyan
-    & cargo mutants --config .cargo-mutants.toml @CargoMutantsArgs
+    Write-Host "==> Running cargo-mutants against $runLabel" -ForegroundColor Cyan
+    & cargo mutants --config $configFile @CargoMutantsArgs
     $mutantsStatus = $LASTEXITCODE
 
     $outcomesPath = Join-Path $outputDir 'outcomes.json'
@@ -67,7 +92,8 @@ try {
     if (-not (Test-Path -LiteralPath $outcomesPath -PathType Leaf) -or
         -not (Test-Path -LiteralPath $mutantsPath -PathType Leaf)) {
         Write-Error "cargo-mutants did not produce complete results in $outputDir"
-        if ($mutantsStatus) { exit $mutantsStatus }
+        # Listing/JSON-only invocations are dry runs and must not masquerade as
+        # completed analysis, even if cargo-mutants itself returned success.
         exit 1
     }
 

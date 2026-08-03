@@ -1,6 +1,6 @@
 /target
 .verification-tmp/
-/mutants.out/
+/mutants.out*
 
 # Per-user scratch notes — never committed. Use these names freely for
 # throwaway planning/working files.

@@ -22,10 +22,8 @@ exclude_globs = [
 ]
 
 timeout_multiplier = 5.0
-output = "mutants.out"
 gitignore = true
 copy_vcs = false
-copy_target = true
 
 # cargo-mutants has no min_test_passes config key. The local wrappers run the
 # clean engine tests twice before cargo-mutants performs its own baseline.

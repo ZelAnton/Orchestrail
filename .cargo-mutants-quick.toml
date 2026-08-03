@@ -1,0 +1,14 @@
+# A proven small mutation-testing slice for fast local feedback. This custom
+# config deliberately replaces .cargo-mutants.toml: cargo-mutants 27 combines
+# command-line --file values with configured examine_globs.
+examine_globs = ["engine/src/resolvers/tiering.rs"]
+test_package = ["orchestrail-engine"]
+# Avoid integration fixtures during the smoke run; these two lib tests cover
+# every mutation in tiering.rs and make the baseline appropriately small.
+additional_cargo_test_args = ["--lib", "--", "resolvers::tiering"]
+timeout_multiplier = 5.0
+gitignore = true
+copy_vcs = false
+
+# Leave output and copy_target at cargo-mutants defaults: reports go to
+# ./mutants.out/, and the multi-gigabyte target tree is not copied per mutant.
