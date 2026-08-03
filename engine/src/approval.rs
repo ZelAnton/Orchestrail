@@ -17,6 +17,12 @@
 //! still refused — with [`ApprovalError::Busy`] naming the holder and its age, so an operator can
 //! tell "someone else is deciding right now" from "this lock needs looking at".
 //!
+//! Recovery never softens ownership. The UUID holder token inside the lock is checked before the
+//! critical section and again when it is released, and a lock that stopped recording this
+//! acquisition is [`ApprovalError::Corrupt`] at both boundaries — including when the mutation
+//! itself also failed, because a second writer inside an authorization mutation is the more
+//! serious of the two facts and may not be suppressed by the less serious one.
+//!
 //! Adopting that primitive deliberately inherits its fail-closed storage requirement: the sidecar
 //! is refused on network, stackable, and unclassifiable filesystems, so a `.work/approvals`
 //! directory on such storage now reports an error instead of mutating. That is the correct
@@ -36,7 +42,7 @@ use uuid::Uuid;
 
 use crate::ownership::{
     TRANSACTION_LOCK_STALE_AFTER, TRANSACTION_LOCK_TIMEOUT, TransactionLockError,
-    TransactionLockPolicy, acquire_transaction_lock,
+    TransactionLockPolicy, TransactionReleaseError, acquire_transaction_lock,
 };
 use crate::work_fs;
 
@@ -511,13 +517,30 @@ impl ApprovalStore {
             operation()
         })();
         // The guard removes the lock only while it still records our own token, so a lock taken
-        // over by anyone else is left untouched and reported. As in the lease transaction, a
-        // release failure is surfaced only when the mutation itself succeeded: otherwise the
-        // primary error is the one worth reporting.
+        // over by anyone else is left untouched and reported. The two ways a release can fail are
+        // not the same condition, and collapsing them into one would silently weaken the holder
+        // token guarantee this store depends on:
+        //
+        // * A holder substitution — the lock stopped recording this acquisition — is exactly the
+        //   condition [`Self::verify_mutation_lock_token`] refuses on entry, observed one moment
+        //   later. It carries the same meaning there and here (another writer may have entered an
+        //   authorization mutation), so it reports the same `Corrupt`, and it is reported even
+        //   when the mutation itself failed: a second decider on an approval outranks whatever the
+        //   operation was going to say, and suppressing it would leave that fact unrecorded.
+        // * A plain I/O failure to remove our own lock is surfaced only when the mutation
+        //   succeeded; otherwise the mutation's own error is the primary one worth reporting.
         match guard.release() {
             Ok(()) => result,
-            Err(error) if result.is_ok() => Err(ApprovalError::Io(error)),
-            Err(_) => result,
+            Err(owner_changed @ TransactionReleaseError::OwnerChanged { .. }) => {
+                Err(ApprovalError::Corrupt(format!(
+                    "approval mutation lock ownership changed before release: {}",
+                    owner_changed.describe()
+                )))
+            }
+            Err(TransactionReleaseError::Io(error)) if result.is_ok() => {
+                Err(ApprovalError::Io(error))
+            }
+            Err(TransactionReleaseError::Io(_)) => result,
         }
     }
 
@@ -1151,14 +1174,49 @@ mod tests {
             )
             .unwrap_err();
 
+        // The token check on entry calls this `Corrupt`; observing the very same substitution one
+        // moment later, at release, may not quietly downgrade it to an I/O error.
         assert!(
-            matches!(&error, ApprovalError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied),
+            matches!(&error, ApprovalError::Corrupt(message)
+                if message.contains("ownership changed before release")
+                    && message.contains("hijacker")),
             "{error:?}"
         );
         assert_eq!(
             fs::read_to_string(&lock).unwrap(),
             "hijacker",
             "owner-conditional cleanup must leave a lock this holder no longer owns"
+        );
+        let _ = fs::remove_dir_all(work);
+    }
+
+    /// A hijack is evidence that a second decider may have entered an authorization mutation, so
+    /// it outranks the mutation's own failure. Reporting only the operation error here would hide
+    /// the more serious fact behind the less serious one.
+    #[test]
+    fn a_hijack_is_reported_even_when_the_mutation_itself_failed() {
+        let work = work();
+        let store = ApprovalStore::new(&work).unwrap();
+        store.request(request(10)).unwrap();
+        let lock = store.directory().join(MUTATION_LOCK);
+
+        let error = store
+            .with_mutation_lock_policy(
+                Duration::from_millis(20),
+                TRANSACTION_LOCK_STALE_AFTER,
+                || {
+                    fs::write(&lock, "hijacker").unwrap();
+                    Err::<(), _>(ApprovalError::Missing {
+                        id: "apr-does-not-matter".into(),
+                    })
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, ApprovalError::Corrupt(message)
+                if message.contains("ownership changed before release")),
+            "a concurrent operation failure must not suppress the hijack: {error:?}"
         );
         let _ = fs::remove_dir_all(work);
     }

@@ -6,10 +6,16 @@
 //! stopped. A running PowerShell control plane does not participate in Orchestrail's kernel-lock
 //! protocol, so concurrent lease mutation by the two control planes is not supported. A
 //! persistent, kernel-locked lifecycle sidecar makes identity-check + create/rename/remove
-//! sequences indivisible across Orchestrail processes. The sidecar is accepted only when the host
-//! can prove that its storage is local with reliable kernel locking; network, unrecognized, and
-//! known stackable Unix filesystems fail closed because their backing stores cannot be recursively
-//! validated. Regular-file mutations retain the identity-authorized file handle until the final
+//! sequences indivisible across Orchestrail processes. The sidecar is opened through the rooted
+//! `work_fs` primitive and its parent chain is re-proved at every mutation boundary, so a `.work`
+//! or store directory swapped for a symlink/junction cannot relocate an authorization artifact's
+//! lock outside the confined root. It is accepted only when the host can prove that the *open
+//! handle* — not merely a pathname that may name something else by then — is on storage that is
+//! local with reliable kernel locking; network, unrecognized, and stackable filesystems (including
+//! `overlayfs`) fail closed because their backing stores cannot be recursively validated. On Unix
+//! that proof is `fstatfs` on the descriptor; on Windows the volume is read from the handle and the
+//! path-derived local/remote classification is admitted only for the volume serial that handle
+//! reports. Regular-file mutations retain the identity-authorized file handle until the final
 //! pathname syscall returns. That closes the reducible file-ID-reuse interval between validation
 //! and mutation. Rust's standard library has no cross-platform unlink/rename-by-handle operation,
 //! so a nanosecond-scale final check-to-syscall race remains: under the supported local,
@@ -719,8 +725,14 @@ impl LeaseStore {
         let result = operation();
         // A failure to remove our owner-checked CreateNew file is surfaced only when the operation
         // itself succeeded; otherwise preserve the primary error. Drop is a best-effort panic path.
+        // A lock that stopped recording this holder is the one exception: it says another writer
+        // may have entered, which outranks whatever the operation itself reported, so it is never
+        // suppressed by a concurrent operation error.
         match guard.release() {
             Ok(()) => result,
+            Err(owner_changed @ TransactionReleaseError::OwnerChanged { .. }) => {
+                Err(owner_changed.into())
+            }
             Err(error) if result.is_ok() => Err(error.into()),
             Err(_) => result,
         }
@@ -865,17 +877,30 @@ struct TransactionFilesystemIdentity {
 #[derive(Debug)]
 struct TransactionLifecycleGuard {
     file: fs::File,
+    /// Confinement root the sidecar's whole parent chain is re-proved against.
+    work: PathBuf,
     path: PathBuf,
+    /// The parent chain the sidecar was actually opened through. A redirect installed later cannot
+    /// make a stale proof pass, because every mutation boundary re-compares against this capture.
+    parents: work_fs::RootedParents,
     identity: TransactionFilesystemIdentity,
 }
 
 impl TransactionLifecycleGuard {
+    /// Re-prove, at every mutation boundary, both that the sidecar handle still names the entry it
+    /// was locked on and that the entry is still reached through the confined parent chain. The
+    /// second half matters even though the handle is pinned: an authorization artifact's lock must
+    /// stay inside `.work`, so a swapped `approvals`/`.work` parent is a refusal rather than a
+    /// still-valid handle to a file that has been moved out of the controlled store.
     fn validate(&self) -> io::Result<()> {
-        validate_transaction_lifecycle_identity(&self.file, &self.path, self.identity)
+        validate_transaction_lifecycle_identity(&self.file, &self.path, self.identity)?;
+        work_fs::assert_rooted_parents_unchanged(&self.work, &self.path, &self.parents)
+            .map_err(|error| lifecycle_identity_error(&self.path, error))
     }
 }
 
 fn try_acquire_transaction_lifecycle(
+    work: &Path,
     transaction_path: &Path,
     lifecycle_name: &str,
 ) -> io::Result<Option<TransactionLifecycleGuard>> {
@@ -889,14 +914,26 @@ fn try_acquire_transaction_lifecycle(
         )
     })?;
     let lifecycle_path = parent.join(lifecycle_name);
-    let file = work_fs::open_plain_file_read_write(&lifecycle_path, true)?;
-    validate_filesystem_supports_kernel_locking(&lifecycle_path)?;
+    // Rooted, not bare: the sidecar is the authorization artifact's own lock, so a `.work` or
+    // `approvals` component swapped for a symlink/junction around this open must never be able to
+    // place it outside the confined root. The primitive captures the parent chain before the open
+    // and re-proves it on both the success and the failure path.
+    let (file, parents) = work_fs::open_plain_file_read_write_rooted(work, &lifecycle_path, true)?;
+    // Pin the storage proof to the handle that was actually opened, then re-prove confinement of
+    // the pathname it was reached through. A pathname-only check could be satisfied by a locally
+    // mounted decoy while the open handle lives on a network filesystem whose kernel locks this
+    // primitive cannot rely on.
+    validate_open_filesystem_supports_kernel_locking(&file, &lifecycle_path)?;
+    work_fs::assert_rooted_parents_unchanged(work, &lifecycle_path, &parents)?;
     let Some(identity) = try_lock_transaction_lifecycle_file(&file, &lifecycle_path)? else {
         return Ok(None);
     };
+    work_fs::assert_rooted_parents_unchanged(work, &lifecycle_path, &parents)?;
     Ok(Some(TransactionLifecycleGuard {
         file,
+        work: work.to_path_buf(),
         path: lifecycle_path,
+        parents,
         identity,
     }))
 }
@@ -1265,7 +1302,7 @@ fn unsupported_locking_filesystem(path: &Path, reason: impl fmt::Display) -> io:
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
 fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Result<()> {
     const LOCAL_FILESYSTEMS: &[u64] = &[
         0x0000_3434, // NILFS
@@ -1283,7 +1320,6 @@ fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Resu
         0x5265_4975, // ReiserFS v3
         0x5346_544E, // NTFS
         0x5846_5342, // XFS
-        0x794C_7630, // overlayfs
         0x8584_58F6, // ramfs
         0x9123_683E, // Btrfs
         0xCA45_1A4E, // bcachefs
@@ -1300,11 +1336,20 @@ fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Resu
         0x4750_4653, // GPFS
         0x5346_414F, // AFS
         0x6573_5546, // FUSE (backing store cannot be established)
-        0x6175_6673, // AUFS (stackable filesystem, cannot validate backing store)
         0x7375_7245, // Coda
         0x7461_636F, // OCFS2
         0xAAD7_AAEA, // PanFS
         0xFF53_4D42, // CIFS
+    ];
+    /// Stackable filesystems present a merged view whose upper and lower layers this code cannot
+    /// recursively prove to be local with reliable kernel locking: the backing store may itself be
+    /// network or unverifiable storage, and two mounts over one shared lower layer do not exclude
+    /// each other at all. They fail closed for the same reason as their named Unix counterparts
+    /// `nullfs`/`unionfs`/`aufs`, which is the only safe default for an authorization artifact's
+    /// lock. A container that must run on one has to place `.work` on a directly mounted volume.
+    const STACKABLE_FILESYSTEMS: &[u64] = &[
+        0x6175_6673, // AUFS
+        0x794C_7630, // overlayfs
     ];
 
     let filesystem_type = filesystem_type & u64::from(u32::MAX);
@@ -1313,6 +1358,8 @@ fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Resu
     }
     let classification = if NETWORK_OR_UNVERIFIABLE_FILESYSTEMS.contains(&filesystem_type) {
         "detected a network or distributed filesystem"
+    } else if STACKABLE_FILESYSTEMS.contains(&filesystem_type) {
+        "detected a stackable filesystem whose backing store cannot be validated"
     } else {
         "filesystem type is not in the local-filesystem allowlist"
     };
@@ -1322,23 +1369,29 @@ fn validate_linux_filesystem_type(path: &Path, filesystem_type: u64) -> io::Resu
     ))
 }
 
+/// Classify the storage of the *open sidecar*, never of a pathname that may name something else.
+///
+/// `fstatfs` answers for the file description this primitive already holds, so a pathname swapped
+/// between the open and the check cannot present a supported local mount while the kernel lock is
+/// taken on a network filesystem that will not honor it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+fn validate_open_filesystem_supports_kernel_locking(
+    file: &fs::File,
+    path: &Path,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
 
-    let encoded = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| unsupported_locking_filesystem(path, "path contains an embedded NUL byte"))?;
     let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `encoded` is NUL-terminated and `statistics` points to writable storage for statfs.
-    if unsafe { libc::statfs(encoded.as_ptr(), statistics.as_mut_ptr()) } != 0 {
+    // SAFETY: `file` owns a live descriptor for the duration of this call and `statistics` points
+    // to writable storage for the complete statfs result.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
         let error = io::Error::last_os_error();
         return Err(unsupported_locking_filesystem(
             path,
             format_args!("filesystem type lookup failed: {error}"),
         ));
     }
-    // SAFETY: a successful statfs call initialized the entire output structure.
+    // SAFETY: a successful fstatfs call initialized the entire output structure.
     let statistics = unsafe { statistics.assume_init() };
     validate_linux_filesystem_type(path, statistics.f_type as u64)
 }
@@ -1351,22 +1404,24 @@ fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
     target_os = "netbsd",
     target_os = "dragonfly"
 ))]
-fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
-    use std::ffi::{CStr, CString};
-    use std::os::unix::ffi::OsStrExt;
+fn validate_open_filesystem_supports_kernel_locking(
+    file: &fs::File,
+    path: &Path,
+) -> io::Result<()> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
 
-    let encoded = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| unsupported_locking_filesystem(path, "path contains an embedded NUL byte"))?;
     let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `encoded` is NUL-terminated and `statistics` points to writable storage for statfs.
-    if unsafe { libc::statfs(encoded.as_ptr(), statistics.as_mut_ptr()) } != 0 {
+    // SAFETY: `file` owns a live descriptor for the duration of this call and `statistics` points
+    // to writable storage for the complete statfs result.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statistics.as_mut_ptr()) } != 0 {
         let error = io::Error::last_os_error();
         return Err(unsupported_locking_filesystem(
             path,
             format_args!("filesystem type lookup failed: {error}"),
         ));
     }
-    // SAFETY: statfs succeeded and its fixed-size filesystem-name field is NUL-terminated.
+    // SAFETY: fstatfs succeeded and its fixed-size filesystem-name field is NUL-terminated.
     let statistics = unsafe { statistics.assume_init() };
     let filesystem = unsafe { CStr::from_ptr(statistics.f_fstypename.as_ptr()) }
         .to_string_lossy()
@@ -1416,7 +1471,10 @@ fn validate_named_unix_filesystem_type(path: &Path, filesystem: &str) -> io::Res
         target_os = "dragonfly"
     ))
 ))]
-fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+fn validate_open_filesystem_supports_kernel_locking(
+    _file: &fs::File,
+    path: &Path,
+) -> io::Result<()> {
     Err(unsupported_locking_filesystem(
         path,
         "filesystem type detection is unavailable on this Unix target",
@@ -1434,8 +1492,142 @@ fn windows_path_is_unc(path: &Path) -> bool {
     )
 }
 
+/// Prove the *open sidecar handle* lives on storage whose kernel locks this primitive may rely on.
+///
+/// A pathname classification alone is unsound here: a redirect can make the pathname resolve to a
+/// locally mounted decoy while the handle the lock is actually taken on lives on a network
+/// filesystem. So the volume is read from the open handle, and the classification that decides
+/// local-versus-remote is *bound* to that handle by volume serial: whatever volume the path-derived
+/// checks classify has to be the very volume the handle is open on, or this refuses. The handle's
+/// own filesystem name is checked against the local allowlist as the second half of the proof.
 #[cfg(windows)]
-fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+fn validate_open_filesystem_supports_kernel_locking(
+    file: &fs::File,
+    path: &Path,
+) -> io::Result<()> {
+    let (handle_serial, filesystem) = windows_handle_volume(file, path)?;
+    validate_windows_filesystem_name(path, &filesystem)?;
+    let path_serial = validate_windows_path_volume(path)?;
+    validate_windows_volume_binding(path, handle_serial, path_serial)
+}
+
+/// Refuse unless the volume that was classified is the volume the handle is actually open on.
+///
+/// This is what makes the path-derived local/remote classification sound: without it, a pathname
+/// swapped to a local decoy would license a lock held on a network volume. Kept separate from the
+/// syscalls so the binding rule itself is proved by a test rather than only by the platform.
+#[cfg(any(test, windows))]
+fn validate_windows_volume_binding(
+    path: &Path,
+    handle_serial: u32,
+    path_serial: u32,
+) -> io::Result<()> {
+    if handle_serial == path_serial {
+        Ok(())
+    } else {
+        Err(unsupported_locking_filesystem(
+            path,
+            format_args!(
+                "the open handle is on volume {handle_serial:#010x} but the classified path is on \
+                 volume {path_serial:#010x}, so the storage classification does not describe the \
+                 locked file"
+            ),
+        ))
+    }
+}
+
+/// Read the volume serial and filesystem name of the volume the *handle* is open on, never of the
+/// volume some pathname happens to resolve to.
+#[cfg(windows)]
+fn windows_handle_volume(file: &fs::File, path: &Path) -> io::Result<(u32, String)> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+
+    let mut serial = 0_u32;
+    // `MAX_PATH` + 1 is the documented ceiling for the filesystem-name buffer.
+    let mut name = [0_u16; 261];
+    // SAFETY: `file` owns a live handle, `serial` and the name buffer are writable for exactly the
+    // sizes described, and every unused optional output is passed as a null pointer.
+    let queried = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            &raw mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    // Capture the failure code before anything else can overwrite the thread's last-error slot.
+    let error = io::Error::last_os_error();
+    if queried == 0 {
+        return Err(unsupported_locking_filesystem(
+            path,
+            format_args!("volume lookup on the open handle failed: {error}"),
+        ));
+    }
+    let length = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    Ok((
+        serial,
+        String::from_utf16_lossy(&name[..length]).to_ascii_lowercase(),
+    ))
+}
+
+/// Read the serial of the volume a pathname resolves to, so the caller can prove it is the same
+/// volume its handle is open on.
+#[cfg(windows)]
+fn windows_volume_serial(volume_root: &[u16], path: &Path) -> io::Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    let mut serial = 0_u32;
+    // SAFETY: `volume_root` is the NUL-terminated root path produced by `GetVolumePathNameW`,
+    // `serial` is writable, and every unused optional output is passed as a null pointer.
+    let queried = unsafe {
+        GetVolumeInformationW(
+            volume_root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &raw mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // Capture the failure code before anything else can overwrite the thread's last-error slot.
+    let error = io::Error::last_os_error();
+    if queried == 0 {
+        return Err(unsupported_locking_filesystem(
+            path,
+            format_args!("Windows volume serial lookup failed: {error}"),
+        ));
+    }
+    Ok(serial)
+}
+
+/// The Windows counterpart of the Unix filesystem allowlist: only volumes whose byte-range locking
+/// this primitive can depend on are accepted, and anything unrecognized fails closed.
+#[cfg(any(test, windows))]
+fn validate_windows_filesystem_name(path: &Path, filesystem: &str) -> io::Result<()> {
+    match filesystem {
+        "ntfs" | "refs" | "exfat" | "fat" | "fat32" => Ok(()),
+        _ => Err(unsupported_locking_filesystem(
+            path,
+            format_args!("filesystem type {filesystem:?} is not in the local-filesystem allowlist"),
+        )),
+    }
+}
+
+/// Classify the volume a pathname resolves to and return its serial, so the caller can require
+/// that this is the same volume its open handle lives on.
+#[cfg(windows)]
+fn validate_windows_path_volume(path: &Path) -> io::Result<u32> {
     use std::iter;
     use std::os::windows::ffi::OsStrExt;
 
@@ -1461,15 +1653,16 @@ fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
     let mut volume_path = vec![0_u16; 32_768];
     // SAFETY: both vectors are live, NUL-terminated/writable as required, and the output length
     // describes the complete allocated buffer.
-    if unsafe {
+    let located = unsafe {
         GetVolumePathNameW(
             wide_path.as_ptr(),
             volume_path.as_mut_ptr(),
             volume_path.len() as u32,
         )
-    } == 0
-    {
-        let error = io::Error::last_os_error();
+    };
+    // Capture the failure code before anything else can overwrite the thread's last-error slot.
+    let error = io::Error::last_os_error();
+    if located == 0 {
         return Err(unsupported_locking_filesystem(
             path,
             format_args!("Windows volume lookup failed: {error}"),
@@ -1477,7 +1670,8 @@ fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
     }
     // SAFETY: GetVolumePathNameW succeeded and wrote a NUL-terminated root path to the buffer.
     let drive_type = unsafe { GetDriveTypeW(volume_path.as_ptr()) };
-    validate_windows_drive_type(path, drive_type)
+    validate_windows_drive_type(path, drive_type)?;
+    windows_volume_serial(&volume_path, path)
 }
 
 #[cfg(windows)]
@@ -1500,7 +1694,10 @@ fn validate_windows_drive_type(path: &Path, drive_type: u32) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn validate_filesystem_supports_kernel_locking(path: &Path) -> io::Result<()> {
+fn validate_open_filesystem_supports_kernel_locking(
+    _file: &fs::File,
+    path: &Path,
+) -> io::Result<()> {
     Err(unsupported_locking_filesystem(
         path,
         "filesystem type detection is unavailable on this platform",
@@ -1517,10 +1714,60 @@ pub(crate) struct TransactionLockGuard {
     lifecycle: Option<TransactionLifecycleGuard>,
 }
 
+/// Why an owner-conditional release did not remove the lock.
+///
+/// The holder-substitution case is a distinct variant rather than an `io::Error` because callers
+/// must not report it as routine I/O trouble: it means the lock this critical section was running
+/// under stopped recording this acquisition, so another writer may have entered. That is corrupt
+/// control-plane state, and every caller has to be able to classify it without matching on
+/// message text or on an `ErrorKind` that a genuine permission failure shares.
+#[derive(Debug)]
+pub(crate) enum TransactionReleaseError {
+    Io(io::Error),
+    OwnerChanged { path: PathBuf, observed: String },
+}
+
+impl TransactionReleaseError {
+    /// The operator-facing description of a lock that stopped being ours.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Io(error) => error.to_string(),
+            Self::OwnerChanged { path, observed } => format!(
+                "transaction lock {} stopped recording this holder before release ({observed}); \
+                 another writer may have entered the critical section",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl fmt::Display for TransactionReleaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+impl From<io::Error> for TransactionReleaseError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<TransactionReleaseError> for LeaseError {
+    fn from(error: TransactionReleaseError) -> Self {
+        match error {
+            TransactionReleaseError::Io(error) => Self::Io(error),
+            owner_changed @ TransactionReleaseError::OwnerChanged { .. } => Self::Corrupt {
+                detail: owner_changed.describe(),
+            },
+        }
+    }
+}
+
 impl TransactionLockGuard {
     /// Remove the lock only while it still records this guard's own holder token. A lock that was
     /// replaced by anyone else is left exactly as found and reported, never silently removed.
-    pub(crate) fn release(&mut self) -> io::Result<()> {
+    pub(crate) fn release(&mut self) -> std::result::Result<(), TransactionReleaseError> {
         if !self.armed {
             return Ok(());
         }
@@ -1529,7 +1776,19 @@ impl TransactionLockGuard {
             .as_ref()
             .ok_or_else(|| io::Error::other("armed transaction lock has no lifecycle guard"))?;
         lifecycle.validate()?;
-        let snapshot = transaction_lock_snapshot(&self.path)?;
+        let snapshot = match transaction_lock_snapshot(&self.path) {
+            Ok(snapshot) => snapshot,
+            // Nothing at the canonical name is the same evidence as foreign content there: the
+            // lock that authorized this critical section is gone, so it was not ours to release
+            // and a contender may have broken it as stale and entered behind us.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(TransactionReleaseError::OwnerChanged {
+                    path: self.path.clone(),
+                    observed: "no lock present".into(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let expected_identity = snapshot.identity;
         match snapshot.kind {
             TransactionLockKind::File { owner } if owner == self.owner => {
@@ -1538,14 +1797,10 @@ impl TransactionLockGuard {
                 self.lifecycle.take();
                 Ok(())
             }
-            kind => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to release replaced transaction lock {}: {}",
-                    self.path.display(),
-                    kind.describe()
-                ),
-            )),
+            kind => Err(TransactionReleaseError::OwnerChanged {
+                path: self.path.clone(),
+                observed: kind.describe(),
+            }),
         }
     }
 }
@@ -1604,7 +1859,8 @@ pub(crate) fn acquire_transaction_lock(
     let (work, path) = (policy.work, policy.path);
     let deadline = Instant::now() + policy.timeout;
     loop {
-        let lifecycle = match try_acquire_transaction_lifecycle(path, policy.lifecycle_name)? {
+        let lifecycle = match try_acquire_transaction_lifecycle(work, path, policy.lifecycle_name)?
+        {
             Some(lifecycle) => lifecycle,
             None => {
                 if Instant::now() >= deadline {
@@ -2124,7 +2380,7 @@ mod tests {
         fs::write(tx.join("foreign-entry"), "do not move").unwrap();
         thread::sleep(Duration::from_millis(2));
 
-        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+        let lifecycle = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
         let decided = transaction_lock_snapshot(&tx).unwrap();
@@ -2157,14 +2413,14 @@ mod tests {
         let work = work("recreated-lifecycle-sidecar");
         fs::create_dir_all(&work).unwrap();
         let tx = work.join(TRANSACTION_LOCK);
-        let original = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+        let original = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns original lifecycle lock");
         let lifecycle_path = original.path.clone();
 
         fs::remove_file(&lifecycle_path).unwrap();
         fs::write(&lifecycle_path, "replacement").unwrap();
-        let replacement = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+        let replacement = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("replacement inode has an independent kernel lock");
 
@@ -2190,7 +2446,7 @@ mod tests {
         fs::write(&tx, "same-owner").unwrap();
         let original_file = work_fs::open_existing_plain_file(&tx).unwrap();
         let (original_identity, _) = opened_transaction_target_identity(&original_file).unwrap();
-        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+        let lifecycle = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
 
@@ -2233,7 +2489,7 @@ mod tests {
         let tx = work.join(TRANSACTION_LOCK);
         fs::write(&tx, "same-owner").unwrap();
         let expected = transaction_lock_snapshot(&tx).unwrap().identity;
-        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+        let lifecycle = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
 
@@ -2261,6 +2517,104 @@ mod tests {
         let _ = fs::remove_dir_all(work);
     }
 
+    /// The sidecar is the authorization artifact's own lock, so a parent redirected between the
+    /// confinement check and the open must never place it outside `.work`. The redirect is
+    /// installed inside exactly that window, and the escaped sidecar the fixture proves was
+    /// created through it has to leave the acquisition refused rather than guarded by a lock
+    /// living in storage the operator does not control.
+    #[test]
+    fn lifecycle_sidecar_creation_refuses_a_parent_redirected_out_of_the_work_root() {
+        let external = work("redirected-lifecycle-external");
+        let work = work("redirected-lifecycle-parent");
+        let approvals = work.join("approvals");
+        let displaced = work.join("approvals-original");
+        let tx = approvals.join("transaction.lock");
+        fs::create_dir_all(&approvals).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        let hook_approvals = approvals.clone();
+        let hook_displaced = displaced.clone();
+        let hook_external = external.clone();
+        work_fs::set_open_rooted_plain_file_hook(move || {
+            fs::rename(&hook_approvals, &hook_displaced)?;
+            work_fs::symlink_directory_for_test(&hook_external, &hook_approvals)
+        });
+
+        let error =
+            try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK).unwrap_err();
+
+        assert!(
+            matches!(
+                work_fs::plain_read_violation(&error),
+                Some(work_fs::PlainReadViolation::ParentNotPlain { path })
+                    if path == &approvals
+            ),
+            "a sidecar parent swapped for a redirect must be a confinement refusal: {error:?}"
+        );
+        assert!(
+            external.join(TRANSACTION_LIFECYCLE_LOCK).is_file(),
+            "the fixture must exercise a sidecar that really was created outside the work root"
+        );
+
+        work_fs::remove_directory_link_for_test(&approvals).unwrap();
+        let _ = fs::remove_dir_all(work);
+        let _ = fs::remove_dir_all(external);
+    }
+
+    /// Whatever else it refuses, the storage proof must accept an ordinary local sidecar: a
+    /// handle-pinned check that fails closed on the developer's own disk would wedge every
+    /// approval mutation instead of protecting it.
+    #[test]
+    fn a_local_sidecar_handle_passes_the_handle_pinned_storage_proof() {
+        let work = work("handle-pinned-filesystem");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        let lifecycle = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
+            .unwrap()
+            .expect("a local temporary directory supports kernel locking");
+
+        validate_open_filesystem_supports_kernel_locking(&lifecycle.file, &lifecycle.path)
+            .expect("the open handle of a local sidecar must satisfy the storage proof");
+
+        drop(lifecycle);
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn unknown_windows_filesystems_fail_closed() {
+        let path = Path::new(r"C:\project\.work\.state-tx.lifecycle.lock");
+        validate_windows_filesystem_name(path, "ntfs").unwrap();
+        validate_windows_filesystem_name(path, "refs").unwrap();
+        for filesystem in ["", "unknown", "nfs", "smb2"] {
+            let error = validate_windows_filesystem_name(path, filesystem).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("is not in the local-filesystem allowlist"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The pathname classification only means something if it describes the volume the handle is
+    /// open on. A locally mounted decoy substituted for the path is exactly the case this rejects.
+    #[test]
+    fn a_classified_path_on_another_volume_never_licenses_the_open_handle() {
+        let path = Path::new(r"C:\project\.work\.state-tx.lifecycle.lock");
+        validate_windows_volume_binding(path, 0xDEAD_BEEF, 0xDEAD_BEEF)
+            .expect("one volume classified as local licenses its own handle");
+
+        let error = validate_windows_volume_binding(path, 0xDEAD_BEEF, 0x0BAD_F00D).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("does not describe the locked file"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn stackable_named_filesystems_fail_closed() {
         let path = Path::new("/test/.state-tx.lifecycle.lock");
@@ -2277,7 +2631,9 @@ mod tests {
         validate_named_unix_filesystem_type(path, "ufs").unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // The classifier is pure, so it is proved on every host rather than only where its `statfs`
+    // caller is compiled: a Linux-only fail-closed rule that no Windows or macOS run exercises is
+    // exactly the kind of allowlist entry that drifts back in unnoticed.
     #[test]
     fn network_and_unknown_linux_filesystems_fail_closed() {
         let path = Path::new("/test/.state-tx.lifecycle.lock");
@@ -2294,7 +2650,28 @@ mod tests {
             assert!(error.to_string().contains("NFS and SMB are not supported"));
         }
         validate_linux_filesystem_type(path, 0x0000_EF53).unwrap();
-        validate_linux_filesystem_type(path, 0x794C_7630).unwrap();
+    }
+
+    /// overlayfs presents a merged view: a kernel lock taken on it says nothing about the upper and
+    /// lower backing stores, which may be network or otherwise unverifiable storage, and two mounts
+    /// sharing a lower layer do not exclude each other. It therefore has to fail closed like the
+    /// named stackable Unix filesystems, not sit in the local allowlist as it once did.
+    #[test]
+    fn stackable_linux_filesystems_fail_closed() {
+        let path = Path::new("/test/.state-tx.lifecycle.lock");
+        for filesystem_type in [
+            0x794C_7630, // overlayfs
+            0x6175_6673, // AUFS
+        ] {
+            let error = validate_linux_filesystem_type(path, filesystem_type).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("stackable filesystem whose backing store cannot be validated"),
+                "{error}"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -2344,7 +2721,7 @@ mod tests {
             snapshot.age_ms.is_some_and(|age| age < 60_000),
             "staleness must use the fresh last-write time, not the tunneled creation time"
         );
-        let lifecycle = try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+        let lifecycle = try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
             .unwrap()
             .expect("test owns lifecycle lock");
         assert!(
@@ -2472,7 +2849,7 @@ mod tests {
             owner: "123:old".into(),
             armed: true,
             lifecycle: Some(
-                try_acquire_transaction_lifecycle(&tx, TRANSACTION_LIFECYCLE_LOCK)
+                try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
                     .unwrap()
                     .expect("test owns lifecycle lock"),
             ),
@@ -2481,8 +2858,53 @@ mod tests {
         fs::write(&tx, "123:new").unwrap();
 
         let error = obsolete.release().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            matches!(&error, TransactionReleaseError::OwnerChanged { path, observed }
+                if path == &tx && observed.contains("123:new")),
+            "a replaced lock must be reported as a typed holder substitution: {error:?}"
+        );
+        assert!(
+            error
+                .describe()
+                .contains("another writer may have entered the critical section"),
+            "{}",
+            error.describe()
+        );
+        assert!(
+            matches!(LeaseError::from(error), LeaseError::Corrupt { .. }),
+            "a holder substitution is control-plane corruption, never routine lease I/O"
+        );
         assert_eq!(fs::read_to_string(&tx).unwrap(), "123:new");
+        obsolete.armed = false;
+        let _ = fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn a_vanished_lock_is_reported_as_a_holder_substitution_not_as_missing_io() {
+        let work = work("vanished-transaction-lock");
+        fs::create_dir_all(&work).unwrap();
+        let tx = work.join(TRANSACTION_LOCK);
+        fs::write(&tx, "123:old").unwrap();
+        let mut obsolete = TransactionLockGuard {
+            path: tx.clone(),
+            owner: "123:old".into(),
+            armed: true,
+            lifecycle: Some(
+                try_acquire_transaction_lifecycle(&work, &tx, TRANSACTION_LIFECYCLE_LOCK)
+                    .unwrap()
+                    .expect("test owns lifecycle lock"),
+            ),
+        };
+        // An absent lock is not "nothing happened": whoever removed it could have broken it as
+        // stale and entered the critical section behind this still-running holder.
+        fs::remove_file(&tx).unwrap();
+
+        let error = obsolete.release().unwrap_err();
+        assert!(
+            matches!(&error, TransactionReleaseError::OwnerChanged { path, observed }
+                if path == &tx && observed.contains("no lock present")),
+            "{error:?}"
+        );
         obsolete.armed = false;
         let _ = fs::remove_dir_all(work);
     }
