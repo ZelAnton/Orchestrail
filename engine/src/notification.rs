@@ -377,7 +377,7 @@ impl NotificationDispatcher {
             serde_json::to_vec_pretty(&receipt).map_err(NotificationError::Serialize)?;
         content.push(b'\n');
         ensure_receipt_location(&self.work, path)?;
-        match work_fs::create_new_plain_file(path) {
+        match work_fs::create_new_plain_file_rooted(&self.work, path) {
             Ok(mut file) => {
                 file.write_all(&content)?;
                 file.sync_all()?;

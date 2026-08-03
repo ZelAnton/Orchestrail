@@ -401,7 +401,7 @@ impl ApprovalStore {
     fn with_mutation_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         approval_directory_available(&self.work, &self.directory, true)?;
         let lock = self.directory.join(MUTATION_LOCK);
-        let mut file = match work_fs::create_new_plain_file(&lock) {
+        let mut file = match work_fs::create_new_plain_file_rooted(&self.work, &lock) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(ApprovalError::Busy);

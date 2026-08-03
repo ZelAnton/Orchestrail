@@ -5,6 +5,8 @@
 //! standard library exposes no equivalent portable directory flush on Windows; that platform
 //! therefore revalidates confinement after rename but otherwise relies on its rename semantics.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type CreateNewPlainFileHook = Box<dyn FnOnce() -> io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_NEW_PLAIN_FILE_HOOK: RefCell<Option<CreateNewPlainFileHook>> =
+        const { RefCell::new(None) };
+}
 
 /// Default ceiling for one authority-bearing control-plane artifact.
 ///
@@ -237,6 +248,35 @@ pub(crate) fn open_plain_file_read_write(path: &Path, create: bool) -> io::Resul
 
 pub(crate) fn create_new_plain_file(path: &Path) -> io::Result<File> {
     open_plain_file(path, false, true, false, true)
+}
+
+/// Create a new confined control-plane file and reject a parent redirect installed around the
+/// creation attempt.
+pub(crate) fn create_new_plain_file_rooted(work: &Path, path: &Path) -> io::Result<File> {
+    ensure_plain_parent(work, path)?;
+    #[cfg(test)]
+    run_create_new_plain_file_hook()?;
+    let file = create_new_plain_file(path)?;
+    assert_plain_parent(work, path)?;
+    Ok(file)
+}
+
+#[cfg(test)]
+fn set_create_new_plain_file_hook(hook: impl FnOnce() -> io::Result<()> + 'static) {
+    CREATE_NEW_PLAIN_FILE_HOOK.with(|slot| {
+        assert!(
+            slot.replace(Some(Box::new(hook))).is_none(),
+            "create-new test hook is already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_create_new_plain_file_hook() -> io::Result<()> {
+    CREATE_NEW_PLAIN_FILE_HOOK.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
 }
 
 pub(crate) fn read_plain_bytes(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
@@ -615,6 +655,99 @@ mod tests {
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[cfg(windows)]
+    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
+        use std::process::{Command, Stdio};
+
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(1_314) => {
+                let parent = target.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no parent")
+                })?;
+                let relative_link = link.strip_prefix(parent).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "test junction paths do not share a parent",
+                    )
+                })?;
+                let target_name = target.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no name")
+                })?;
+                let command = format!(
+                    "mklink /j {} {}",
+                    relative_link.to_string_lossy().replace('/', "\\"),
+                    target_name.to_string_lossy()
+                );
+                let output = Command::new("cmd.exe")
+                    .args(["/d", "/c", &command])
+                    .current_dir(parent)
+                    .stdin(Stdio::null())
+                    .output()?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "failed to create test junction {} -> {}: stdout={} stderr={}",
+                        link.display(),
+                        target.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(path: &Path) -> io::Result<()> {
+        fs::remove_dir(path)
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    #[test]
+    fn rooted_creation_rejects_a_parent_swapped_after_the_initial_check() {
+        let work = temp_root("create-parent-swap");
+        let parent = work.join("claims");
+        let original_parent = work.join("claims-original");
+        let external = work.join("external");
+        let path = parent.join("claim.lock");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir(&external).unwrap();
+
+        let hook_parent = parent.clone();
+        let hook_original_parent = original_parent.clone();
+        let hook_external = external.clone();
+        set_create_new_plain_file_hook(move || {
+            fs::rename(&hook_parent, &hook_original_parent)?;
+            symlink_directory(&hook_external, &hook_parent)
+        });
+        let error = create_new_plain_file_rooted(&work, &path).unwrap_err();
+
+        assert!(matches!(
+            plain_read_violation(&error),
+            Some(PlainReadViolation::ParentNotPlain { path: violation_path })
+                if violation_path == &parent
+        ));
+        assert!(
+            external.join("claim.lock").is_file(),
+            "the post-create parent proof must reject the redirected creation"
+        );
+
+        remove_directory_link(&parent).unwrap();
+        fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

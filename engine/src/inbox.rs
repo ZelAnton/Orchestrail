@@ -165,6 +165,7 @@ pub fn inspect(root: &Path) -> Result<InboxProjection> {
     let Some(paths) = paths(root)? else {
         return Ok(InboxProjection::Absent);
     };
+    let _ = work_directory(root)?;
     let messages = load_messages(&paths)?
         .into_iter()
         .map(|record| record.message)
@@ -1554,6 +1555,16 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
     fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
         use std::process::{Command, Stdio};
 
@@ -1729,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_inbox_is_not_silently_ignored() {
+    fn malformed_or_redirected_inbox_is_not_silently_ignored() {
         let root = Root::new();
         root.write(".inbox/messages/msg-00000001.json", "not json");
         assert!(matches!(inspect(&root.path), Err(InboxError::Malformed(_))));
@@ -1742,11 +1753,12 @@ mod tests {
         root.message(id, "new", "none", &[]);
         let message = root.path.join(format!(".inbox/messages/{id}.json"));
         fs::remove_file(&message).unwrap();
-        let external = root.path.with_extension("external-message");
-        fs::create_dir(&external).unwrap();
-        let sentinel = external.join("sentinel.txt");
-        fs::write(&sentinel, "external sentinel\n").unwrap();
-        symlink_directory(&external, &message).unwrap();
+        let external = root.path.with_extension("external-message.json");
+        fs::write(&external, "external sentinel\n").unwrap();
+        if symlink_file(&external, &message).is_err() {
+            fs::remove_file(external).unwrap();
+            return;
+        }
 
         let error = inspect(&root.path).unwrap_err();
         assert!(matches!(
@@ -1755,12 +1767,12 @@ mod tests {
                 if diagnostic.contains("not a plain file") && diagnostic.contains(id)
         ));
         assert_eq!(
-            fs::read_to_string(&sentinel).unwrap(),
+            fs::read_to_string(&external).unwrap(),
             "external sentinel\n"
         );
 
-        remove_directory_link(&message).unwrap();
-        fs::remove_dir_all(external).unwrap();
+        fs::remove_file(&message).unwrap();
+        fs::remove_file(external).unwrap();
     }
 
     #[test]
@@ -1804,7 +1816,7 @@ mod tests {
         fs::write(&sentinel, "## [T-1] external\n").unwrap();
         symlink_directory(&external, &work).unwrap();
 
-        let error = actionable(&root.path).unwrap_err();
+        let error = inspect(&root.path).unwrap_err();
         assert!(matches!(
             &error,
             InboxError::Malformed(diagnostic)
@@ -1817,6 +1829,42 @@ mod tests {
         );
 
         remove_directory_link(&work).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn redirected_task_directory_fails_closed_without_reading_provenance() {
+        let root = Root::new();
+        let id = "msg-00000001";
+        root.message(id, "read", "none", &[]);
+        root.write(
+            ".work/tasks/T-001/task.md",
+            "# Task\n\nInbox message: msg-original\n",
+        );
+        let task = root.path.join(".work/tasks/T-001");
+        fs::remove_dir_all(&task).unwrap();
+        let external = root.path.with_extension("external-task");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("task.md");
+        fs::write(&sentinel, format!("Inbox message: {id}\n")).unwrap();
+        symlink_directory(&external, &task).unwrap();
+
+        let error = reconcile(&root.path, "2026-07-25T12:00:00Z").unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                InboxError::Malformed(diagnostic)
+                    if diagnostic.contains("not a plain directory")
+                        && diagnostic.contains("T-001")
+            ),
+            "unexpected task redirect diagnostic: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            format!("Inbox message: {id}\n")
+        );
+
+        remove_directory_link(&task).unwrap();
         fs::remove_dir_all(external).unwrap();
     }
 

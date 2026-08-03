@@ -411,7 +411,7 @@ fn create_transaction_marker(
             "native queue inbox transaction exceeds the {MAX_TRANSACTION_BYTES}-byte limit"
         )));
     }
-    let mut file = work_fs::create_new_plain_file(&marker).map_err(|error| {
+    let mut file = work_fs::create_new_plain_file_rooted(work, &marker).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             QueueInboxError::Invalid(
                 "native queue inbox transaction is already pending; recovery was skipped".into(),
@@ -1256,6 +1256,76 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
+        use std::process::{Command, Stdio};
+
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(1_314) => {
+                let parent = target.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no parent")
+                })?;
+                let relative_link = link.strip_prefix(parent).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "test junction paths do not share a parent",
+                    )
+                })?;
+                let target_name = target.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test target has no name")
+                })?;
+                let command = format!(
+                    "mklink /j {} {}",
+                    relative_link.to_string_lossy().replace('/', "\\"),
+                    target_name.to_string_lossy()
+                );
+                let output = Command::new("cmd.exe")
+                    .args(["/d", "/c", &command])
+                    .current_dir(parent)
+                    .stdin(Stdio::null())
+                    .output()?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "failed to create test junction {} -> {}: stdout={} stderr={}",
+                        link.display(),
+                        target.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn symlink_directory(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(path: &Path) -> io::Result<()> {
+        fs::remove_dir(path)
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
     fn task(title: &str, body: &str, predecessors: &[&str]) -> Value {
         serde_json::json!({
             "kind": "task",
@@ -1462,6 +1532,57 @@ mod tests {
                 .join("20260725T120000Z-bad-1.metadata.txt")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn redirected_queue_entry_fails_closed_without_reading_the_target() {
+        let work = Work::new();
+        let inbox = work.path.join(INBOX_DIRECTORY);
+        fs::create_dir(&inbox).unwrap();
+        let entry = inbox.join("redirected.json");
+        let external = work.path.with_extension("external-record.json");
+        fs::write(&external, "external sentinel\n").unwrap();
+        if symlink_file(&external, &entry).is_err() {
+            fs::remove_file(external).unwrap();
+            return;
+        }
+
+        let error = drain(&work.path, "2026-07-25T12:00:00Z").unwrap_err();
+        assert!(error.to_string().contains("not a plain file"));
+        assert_eq!(
+            fs::read_to_string(&external).unwrap(),
+            "external sentinel\n"
+        );
+        assert!(!work.path.join(QUEUE_FILE).exists());
+
+        fs::remove_file(entry).unwrap();
+        fs::remove_file(external).unwrap();
+    }
+
+    #[test]
+    fn redirected_active_task_directory_fails_closed_without_reading_the_target() {
+        let work = Work::new();
+        work.write("queue_inbox/new.json", task("New task", "", &[]));
+        work.text("tasks/T-001/task.md", "# Original task\n");
+        let task_directory = work.path.join("tasks/T-001");
+        fs::remove_dir_all(&task_directory).unwrap();
+        let external = work.path.with_extension("external-task");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("task.md");
+        fs::write(&sentinel, "# External sentinel\n").unwrap();
+        symlink_directory(&external, &task_directory).unwrap();
+
+        let error = drain(&work.path, "2026-07-25T12:00:00Z").unwrap_err();
+        assert!(error.to_string().contains("not a plain directory"));
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "# External sentinel\n"
+        );
+        assert!(work.path.join("queue_inbox/new.json").is_file());
+        assert!(!work.path.join(QUEUE_FILE).exists());
+
+        remove_directory_link(&task_directory).unwrap();
+        fs::remove_dir_all(external).unwrap();
     }
 
     #[test]
