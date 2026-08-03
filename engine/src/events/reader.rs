@@ -29,7 +29,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::model::Event;
-use super::outbox::{EventStreamLayout, event_stream_layout, open_existing_plain_outbox};
+use super::outbox::{
+    EventStreamLayout, EventStreamSource, event_stream_snapshot, open_existing_plain_outbox,
+};
 use super::parse::parse_line;
 
 /// Largest byte range one `poll` retains at once.  The reader is long-lived, while an outbox can
@@ -37,6 +39,14 @@ use super::parse::parse_line;
 /// burst. A single committed event larger than this is rejected rather than risking an unbounded
 /// line buffer or silently skipping a durable fact.
 const MAX_POLL_BYTES: u64 = 1024 * 1024;
+
+/// How many times one `poll` re-resolves its layout when guarded rotation lands inside the poll.
+///
+/// One committed rotation invalidates at most the attempt that observed it, so a single retry is
+/// the realistic case and this budget is deliberately generous. Exhausting it is therefore not
+/// contention but a stream this reader cannot follow, and it must be reported rather than
+/// returned as an idle "no new events".
+const MAX_POLL_SNAPSHOT_ATTEMPTS: usize = 8;
 
 /// Exact recent ids retained in memory and in `events_cursor.json`. Older ids remain represented
 /// by the fixed membership filter and are confirmed against the immutable committed prefix on a
@@ -330,13 +340,52 @@ impl TailReader {
     /// events in file order. Advances the internal cursor past every newline-terminated line
     /// consumed; leaves any unterminated trailing fragment for a future poll. A missing file
     /// reads as empty (so `--follow` can wait for the file to appear).
+    ///
+    /// Resolving where a logical offset lives and reading the bytes there are separate
+    /// filesystem operations, and guarded rotation rewrites that mapping between them: the
+    /// active file it replaces keeps its path while its bytes move to an archive segment and new
+    /// appends restart at physical zero. An attempt that observes such a rotation is therefore
+    /// discarded whole and retried against a freshly resolved layout, because interpreting those
+    /// new bytes at the pre-rotation offsets would deliver them out of order and leave the
+    /// cursor pointing inside the range that was just archived — permanently skipping it.
     pub fn poll(&mut self) -> io::Result<Vec<Event>> {
         self.unterminated_tail = false;
-        let layout = event_stream_layout(&self.path)?;
+        for _ in 0..MAX_POLL_SNAPSHOT_ATTEMPTS {
+            if let Some(batch) = self.poll_attempt()? {
+                return Ok(self.commit(batch));
+            }
+        }
+        Err(io::Error::other(
+            "events stream was rotated during every attempted poll snapshot",
+        ))
+    }
+
+    /// Apply a verified attempt. Nothing outside this method mutates delivery state, so a
+    /// discarded attempt cannot leak an id into the dedup filter or advance the cursor.
+    fn commit(&mut self, batch: PollBatch) -> Vec<Event> {
+        for id in batch.delivered_ids {
+            self.dedupe_filter.insert(&id);
+            self.recent.insert(id);
+        }
+        self.stats.delivered += batch.stats.delivered;
+        self.stats.skipped_invalid += batch.stats.skipped_invalid;
+        self.stats.skipped_dup += batch.stats.skipped_dup;
+        self.offset += batch.consumed;
+        self.unterminated_tail = batch.unterminated_tail;
+        batch.events
+    }
+
+    /// One consistent read attempt. `Ok(None)` means a rotation was observed while reading and
+    /// the caller must retry; every other outcome is safe to apply or report.
+    fn poll_attempt(&self) -> io::Result<Option<PollBatch>> {
+        let snapshot = event_stream_snapshot(&self.path)?;
+        #[cfg(test)]
+        rotation_probe::fire(&self.path);
+        let layout = &snapshot.layout;
         // Defensive: a logical append-only stream should never shrink. If it somehow did, there
         // is nothing new past our cursor to read.
         if self.offset >= layout.logical_len {
-            return Ok(Vec::new());
+            return Ok(Some(PollBatch::default()));
         }
         let source = layout
             .sources
@@ -357,11 +406,36 @@ impl TailReader {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "event source offset overflowed")
             })?;
+        // The layout fixed this source's physical range before the handle existed. Rotation
+        // replaces the active file by rename, so a handle that can no longer cover the planned
+        // range proves we opened a different file — it does not prove the stream shrank.
+        if file.metadata()?.len() < physical_offset.saturating_add(read_len) {
+            return Ok(None);
+        }
         file.seek(SeekFrom::Start(physical_offset))?;
         let mut buf = Vec::with_capacity(read_len as usize);
         (&mut file).take(read_len).read_to_end(&mut buf)?;
 
-        let mut out = Vec::new();
+        let interpreted = self.interpret(&buf, source, unread, read_len, layout);
+        // Only a snapshot that is still current makes those bytes mean what the layout said —
+        // including the committed-history scans the dedup check ran through the same layout.
+        // Until that holds, even a *failure* to interpret them may be about the wrong file.
+        if !snapshot.is_still_current()? {
+            return Ok(None);
+        }
+        interpreted.map(Some)
+    }
+
+    /// Turn one raw read into the state change it would produce, without applying any of it.
+    fn interpret(
+        &self,
+        buf: &[u8],
+        source: &EventStreamSource,
+        unread: u64,
+        read_len: u64,
+        layout: &EventStreamLayout,
+    ) -> io::Result<PollBatch> {
+        let mut batch = PollBatch::default();
         let mut consumed: usize = 0; // bytes up to and including the last newline processed
         let mut line_start: usize = 0;
         for i in 0..buf.len() {
@@ -370,10 +444,10 @@ impl TailReader {
                 let raw = &buf[line_start..i]; // line content, newline excluded
                 consumed = i + 1;
                 line_start = i + 1;
-                self.process_line(raw, absolute_line_start, &layout, &mut out)?;
+                self.classify_line(raw, absolute_line_start, layout, &mut batch)?;
             }
         }
-        self.unterminated_tail = !source.archived && consumed < buf.len() && read_len == unread;
+        batch.unterminated_tail = !source.archived && consumed < buf.len() && read_len == unread;
         // buf[line_start..] is the unterminated trailing fragment (torn tail or not-yet-newline
         // valid line): deliberately NOT consumed and NOT advanced past. If it has filled a whole
         // capped poll while more bytes were already committed, it cannot become a valid bounded
@@ -390,22 +464,22 @@ impl TailReader {
                 "archived events segment has an unterminated record",
             ));
         }
-        self.offset += consumed as u64;
-        Ok(out)
+        batch.consumed = consumed as u64;
+        Ok(batch)
     }
 
-    fn process_line(
-        &mut self,
+    fn classify_line(
+        &self,
         raw: &[u8],
         absolute_line_start: u64,
         layout: &EventStreamLayout,
-        out: &mut Vec<Event>,
+        batch: &mut PollBatch,
     ) -> io::Result<()> {
         // A non-UTF-8 line cannot be a valid event; treat as an invalid (skipped) line.
         let text = match std::str::from_utf8(raw) {
             Ok(t) => t.trim(),
             Err(_) => {
-                self.stats.skipped_invalid += 1;
+                batch.stats.skipped_invalid += 1;
                 return Ok(());
             }
         };
@@ -414,25 +488,85 @@ impl TailReader {
         }
         match parse_line(text) {
             Ok(ev) => {
+                // Ids delivered earlier in this same attempt are matched exactly, so a duplicate
+                // inside one buffer is suppressed without the filter having been mutated yet.
                 let duplicate = self.recent.contains(&ev.event_id)
+                    || batch.delivered_set.contains(&ev.event_id)
                     || self.dedupe_filter.maybe_contains(&ev.event_id)
                         && history_contains_event_id(layout, absolute_line_start, &ev.event_id)?;
                 if duplicate {
-                    self.stats.skipped_dup += 1;
+                    batch.stats.skipped_dup += 1;
                 } else {
-                    self.dedupe_filter.insert(&ev.event_id);
-                    self.recent.insert(ev.event_id.clone());
-                    self.stats.delivered += 1;
-                    out.push(ev);
+                    batch.delivered_set.insert(ev.event_id.clone());
+                    batch.delivered_ids.push(ev.event_id.clone());
+                    batch.stats.delivered += 1;
+                    batch.events.push(ev);
                 }
             }
             Err(_) => {
-                self.stats.skipped_invalid += 1;
+                batch.stats.skipped_invalid += 1;
             }
         }
         Ok(())
     }
 }
+
+/// Everything one poll attempt would change, held outside the reader until the attempt proves it
+/// read the bytes its layout described.
+#[derive(Debug, Default)]
+struct PollBatch {
+    events: Vec<Event>,
+    delivered_ids: Vec<String>,
+    delivered_set: HashSet<String>,
+    stats: PollStats,
+    consumed: u64,
+    unterminated_tail: bool,
+}
+
+/// Deterministic interleaving point for the rotation race `poll` must survive.
+///
+/// The window between resolving a layout and reading through it is microseconds wide, so a
+/// stress test would only *probably* exercise it — and a guarantee that is only probably tested
+/// is not a guarantee. A hook keyed by events-file path lets one test force a real rotation into
+/// exactly that window without affecting any other reader in the same process.
+#[cfg(test)]
+mod rotation_probe {
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Probe = Box<dyn FnOnce() + Send>;
+
+    static PROBES: LazyLock<Mutex<HashMap<PathBuf, VecDeque<Probe>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `probe` inside the next poll of `path`, after its layout snapshot and before its read.
+    pub(crate) fn install(path: &Path, probe: impl FnOnce() + Send + 'static) {
+        PROBES
+            .lock()
+            .expect("rotation probe registry is usable")
+            .entry(path.to_path_buf())
+            .or_default()
+            .push_back(Box::new(probe));
+    }
+
+    pub(super) fn fire(path: &Path) {
+        // The registry lock is released before running the probe: a probe writes events, and one
+        // that installs a follow-up probe must not deadlock against its own registry.
+        let probe = PROBES
+            .lock()
+            .expect("rotation probe registry is usable")
+            .get_mut(path)
+            .and_then(VecDeque::pop_front);
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use rotation_probe::install as install_rotation_probe;
 
 fn history_contains_event_id(
     layout: &EventStreamLayout,

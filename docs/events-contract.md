@@ -458,19 +458,42 @@ found, is an error.
 ### Optional archive rotation
 
 `EVENTS_ROTATION_ENABLED: true` lets the native writer rotate only after it has durably committed
-both `cohort.published` and the later Phase-6 `cohort.closed` for the same batch. The entire
-newline-terminated active file becomes the next immutable, zero-padded segment in
-`.work/events_archive/`; `.work/events_rotation.json` maps each segment to its original absolute
-byte range. The active file then continues at the last archived offset.
+both `cohort.published` and the later Phase-6 `cohort.closed` for the same batch, and only once
+the active file has reached `EVENTS_ROTATION_MIN_BYTES` (8 MiB by default). The boundary decides
+when rotation is *safe*; the threshold decides when it is worth doing, so an idle or low-volume
+project does not accumulate one immutable segment per cohort. A boundary below the threshold
+leaves the active file untouched and is retried at the next one.
+
+When it does rotate, the entire newline-terminated active file becomes the next immutable segment
+in `.work/events_archive/`. Each segment carries its own sequence number and absolute logical byte
+range in its zero-padded name (`segment_<sequence>_<start>_<end>.jsonl`), so the archive directory
+*is* the range map. `.work/events_rotation.json` therefore stays a fixed-size commit pointer — a
+published generation, how many leading segments are committed, the logical end of the archive, and
+whatever single transfer is in flight — and never grows with the number of rotations. The active
+file then continues at the last archived offset.
 
 Transfer is a recoverable sequence: a streamed temporary archive is synchronized and renamed,
-metadata atomically publishes the archived range plus a pending active-prefix marker, the active
-file is atomically replaced without that prefix, and metadata clears the marker. Before metadata
-publication readers use the unchanged active file. While the marker is present they read the
-archive and skip its duplicate active prefix; after replacement they read the archive and the new
-active suffix. A writer restart adopts a fully written orphan segment only after proving that it
-matches the active prefix, then completes the same sequence. Thus every crash point exposes one
-logical copy of every committed byte.
+the index atomically commits the segment plus a pending active-prefix marker, the active file is
+atomically replaced without that prefix, and the index clears the marker. A segment renamed into
+place but not yet counted by the commit pointer is invisible to readers, because its bytes are
+still part of the active file. While the marker is present readers use the archive and skip the
+duplicate active prefix; after replacement they read the archive and the new active suffix. A
+writer restart adopts a fully written but uncounted segment only after proving that it matches the
+active prefix, then completes the same sequence. Thus every crash point exposes one logical copy
+of every committed byte.
+
+Capacity is proved before a segment becomes visible, never after: the exact index payload that
+must follow the transfer is serialized and checked first, and a boundary that cannot be indexed —
+or that would exceed the archive's segment ceiling — is declined. Declining costs nothing but a
+larger active file, whereas publishing a segment whose index could not follow it would leave
+bytes that can never be described again and an outbox that can never append again.
+
+Every rotation state transition publishes a new index generation. Readers resolve their layout
+from that generation and re-confirm it before acting on any bytes they read, because rotation
+replaces the active file underneath a concurrent reader: new appends restart at physical zero
+while the bytes that were there moved into an archive segment. An observed rotation discards the
+whole read attempt and retries against a freshly resolved layout, so no reader interprets
+post-rotation bytes at pre-rotation logical offsets.
 
 Only the engine owns rotation. Consumers and operators must not independently rotate, truncate,
 replace, edit, or remove the active file, archive metadata, or immutable segments.

@@ -16,13 +16,17 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-use crate::events::outbox::{event_stream_layout, open_existing_plain_outbox};
+use crate::events::outbox::{EventStreamLayout, event_stream_snapshot, open_existing_plain_outbox};
 use crate::task_id::is_task_id;
 use sha2::{Digest, Sha256};
 use vcs_core::{BackendKind, Repo};
 use vcs_diff::DiffSpec;
 use vcs_git::{GitApi, RevSpec};
 use vcs_jj::{JjApi, RevsetExpr};
+
+/// How many times the outbox projection is rebuilt when guarded rotation keeps moving the stream
+/// underneath it. Rotation happens at most once per published cohort, so this is generous.
+const MAX_OUTBOX_SNAPSHOT_ATTEMPTS: usize = 8;
 
 /// A committed tree entry supplied by a typed VCS inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,12 +303,30 @@ fn archive_digest(work: &Path) -> Result<String> {
     ))
 }
 
+/// Project the outbox component, retrying if guarded rotation moves the stream mid-projection.
+///
+/// The projection reads one source after another through a layout resolved beforehand, and
+/// rotation replaces the active file underneath exactly that sequence. A digest built from a
+/// half-rotated view would report drift the run never had, so a projection that observed a
+/// rotation is discarded and rebuilt.
 fn outbox_digest(work: &Path) -> Result<String> {
+    let path = work.join("events.jsonl");
+    for _ in 0..MAX_OUTBOX_SNAPSHOT_ATTEMPTS {
+        let snapshot = event_stream_snapshot(&path)?;
+        let digest = outbox_digest_of(&snapshot.layout)?;
+        if snapshot.is_still_current()? {
+            return Ok(digest);
+        }
+    }
+    Err(FingerprintError::Io(io::Error::other(
+        "events stream was rotated during every attempted outbox projection",
+    )))
+}
+
+fn outbox_digest_of(layout: &EventStreamLayout) -> Result<String> {
     let mut event_ids = BTreeSet::new();
     let mut identities = Vec::new();
-    let path = work.join("events.jsonl");
-    let layout = event_stream_layout(&path)?;
-    for source in layout.sources {
+    for source in &layout.sources {
         let mut file = open_existing_plain_outbox(&source.path)?;
         file.seek(SeekFrom::Start(source.physical_start))?;
         let byte_len = source.end_offset - source.start_offset;
@@ -465,7 +487,8 @@ mod tests {
 
     use super::*;
     use crate::events::{
-        Actor, ActorKind, Event, EventType, Outbox, SCHEMA_VERSION, deterministic_event_id,
+        Actor, ActorKind, Event, EventType, Outbox, RotationPolicy, SCHEMA_VERSION,
+        deterministic_event_id,
     };
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -570,7 +593,8 @@ mod tests {
             lifecycle_event("closed", EventType::CohortClosed),
         ];
         let plain_outbox = Outbox::new(&monolithic);
-        let rotating_outbox = Outbox::with_rotation_enabled(&rotated, true);
+        let rotating_outbox =
+            Outbox::with_rotation_policy(&rotated, RotationPolicy::enabled_above(1));
         for event in &events {
             plain_outbox.append_idempotent(event).unwrap();
             rotating_outbox.append_idempotent(event).unwrap();

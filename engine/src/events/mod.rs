@@ -28,7 +28,9 @@ pub use fingerprint::{
     sha256 as fingerprint_sha256,
 };
 pub use model::{Actor, ActorKind, Event, EventType, SCHEMA_VERSION};
-pub use outbox::{AppendOutcome, OUTBOX_FILE, Outbox, OutboxError, deterministic_event_id};
+pub use outbox::{
+    AppendOutcome, OUTBOX_FILE, Outbox, OutboxError, RotationPolicy, deterministic_event_id,
+};
 pub use parse::{ParseError, parse_line};
 pub use projector::{project_processor_transition, project_task_done_transition};
 pub use reader::{Cursor, PollStats, TailReader};

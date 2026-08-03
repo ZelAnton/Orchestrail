@@ -1725,7 +1725,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::events::{Outbox, parse_line};
+    use crate::events::{Outbox, RotationPolicy, parse_line};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1901,7 +1901,7 @@ mod tests {
     #[test]
     fn cohort_token_snapshot_is_lossless_across_archive_and_active_segments() {
         let work = temp_work("rotated-token-snapshot");
-        let outbox = Outbox::with_rotation_enabled(&work, true);
+        let outbox = Outbox::with_rotation_policy(&work, RotationPolicy::enabled_above(1));
         let actual = parse_line(&usage("u-archived", "B-1", 10, false)).unwrap();
         let published = parse_line(
             r#"{"schema_version":1,"event_id":"published-1","occurred_at":"2026-07-25T12:00:01Z","type":"cohort.published","batch_id":"B-1","actor":{"kind":"agent","name":"engine"},"payload":{}}"#,

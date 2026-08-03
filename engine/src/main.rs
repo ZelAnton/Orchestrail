@@ -2096,14 +2096,14 @@ fn cmd_processor(args: &[String]) {
                 }
             }
         }
-        let events_rotation_enabled = config.events_rotation_enabled;
+        let events_rotation_policy = config.events_rotation_policy();
         let mut executor = NativeExecutor::new(port).with_cancellation_probe(lease_cancellation);
         let mut runtime = match imported_runtime {
             Some(runtime) => runtime,
             None => ProcessorRuntime::resume(config.processor, &work)
                 .map_err(|error| error.to_string())?,
         };
-        runtime.set_events_rotation_enabled(events_rotation_enabled);
+        runtime.set_events_rotation_policy(events_rotation_policy);
         let loop_config = NativeLoopConfig {
             batch_id: batch_id.clone(),
             base: base.clone(),

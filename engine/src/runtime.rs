@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::{CheckpointError, CheckpointStore};
-use crate::events::{Event, Outbox, OutboxError, project_processor_transition};
+use crate::events::{Event, Outbox, OutboxError, RotationPolicy, project_processor_transition};
 use crate::processor::{
     CiFixPreparationOutcome, CiOutcome, Effect, LeafKind, LeafOutcome, MergeOutcome, Processor,
     ProcessorCommand, ProcessorConfig, ProcessorError, ProcessorState, ReviewOutcome, TaskPhase,
@@ -235,9 +235,10 @@ impl ProcessorRuntime {
 
     /// Bind the operator's non-semantic storage policy after configuration has been decoded.
     /// Rotation is deliberately not part of the reducer checkpoint: archives preserve the same
-    /// logical event stream and may be enabled or disabled between otherwise identical runs.
-    pub fn set_events_rotation_enabled(&mut self, enabled: bool) {
-        self.outbox.set_rotation_enabled(enabled);
+    /// logical event stream and may be enabled, disabled, or re-thresholded between otherwise
+    /// identical runs.
+    pub fn set_events_rotation_policy(&mut self, policy: RotationPolicy) {
+        self.outbox.set_rotation_policy(policy);
     }
 
     /// Return the durable ledger key associated with an effect. Effects without a key are
