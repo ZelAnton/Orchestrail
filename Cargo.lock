@@ -610,6 +610,7 @@ name = "orchestrail-engine"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "libc",
  "processkit",
  "proptest",
  "serde",
@@ -625,6 +626,7 @@ dependencies = [
  "vcs-github",
  "vcs-gitlab",
  "vcs-jj",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
