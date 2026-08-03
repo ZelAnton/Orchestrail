@@ -12,7 +12,7 @@ authors = ["Zhelezniakou Anton <github@zelanton.net>"]
 
 [workspace.dependencies]
 # Contained, async execution of every external program launched by the engine or TUI.
-processkit = "2.3"
+processkit = "3.1"
 # Typed, async facade for Git and Jujutsu operations used by product code.
 vcs-core = "0.9"
 # Managed CLI wrappers, retries, credential injection, and ProcessKit error classifiers.
