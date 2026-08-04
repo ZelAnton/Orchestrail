@@ -76,6 +76,7 @@ pub mod execution;
 pub mod forge_ci;
 pub mod headless;
 pub mod inbox;
+pub mod init;
 pub mod jsonline;
 pub mod lease;
 pub mod legacy_fingerprint;

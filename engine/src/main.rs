@@ -20,6 +20,10 @@
 //!                             cohort admission, integration/join state, batch manifest — and
 //!                             print it human-readably, or as one JSON object with `--json`.
 //!                             Read-only: never writes, locks, or emits.
+//!   init     [--work <.work>]
+//!                             Create a safe, no-overwrite control-plane skeleton and strictly
+//!                             validate its config/policy. Publication and Codex network access
+//!                             are disabled in a new seed.
 //!   plan     --dry-run [--work <dir>]
 //!                             Print the cohort + per-task decisions the engine WOULD make now
 //!                             over a read-only snapshot (default `.work`): the cohort
@@ -122,6 +126,7 @@ use orchestrail_engine::doctor;
 use orchestrail_engine::events::TailReader;
 use orchestrail_engine::headless::{HeadlessConfig, HeadlessExternalPort};
 use orchestrail_engine::inbox;
+use orchestrail_engine::init;
 use orchestrail_engine::lease::{LeaseOp, exit as lease_exit};
 use orchestrail_engine::native::{NativeExecutor, ProcessorPort};
 use orchestrail_engine::native_loop::{
@@ -162,6 +167,7 @@ fn main() {
         "codex" => cmd_codex(&args),
         "events" => cmd_events(&args),
         "state" => cmd_state(&args),
+        "init" => cmd_init(&args),
         "plan" => cmd_plan(&args),
         "doctor" => cmd_doctor(&args),
         "config" => cmd_config(&args),
@@ -178,7 +184,7 @@ fn main() {
         "version" | "--version" => println!("orchestrail-engine 0.0.1"),
         _ => {
             eprintln!(
-                "usage: orchestrail-engine <selfcheck|argv|claude|codex|events|state|plan|doctor|config|approval|inbox|lease|processor|release-sync|run|version>\n\
+                "usage: orchestrail-engine <selfcheck|argv|claude|codex|events|state|init|plan|doctor|config|approval|inbox|lease|processor|release-sync|run|version>\n\
                  (see src/main.rs; every real model call, including `config discover`, requires --live)"
             );
             exit(2);
@@ -251,6 +257,72 @@ fn doctor_usage(error: &str) -> ! {
     eprintln!(
         "usage: orchestrail-engine doctor [--work <.work>] [--root <repository-root>] [--json]: {error}"
     );
+    exit(2)
+}
+
+/// `init [--work <.work>]` creates only missing control-plane files and validates the resulting
+/// configuration and policy before reporting success.
+fn cmd_init(args: &[String]) {
+    let work = match parse_init_args(args) {
+        Ok(work) => work,
+        Err(error) => init_usage(&error),
+    };
+    match init::initialize(&work) {
+        Ok(report) => {
+            for name in &report.created {
+                println!("init: created {}", report.work_dir.join(name).display());
+            }
+            for name in &report.existing {
+                println!(
+                    "init: kept existing {} (no overwrite)",
+                    report.work_dir.join(name).display()
+                );
+            }
+            println!(
+                "init: config.md valid (PUSH={}, CODEX_NETWORK={}, CODEX_SANDBOX={:?})",
+                report.config.push, report.config.codex.network, report.config.codex.sandbox
+            );
+            println!(
+                "init: constraints.md valid (denylist={}, publication={})",
+                report.policy.denied_paths.len(),
+                if report.policy.push_requires_approval {
+                    "human approval required"
+                } else {
+                    "not human-gated"
+                }
+            );
+        }
+        Err(error) => {
+            eprintln!("init: {error}");
+            exit(1);
+        }
+    }
+}
+
+fn parse_init_args(args: &[String]) -> Result<PathBuf, String> {
+    let mut work = None;
+    let mut index = 2;
+    while index < args.len() {
+        if args[index] != "--work" {
+            return Err(format!("unknown argument {:?}", args[index]));
+        }
+        if work.is_some() {
+            return Err("--work may be specified only once".into());
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| "--work requires a path".to_string())?;
+        if value.starts_with("--") {
+            return Err("--work requires a path".into());
+        }
+        work = Some(PathBuf::from(value));
+        index += 2;
+    }
+    Ok(work.unwrap_or_else(|| PathBuf::from(".work")))
+}
+
+fn init_usage(error: &str) -> ! {
+    eprintln!("usage: orchestrail-engine init [--work <control-dir>]: {error}");
     exit(2)
 }
 
