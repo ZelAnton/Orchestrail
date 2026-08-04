@@ -6136,6 +6136,9 @@ mod tests {
             ("", false),
             (" \t ", false),
             ("engine/**, tui/**", true),
+            ("engine/**\ntui/**", true),
+            ("engine/**\n../outside/**", false),
+            ("engine/**\r\n../outside/**", false),
             ("../outside/**", false),
             ("/absolute/**", false),
         ] {

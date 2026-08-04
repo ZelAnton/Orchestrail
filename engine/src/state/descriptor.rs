@@ -9,6 +9,7 @@
 use std::io;
 use std::path::Path;
 
+use crate::resolvers::admission::domain_tokens;
 use crate::resolvers::{Level, NetworkNeed, Risk, network_need};
 use crate::work_fs::{self, MAX_CONTROL_BYTES};
 
@@ -62,12 +63,7 @@ pub struct Descriptor {
 /// A descriptor with an absent, empty, or non-path-shaped field stays unknown so admission fails
 /// closed rather than packing it as conflict-free.
 pub(crate) fn parse_conflict_domain(value: &str) -> Option<Vec<String>> {
-    let globs: Vec<String> = value
-        .split([',', ' ', '\t'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    let globs: Vec<String> = domain_tokens(value).map(str::to_string).collect();
 
     (!globs.is_empty()
         && globs.iter().all(|glob| {

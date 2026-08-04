@@ -43,6 +43,15 @@ pub fn is_ready(prerequisites: &[String], completed: &BTreeSet<String>) -> bool 
     prerequisites.iter().all(|p| completed.contains(p.as_str()))
 }
 
+/// Split and normalize a conflict-domain specification into its non-empty glob tokens.
+/// Descriptor admission uses this same tokenizer so validation cannot disagree with the
+/// resolver about newline-separated domains.
+pub(crate) fn domain_tokens(spec: &str) -> impl Iterator<Item = &str> {
+    spec.split([',', ' ', '\t', '\n', '\r'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
 /// A single glob reduced to a conservative path matcher for overlap tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Matcher {
@@ -112,12 +121,7 @@ impl Domain {
     /// known empty set for resolver-level callers; descriptor readers use [`Domain::unknown`] for
     /// missing or invalid fields.
     pub fn parse(spec: &str) -> Domain {
-        let matchers = spec
-            .split([',', ' ', '\t', '\n', '\r'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(matcher)
-            .collect();
+        let matchers = domain_tokens(spec).map(matcher).collect();
         Domain {
             matchers,
             unknown: false,
