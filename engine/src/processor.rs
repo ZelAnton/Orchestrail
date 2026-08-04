@@ -2640,6 +2640,9 @@ impl Processor {
         now_secs: u64,
     ) -> Result<Vec<Effect>, ProcessorError> {
         self.require_phase(Phase::Rolling, "rolling admission")?;
+        for candidate in &candidates {
+            validate_conflict_domain(&candidate.conflict_domain)?;
+        }
         self.close_for_budget_if_needed(now_secs);
         let Some(batch) = self.state.batch.as_ref() else {
             return Err(ProcessorError::InvalidCommand(
@@ -4761,6 +4764,16 @@ fn validate_task_id(id: &str) -> Result<(), ProcessorError> {
     }
 }
 
+fn validate_conflict_domain(value: &str) -> Result<(), ProcessorError> {
+    if crate::state::descriptor::parse_conflict_domain(value).is_some() {
+        Ok(())
+    } else {
+        Err(ProcessorError::InvalidCommand(format!(
+            "invalid conflict domain {value:?}; expected non-empty repository-relative path globs"
+        )))
+    }
+}
+
 fn validate_batch_id(id: &str) -> Result<(), ProcessorError> {
     let valid = id
         .strip_prefix("B-")
@@ -6115,6 +6128,37 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn rolling_admission_rejects_invalid_conflict_domains_before_runtime_creation() {
+        for (domain, expected_valid) in [
+            ("", false),
+            (" \t ", false),
+            ("engine/**, tui/**", true),
+            ("../outside/**", false),
+            ("/absolute/**", false),
+        ] {
+            let mut p = processor();
+            open(&mut p);
+            let result = p.apply(ProcessorCommand::Admit {
+                candidates: vec![candidate("T-1", domain)],
+                now_secs: 101,
+            });
+
+            if expected_valid {
+                assert!(result.is_ok(), "valid domain {domain:?} was rejected");
+                assert_eq!(p.state().tasks["T-1"].conflict_domain, domain);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ProcessorError::InvalidCommand(message))
+                        if message.contains("invalid conflict domain")
+                ));
+                assert!(p.state().tasks.is_empty());
+                assert_eq!(p.state().batch.as_ref().unwrap().admitted_total, 0);
+            }
+        }
     }
 
     #[test]
