@@ -87,7 +87,14 @@ fn text(bytes: &[u8]) -> String {
 }
 
 fn test_work(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    // macOS exposes its temporary directory through /var, which is a symlink to /private/var.
+    // Pass the physical path to the production confinement checks without weakening them.
+    let root = if cfg!(target_os = "macos") {
+        fs::canonicalize(std::env::temp_dir()).expect("macOS temporary directory must exist")
+    } else {
+        std::env::temp_dir()
+    };
+    root.join(format!(
         "orchestrail-cli-init-{label}-{}",
         std::process::id()
     ))
